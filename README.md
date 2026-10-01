@@ -1,11 +1,16 @@
 # Densemble
 
-**Preproduction scaffold, not a working service.** Densemble is intended to be
-a local Telegram interface to managed Copilot agent runtimes. This repository
-contains a strict TypeScript ESM foundation and an **incomplete, blocking SDK
-integration gate**. Normal startup does not start Telegram polling, a Copilot
-runtime, or an HTTP server. The explicitly opted-in gate launches isolated
-Copilot runtimes, but does not start the application.
+A local, single-owner Telegram interface to managed Copilot agent runtimes on
+Apple Silicon macOS. One bot per persona, one binding per group/topic, and
+separate conversation histories. TypeScript/Node, grammY, SQLite and the Copilot
+SDK form a modular monolith; there is no HTTP server or hosted control plane.
+
+**Deployment acceptance is pending:** the authenticated synthetic SDK gate
+passed, but real Telegram accounts/tokens and a provisioned whisper.cpp model
+are required to complete Telegram/voice acceptance. Offline tests do not prove
+live Bot API delivery or Ukrainian transcription accuracy. Nothing installs a
+LaunchAgent, creates bots, downloads a speech model, or changes external task
+services automatically.
 
 ## Development
 
@@ -32,16 +37,24 @@ upstream compatibility errors; it does not establish SDK runtime compatibility.
 If a prebuilt SQLite binary is unavailable, installation requires native build
 tools (on macOS, Xcode Command Line Tools and a supported Python installation).
 
-After building, `npm start` deliberately writes a not-configured diagnostic to
-stderr and exits with status **1**. There is no configured execution path yet;
-creating a configuration file will not turn this scaffold into a service.
+After building, `npm start` starts the foreground service with
+`config.local.json`. A missing or invalid configuration fails explicitly.
+Use Node 24 for every command, including native SQLite tests.
 
 ## Configuration and privacy
 
-[`config.example.json`](config.example.json) is an **illustrative, nonfunctional**
-example of intended configuration inputs, not an implemented or validated schema.
-Its paths, identifiers, zero owner ID, and empty bindings are placeholders.
-Future configuration loading belongs after the SDK integration gate.
+Copy [`config.example.json`](config.example.json) to ignored `config.local.json`
+and replace its synthetic paths, owner/chat IDs, persona and secret references.
+Create the configured data/home directories yourself with private permissions:
+
+```sh
+mkdir -p data runtime/copilot
+chmod 700 data runtime/copilot
+```
+
+Configuration is strict; unknown fields, conflicting bindings, duplicate bot
+identities, non-invocable workers as bots, unsafe paths and unresolved secrets
+are errors. Detailed schema and lifecycle rules: [contracts](docs/contracts.md).
 
 Keep actual configuration in an ignored `config.local.json`. Reference an
 existing external `secrets.local.json` using `secretsPath`; bot entries reference
@@ -53,6 +66,124 @@ Local configuration, credentials, dependency caches, runtime data, attachments,
 database files, logs, and scratch files are ignored. Use `data/`, `runtime/`,
 `logs/`, and `.cache/` for local artifacts. Ignore rules are only an accidental
 commit safeguard, not access control; review staged changes before committing.
+
+## Foreground setup
+
+1. Complete the service-only OAuth login below. Densemble uses its own Copilot
+   home; it does not import interactive CLI sessions or global MCP configuration.
+2. Create a bot for each desired persona through BotFather. Store its token only
+   in the existing external canonical `secrets.local.json`; set `tokenRef` to
+   that key. Never paste tokens into command-line arguments, commits or logs.
+3. Set your numeric Telegram `ownerId` and explicit `bindings`. For a private
+   chat, use your numeric user/chat ID and `topicId: null`. Send `/start` to the
+   bot yourself. Groups use a negative chat ID; forum bindings require the exact
+   topic ID. Other bots/topics/users are ignored before LLM or media processing.
+4. For groups, disable BotFather privacy mode or grant the necessary bot rights,
+   then verify reception with a real ordinary message without `@`. Membership
+   alone does not establish the binding. Existing webhooks cause an explicit
+   conflict; the service never deletes them automatically.
+5. Declare MCP as `"none"` or explicitly allowlist servers/tools and secret
+   references. IDE-only tools are not available from a background service.
+
+```sh
+npm run build
+node dist/main.js doctor --config config.local.json
+npm start -- --config config.local.json
+```
+
+Doctor performs bounded, read-only SDK auth/model and Bot API identity/webhook
+checks, plus local audio prerequisites. It does not infer, send Telegram
+messages, poll updates or invoke MCP tools. Exit 2 means prerequisites or actual
+MCP acceptance remain incomplete. Audio is optional for starting text service:
+missing ASR prerequisites produce an explicit voice error, never cloud fallback.
+
+Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`.
+Questions/permissions and session/model controls use scoped, expiring buttons.
+`/new` retains old history; deletion needs confirmation. `/stop` is scoped to
+the current bot/chat/topic and does not undo external actions. An unknown
+external-action or Telegram-send outcome is reported as uncertain, not retried
+as a new agent task. `/status` provides explicit delivery-retry controls with
+duplicate warnings. After restart, queued input requires an explicit decision;
+interrupted actions and stale permissions are never automatically replayed.
+
+SIGINT/SIGTERM stop polling/media/runtime work before closing SQLite and releasing
+the OS process lock. If pending work cannot be confirmed stopped, shutdown reports
+failure and retains database/process ownership rather than allowing a second
+instance to race it. A second service/doctor/backup process fails fast. After a
+crash, owned runtimes are reconciled before database recovery. The service is
+unavailable while the Mac sleeps; reconnect cannot recover messages older than
+Telegram's update-retention window.
+
+## Local voice and media
+
+Documents: text PDF, DOCX, UTF-8 TXT/Markdown/CSV. Photos are PNG/JPEG/WebP;
+model vision capability is checked without silently switching models. Image-only
+PDF, unsupported encodings, oversized or corrupt documents fail explicitly.
+Incoming files are limited to 20 MB, exports to 50 MB. Export is an explicit
+permission-controlled tool, not automatic sending of a model-mentioned path.
+
+Provision FFmpeg and whisper.cpp explicitly, and download a **multilingual
+Whisper small GGML** model yourself (not `small.en` or Python `.pt`). Optional
+configuration, using your actual local paths:
+
+```json
+"audio": {
+  "ffmpegPath": "/opt/homebrew/bin/ffmpeg",
+  "ffprobePath": "/opt/homebrew/bin/ffprobe",
+  "whisperPath": "/opt/homebrew/bin/whisper-cli",
+  "modelPath": "/absolute/path/to/ggml-small.bin",
+  "language": "auto",
+  "threads": 4
+}
+```
+
+No automatic install/download occurs. Maximum actual duration is 600 seconds;
+voice stays local to ASR, then only the labelled transcript goes to Copilot.
+Raw voice/WAV are removed on success, failure and cancellation; inputs expire
+after seven days unless retained for active work/delivery. See the
+[media adapter](src/media/README.md) and [Telegram adapter](src/telegram/README.md).
+
+## macOS background operation
+
+Generate a **user** LaunchAgent template after configuring and building:
+
+```sh
+node dist/main.js launchd --config config.local.json > "$HOME/Library/LaunchAgents/dev.densemble.agent.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.densemble.agent.plist"
+```
+
+Create `~/Library/LaunchAgents` first if absent. Generation alone does not load
+the service; `launchctl bootstrap` is an explicit operator action. The template
+uses the exact Node executable selected for generation, so generate it with
+stable Node 24, not a disposable npm-exec cache. Logs are beneath the configured
+data directory. Stop before foreground startup or backup:
+
+```sh
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.densemble.agent.plist"
+```
+
+Logs contain fixed codes and approved scalar metadata, not document content,
+tokens, full tool arguments or raw upstream errors.
+
+## Offline backup and restore
+
+Stop the service first. A backup contains an online SQLite snapshot, retained
+managed input/output files, generated run files and only `densemble-*` native
+session histories. It excludes OAuth configuration/tokens, external workspace,
+raw audio and interactive CLI history. Protect backups as private conversation
+data; store them outside the code, workspace and configured data/home roots.
+
+```sh
+node dist/main.js backup --config config.local.json --target /private/backup-parent/new-snapshot
+node dist/main.js restore --config config.local.json --target /private/backup-parent/new-snapshot
+```
+
+The parent directory must exist. Backup refuses an existing destination.
+Restore requires empty application data and native history destinations, validates
+the snapshot database, never overwrites existing state, and preserves service
+OAuth configuration. Restore with the same workspace/scope configuration;
+provision OAuth independently on a replacement machine. Restart recovery
+invalidates old callbacks and marks interrupted work without replaying it.
 
 ## SDK integration gate — PASS (synthetic authenticated contracts)
 
@@ -323,7 +454,39 @@ production runtime-tree supervisor**. Native tool identities are explicitly
 registered before abort; the gate verifies both their actual exit and an
 unaffected active neighboring runtime.
 
-The `sdk-contract` prerequisite is verified. Safe next work is `state-config`;
-after that shared contract, session control, Telegram core and media can proceed
-with the plan's ownership boundaries. Any future failed/blocked gate rerun must
+The `sdk-contract` prerequisite is verified; application state and adapters
+build on those checked contracts. Any future failed/blocked gate rerun must
 stop dependent SDK changes until its concrete incompatibility is resolved.
+
+## Acceptance status
+
+Verified locally on Node 24: configuration/SQLite recovery, synthetic cross-module
+Telegram ingress → document worker → application → runtime events → outbox,
+duplicate suppression, priority stop, backup/restore, process ownership and
+shutdown failure retention. The external boundaries in offline tests are fakes.
+
+The **production Copilot adapter**, application and real SQLite were also run
+against the provisioned service OAuth: a synthetic reply completed, a second
+turn was cancelled, then the same native session resumed with
+`continuePendingWork: false`. The completed reply remained in real SDK history,
+with no automatic replay; exactly two sends, tool requests denied and fixture
+sessions removed. The zero-inference lifecycle probe is separate. Reproduce
+these opt-in checks only with an explicit service home:
+
+```sh
+DENSEMBLE_RUNTIME_SMOKE=1 DENSEMBLE_RUNTIME_HOME="$PWD/runtime/copilot" \
+  npm test -- tests/unit/runtime-sdk-smoke.test.ts
+DENSEMBLE_APPLICATION_SMOKE=1 DENSEMBLE_RUNTIME_HOME="$PWD/runtime/copilot" \
+  npm test -- tests/unit/runtime-application-smoke.test.ts
+```
+
+The full test suite skips opt-in real SDK tests by default. The separate
+authenticated SDK gate is documented above; running it consumes Copilot usage.
+
+**Not yet verified:** real Telegram DM/group/forum routing, privacy-mode
+configuration, actual file uploads/downloads and Bot API outages; Ukrainian voice
+recognition using a real whisper.cpp model; manual sleep/wake and LaunchAgent
+operation. Complete those checks with provisioned bot tokens, numeric owner/chat
+bindings, a local multilingual model and an approved voice sample before
+considering deployment accepted. No real Trello/Calendar mutations are part of
+acceptance.
