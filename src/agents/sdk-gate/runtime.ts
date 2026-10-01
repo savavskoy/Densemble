@@ -144,6 +144,7 @@ export class IsolatedRuntime {
   readonly workspace: string;
   readonly client: CopilotClient;
   readonly cliPath: string;
+  readonly baseDirectory: string;
   identity: ProcessIdentity | undefined;
   private tracked = new Map<string, ProcessIdentity>();
   private monitor: NodeJS.Timeout | undefined;
@@ -153,6 +154,7 @@ export class IsolatedRuntime {
   private removed = false;
   private cleanupVerified = false;
   private closing: Promise<{ forced: boolean; issues: string[] }> | undefined;
+  private readonly sessionIds = new Set<string>();
 
   constructor(authMode: AuthMode = "token") {
     if (shuttingDown) throw new GateError("GATE_SHUTTING_DOWN");
@@ -162,6 +164,7 @@ export class IsolatedRuntime {
     this.root = join(this.parentDirectory, randomUUID());
     this.workspace = join(this.root, "workspace");
     const options = runtimeOptions(this.root, this.cliPath, authMode);
+    this.baseDirectory = options.baseDirectory!;
     this.serviceHome = authMode === "service-login" ? options.baseDirectory : undefined;
     mkdirSync(cache, { recursive: true, mode: 0o700 });
     if (realpathSync(cache) !== cache) throw new GateError("CACHE_MUST_NOT_BE_SYMLINKED");
@@ -192,6 +195,7 @@ export class IsolatedRuntime {
       } catch (error) {
         this.monitorError = safeError(error);
       }
+
     }, 200);
     this.monitor.unref();
     try {
@@ -200,6 +204,37 @@ export class IsolatedRuntime {
       this.observeProcesses();
     }
     if (!this.identity) throw new GateError("RUNTIME_IDENTITY_NOT_VERIFIED");
+  }
+
+  ownSession(id: string): void {
+    if (!/^densemble-gate-[a-f0-9-]{36}$/.test(id)) throw new GateError("INVALID_OWNED_SESSION_ID");
+    this.sessionIds.add(id);
+  }
+
+  transferOwnedSession(id: string, target: IsolatedRuntime): void {
+    if (target === this || !this.sessionIds.has(id) || !this.serviceHome || target.serviceHome !== this.serviceHome) {
+      throw new GateError("REFUSING_SESSION_OWNERSHIP_TRANSFER");
+    }
+
+    target.ownSession(id);
+    this.sessionIds.delete(id);
+  }
+
+  async deleteOwnedSession(id: string, client = this.client): Promise<void> {
+    if (!this.sessionIds.has(id)) throw new GateError("REFUSING_UNOWNED_SESSION_DELETE");
+    await bounded(client.deleteSession(id), 5_000, "SESSION_DELETE_TIMEOUT");
+    const home = this.serviceHome ?? join(this.root, "copilot");
+    if (existsSync(join(home, "session-state", id))) throw new GateError("SESSION_FILES_SURVIVED_DELETE");
+    this.sessionIds.delete(id);
+  }
+
+  trackOwnedProcesses(identities: ProcessIdentity[]): void {
+    if (!this.identity) throw new GateError("RUNTIME_IDENTITY_NOT_VERIFIED");
+    const tree = descendants(this.identity, processes());
+    for (const identity of identities) {
+      if (!tree.some((current) => sameProcess(identity, current))) throw new GateError("TOOL_PROCESS_NOT_OWNED");
+      this.tracked.set(`${identity.pid}:${identity.started}:${identity.command}`, identity);
+    }
   }
 
   private observeProcesses(): void {
@@ -239,6 +274,7 @@ export class IsolatedRuntime {
     }
     try {
       if (!force) {
+        for (const id of this.sessionIds) await this.deleteOwnedSession(id);
         const errors = await bounded(this.client.stop(), 8_000, "RUNTIME_STOP_TIMEOUT");
         if (errors.length) issues.push("SDK_STOP_REPORTED_ERRORS");
       }
@@ -272,7 +308,21 @@ export class IsolatedRuntime {
       }
       if (this.identity) activePids.delete(this.identity.pid);
       this.identity = undefined;
-      this.cleanupVerified = issues.length === 0;
+      // A crashed/frozen runtime cannot service deleteSession. Only IDs registered by
+      // this run may be removed, after its processes have demonstrably exited.
+      const home = this.serviceHome ?? join(this.root, "copilot");
+      for (const id of this.sessionIds) {
+        const state = join(home, "session-state");
+        const directory = join(state, id);
+        if (!existsSync(directory)) continue;
+        if (realpathSync(state) !== state || realpathSync(directory) !== directory) {
+          throw new GateError("REFUSING_SYMLINKED_SESSION_CLEANUP");
+        }
+        rmSync(directory, { recursive: true });
+        if (existsSync(directory)) throw new GateError("SESSION_FILES_SURVIVED_CLEANUP");
+      }
+      this.sessionIds.clear();
+      this.cleanupVerified = issues.length === 0 && !this.monitorError;
     } catch (error) {
       issues.push(safeError(error));
     }

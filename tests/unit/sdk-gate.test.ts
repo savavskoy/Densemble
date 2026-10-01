@@ -378,6 +378,44 @@ describe("SDK auth option isolation (offline, not authentication evidence)", () 
       expect(readFileSync(marker, "utf8")).toBe(state);
     });
 
+    it("deletes only registered gate sessions and never the service home or unrelated history", async () => {
+      const { home, marker } = provisionSyntheticHome();
+      const runtime = new IsolatedRuntime("service-login");
+      const id = `densemble-gate-${randomUUID()}`;
+      const directory = join(home, "session-state", id);
+      const unrelated = join(home, "session-state", `densemble-gate-${randomUUID()}`);
+      mkdirSync(directory, { recursive: true });
+      mkdirSync(unrelated, { recursive: true });
+      writeFileSync(join(directory, "events.jsonl"), "synthetic");
+      runtime.ownSession(id);
+      expect(() => runtime.ownSession("../service-state")).toThrow("INVALID_OWNED_SESSION_ID");
+      await expect(runtime.deleteOwnedSession("unregistered")).rejects.toThrow("REFUSING_UNOWNED_SESSION_DELETE");
+      expect((await runtime.stop(true)).issues).toEqual([]);
+      runtime.removeOwnedFiles();
+      expect(existsSync(directory)).toBe(false);
+      expect(existsSync(unrelated)).toBe(true);
+      expect(readFileSync(marker, "utf8")).toBe(state);
+    });
+
+    it("transfers exact session cleanup ownership across a service-runtime restart", async () => {
+      const { home, marker } = provisionSyntheticHome();
+      const first = new IsolatedRuntime("service-login");
+      const second = new IsolatedRuntime("service-login");
+      const id = `densemble-gate-${randomUUID()}`;
+      const directory = join(home, "session-state", id);
+      mkdirSync(directory, { recursive: true });
+      first.ownSession(id);
+      expect(() => first.transferOwnedSession(id, first)).toThrow("REFUSING_SESSION_OWNERSHIP_TRANSFER");
+      first.transferOwnedSession(id, second);
+      expect((await first.stop(true)).issues).toEqual([]);
+      first.removeOwnedFiles();
+      expect(existsSync(directory)).toBe(true);
+      expect((await second.stop(true)).issues).toEqual([]);
+      second.removeOwnedFiles();
+      expect(existsSync(directory)).toBe(false);
+      expect(readFileSync(marker, "utf8")).toBe(state);
+    });
+
     it.each(["missing", "symlink", "ancestor-symlink"] as const)("rechecks %s service home immediately before SDK startup", async (kind) => {
       const { home } = provisionSyntheticHome();
       const runtime = new IsolatedRuntime("service-login");

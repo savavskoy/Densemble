@@ -1,6 +1,9 @@
 import { bounded, CLI_VERSION, completeChecks, parseGateArgs, safeError, SDK_VERSION, summarize } from "./contracts.js";
 import type { AuthMode, Check, Observation } from "./contracts.js";
-import { emergencyCleanup, IsolatedRuntime, isolatedStopSmoke } from "./runtime.js";
+import { emergencyCleanup, IsolatedRuntime } from "./runtime.js";
+import { runBehavior } from "./behavior.js";
+import type { BehaviorSummary } from "./behavior.js";
+import type { ModelInfo } from "@github/copilot-sdk";
 
 const checks: Check[] = [];
 const observations: Observation[] = [];
@@ -12,6 +15,11 @@ let modelCount: number | null = null;
 let runtime: IsolatedRuntime | undefined;
 let blockedBy = "REAL_PROBES_NOT_ENABLED";
 let argumentError = false;
+let behavior: BehaviorSummary | undefined;
+let suppressedSdkDiagnostics = 0;
+const originalError = console.error;
+const originalWarn = console.warn;
+console.error = console.warn = () => { suppressedSdkDiagnostics++; };
 try {
   ({ real, readinessOnly, authMode } = parseGateArgs(process.argv.slice(2)));
 } catch (error) {
@@ -31,7 +39,7 @@ const onInterrupt = (): void => { void interrupt(130); };
 const onTerminate = (): void => { void interrupt(143); };
 process.once("SIGINT", onInterrupt);
 process.once("SIGTERM", onTerminate);
-const watchdog = setTimeout(() => { void interrupt(1); }, 180_000);
+const watchdog = setTimeout(() => { void interrupt(1); }, readinessOnly ? 180_000 : 20 * 60_000);
 watchdog.unref();
 
 if (argumentError) {
@@ -55,8 +63,9 @@ if (argumentError) {
       evidence: `AUTH_MODE=${authMode}; IS_AUTHENTICATED=${isAuthenticated}`,
     });
     // Attempt the actual RPC even when auth says false; do not infer model availability.
+    let models: ModelInfo[] = [];
     try {
-      const models = await bounded(runtime.client.listModels(), 15_000, "MODEL_LIST_TIMEOUT");
+      models = await bounded(runtime.client.listModels(), 15_000, "MODEL_LIST_TIMEOUT");
       modelCount = models.length;
       checks.push({
         contract: "model-discovery", status: models.length ? "PASS" : "BLOCKED",
@@ -65,19 +74,9 @@ if (argumentError) {
     } catch (error) {
       checks.push({ contract: "model-discovery", status: "BLOCKED", evidence: safeError(error) });
     }
-    blockedBy = auth.isAuthenticated ? "AUTHENTICATED_BEHAVIOR_PROBES_NOT_IMPLEMENTED" : "AUTHENTICATION_REQUIRED";
-    if (!readinessOnly) {
-      try {
-        const evidence = await isolatedStopSmoke(runtime);
-        observations.push({ name: "two-runtime-forced-stop", status: "PASS", evidence });
-        checks.push({
-          contract: "process-isolation", status: "BLOCKED",
-          evidence: "TWO_RUNTIME_SMOKE_PASSED; ACTIVE_CHAT_AND_RUNTIME_TOOL_TREE_NOT_TESTED",
-        });
-      } catch (error) {
-        observations.push({ name: "two-runtime-forced-stop", status: "FAIL", evidence: safeError(error) });
-        checks.push({ contract: "process-isolation", status: "FAIL", evidence: safeError(error) });
-      }
+    blockedBy = auth.isAuthenticated ? "BEHAVIOR_NOT_REQUESTED_OR_NOT_COMPLETED" : "AUTHENTICATION_REQUIRED";
+    if (!readinessOnly && auth.isAuthenticated && models.length && status.version === CLI_VERSION) {
+      behavior = await runBehavior(runtime, authMode, models, checks, observations);
     }
   } catch (error) {
     blockedBy = safeError(error);
@@ -106,15 +105,19 @@ if (finalCleanup.length) {
 clearTimeout(watchdog);
 process.removeListener("SIGINT", onInterrupt);
 process.removeListener("SIGTERM", onTerminate);
+console.error = originalError;
+console.warn = originalWarn;
 const complete = completeChecks(checks, real && !readinessOnly ? "BLOCKED" : "SKIPPED", blockedBy);
-const status = argumentError || finalCleanup.length ? "FAIL" : summarize(complete);
+const status = argumentError || finalCleanup.length || observations.some((o) => o.status === "FAIL") ? "FAIL" : summarize(complete);
 if (!interrupted) {
   console.log(JSON.stringify({
     status, sdk: SDK_VERSION, cli: CLI_VERSION,
-    scope: "READINESS_AND_AUTH_INDEPENDENT_PROCESS_SMOKE_ONLY",
+    scope: readinessOnly ? "READINESS_ONLY_ZERO_INFERENCE" : real ? "AUTHENTICATED_SYNTHETIC_BEHAVIOR" : "OFFLINE",
     authMode,
     readiness: { isAuthenticated, modelCount },
-    modelRequests: 0,
+    modelRequests: behavior?.submittedMessages ?? 0,
+    behavior,
+    suppressedSdkDiagnostics,
     provisioning: "Choose --auth=token with externally supplied COPILOT_GITHUB_TOKEN, --auth=logged-in for empty-mode gh discovery, --auth=cli-login for transient CLI-mode stored-login discovery, or --auth=service-login for a manually provisioned runtime/copilot service home (never removed by gate cleanup). No login or credential migration is performed.",
     checks: complete, observations,
   }, null, 2));
