@@ -6,3 +6,44 @@
 
 # Python bytecode (agent/tools scripts)
 __pycache__/
+
+# Dependencies, builds, and local tooling
+node_modules/
+dist/
+coverage/
+.cache/
+*.tsbuildinfo
+.DS_Store
+
+# Private configuration and credentials
+/.npmrc
+.env
+.env.*
+!.env.example
+*.local.*
+/config.json
+/config/
+/secrets/
+*.pem
+*.key
+
+# Runtime state, attachments, and logs
+/data/
+/runtime/
+/logs/
+*.log
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Scratch files
+/tmp/
+/temp/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~

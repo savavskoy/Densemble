@@ -1,0 +1,16 @@
+{
+  "workspacePath": "/absolute/path/to/agent-workspace",
+  "agentDefinitionsPath": "/absolute/path/to/agent-workspace/agent/agents",
+  "agentLaunchersPath": "/absolute/path/to/agent-workspace/.github/agents",
+  "secretsPath": "/absolute/path/to/agent-workspace/secrets.local.json",
+  "runtimeDataPath": "./data",
+  "ownerId": 0,
+  "bots": [
+    {
+      "id": "example-bot",
+      "agentId": "example-agent",
+      "tokenRef": "telegram.example_bot_token"
+    }
+  ],
+  "bindings": []
+}
