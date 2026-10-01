@@ -1,0 +1,8 @@
+/.idea/
+
+# Local credentials
+/secrets.local.json
+.agent-craft/
+
+# Python bytecode (agent/tools scripts)
+__pycache__/
