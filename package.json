@@ -13,9 +13,11 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "sdk:gate": "npm run build --silent && node dist/agents/sdk-gate/main.js",
     "start": "node dist/main.js"
   },
   "dependencies": {
+    "@github/copilot": "1.0.91",
     "@github/copilot-sdk": "1.0.16",
     "better-sqlite3": "13.0.3",
     "grammy": "1.46.0",
