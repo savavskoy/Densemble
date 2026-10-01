@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it, vi } from "vitest";
+import { CopilotClient } from "@github/copilot-sdk";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   bounded, CLI_VERSION, completeChecks, GateError, parseGateArgs,
   REQUIRED_CONTRACTS, safeError, SDK_VERSION, summarize,
@@ -31,7 +33,10 @@ describe("SDK gate bookkeeping (offline, not runtime contract evidence)", () => 
     expect(parseGateArgs(["--auth=logged-in"])).toEqual({
       real: false, readinessOnly: false, authMode: "logged-in",
     });
-    for (const authMode of ["token", "logged-in", "cli-login"] as const) {
+    for (const authMode of ["token", "logged-in", "cli-login", "service-login"] as const) {
+      expect(parseGateArgs([`--auth=${authMode}`])).toEqual({
+        real: false, readinessOnly: false, authMode,
+      });
       expect(parseGateArgs(["--real", `--auth=${authMode}`, "--readiness"])).toEqual({
         real: true, readinessOnly: true, authMode,
       });
@@ -47,6 +52,8 @@ describe("SDK gate bookkeeping (offline, not runtime contract evidence)", () => 
   it("rejects conflicting or repeated auth selection rather than using last-wins", () => {
     expect(() => parseGateArgs(["--auth=token", "--auth=logged-in"])).toThrow("DUPLICATE_AUTH_MODE");
     expect(() => parseGateArgs(["--auth=token", "--auth=token"])).toThrow("DUPLICATE_AUTH_MODE");
+    expect(() => parseGateArgs(["--auth=service-login", "--auth=cli-login"])).toThrow("DUPLICATE_AUTH_MODE");
+    expect(() => parseGateArgs(["--auth=service-login", "--auth=service-login"])).toThrow("DUPLICATE_AUTH_MODE");
     expect(() => parseGateArgs(["--auth", "logged-in"])).toThrow("UNKNOWN_GATE_ARGUMENT");
   });
 
@@ -73,6 +80,14 @@ describe("SDK gate bookkeeping (offline, not runtime contract evidence)", () => 
     expect(summarize(checks.slice(1))).toBe("BLOCKED");
     expect(summarize([...checks, checks[0]!])).toBe("BLOCKED");
     expect(summarize([...checks, { contract: "cleanup", status: "FAIL", evidence: "test" }])).toBe("FAIL");
+  });
+
+  it("keeps the full gate blocked even if every readiness RPC and cleanup passes", () => {
+    const readiness: Check[] = (["runtime-version", "authentication", "model-discovery", "cleanup"] as const).map(
+      (contract) => ({ contract, status: "PASS", evidence: "synthetic-test-only" }),
+    );
+    expect(summarize(completeChecks(readiness, "SKIPPED", "AUTHENTICATED_BEHAVIOR_PROBES_NOT_IMPLEMENTED")))
+      .toBe("BLOCKED");
   });
 
   it("preserves observed failures when completing the matrix", () => {
@@ -211,16 +226,204 @@ describe("SDK auth option isolation (offline, not authentication evidence)", () 
       .toThrow("AUTH_GH_CONFIG_MUST_BE_ABSOLUTE");
   });
 
-  it("removes only newly owned run files when auth configuration fails before startup", () => {
+  it("leaves no newly owned run files when auth configuration fails before startup", () => {
     const parent = resolve(".cache", "sdk-contract");
     const before = existsSync(parent) ? readdirSync(parent).sort() : [];
     vi.stubEnv("HOME", "");
     try {
       expect(() => new IsolatedRuntime("logged-in")).toThrow("AUTH_HOME_REQUIRED");
-      expect(readdirSync(parent).sort()).toEqual(before);
+      expect(existsSync(parent) ? readdirSync(parent).sort() : []).toEqual(before);
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  describe("persistent service login (synthetic owned directories, never actual login state)", () => {
+    let project: string;
+    const state = "synthetic service state, not credentials or proof of authentication";
+
+    beforeEach(() => {
+      project = resolve(".cache", `sdk-service-login-test-${randomUUID()}`);
+      mkdirSync(project, { recursive: true, mode: 0o700 });
+      vi.spyOn(process, "cwd").mockReturnValue(project);
+      vi.stubEnv("HOME", join(project, "auth-home"));
+      vi.stubEnv("GH_CONFIG_DIR", join(project, "auth-home", ".config", "gh"));
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+      rmSync(project, { recursive: true, force: true });
+    });
+
+    function provisionSyntheticHome(): { home: string; marker: string } {
+      const home = join(project, "runtime", "copilot");
+      const marker = join(home, "service-state", "marker");
+      mkdirSync(dirname(marker), { recursive: true, mode: 0o700 });
+      writeFileSync(marker, state, { mode: 0o600 });
+      return { home, marker };
+    }
+
+    it("selects the fixed service baseDirectory while retaining per-run isolation and a token-free environment", () => {
+      const { home } = provisionSyntheticHome();
+      const options = runtimeOptions(runRoot, cli, "service-login", source);
+      const transient = runtimeOptions(runRoot, cli, "cli-login", source);
+      expect(options).toEqual({ ...transient, baseDirectory: home });
+      expect(options.mode).toBe("copilot-cli");
+      expect(options.useLoggedInUser).toBe(true);
+      expect(options.gitHubToken).toBeUndefined();
+      expect(options.workingDirectory).toBe(join(runRoot, "workspace"));
+      expect(options.env?.TMPDIR).toBe(join(runRoot, "scratch"));
+      expect(options.env?.COPILOT_HOME).toBeUndefined();
+      expect(options.env?.COPILOT_DISABLE_KEYTAR).toBeUndefined();
+      for (const name of ["COPILOT_GITHUB_TOKEN", "COPILOT_SDK_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const) {
+        expect(options.env?.[name]).toBeUndefined();
+        expect(JSON.stringify(options)).not.toContain(source[name]);
+      }
+      expect(source.COPILOT_HOME).toBe("/synthetic/private-copilot");
+    });
+
+    it.each([
+      ["missing-runtime", "SERVICE_LOGIN_HOME_MISSING"],
+      ["missing-home", "SERVICE_LOGIN_HOME_MISSING"],
+      ["home-file", "SERVICE_LOGIN_HOME_NOT_DIRECTORY"],
+      ["ancestor-file", "SERVICE_LOGIN_HOME_NOT_DIRECTORY"],
+      ["home-symlink", "SERVICE_LOGIN_HOME_SYMLINKED"],
+      ["dangling-home-symlink", "SERVICE_LOGIN_HOME_SYMLINKED"],
+      ["ancestor-symlink", "SERVICE_LOGIN_HOME_SYMLINKED"],
+      ["project-symlink", "SERVICE_LOGIN_HOME_SYMLINKED"],
+    ])("rejects %s before allocating run files or spawning, without fallback", async (kind, code) => {
+      const home = join(project, "runtime", "copilot");
+      const target = join(project, "synthetic-target");
+      switch (kind) {
+        case "missing-runtime":
+          break;
+        case "missing-home":
+          mkdirSync(dirname(home));
+          break;
+        case "home-file":
+          mkdirSync(dirname(home));
+          writeFileSync(home, state);
+          break;
+        case "ancestor-file":
+          writeFileSync(dirname(home), state);
+          break;
+        case "home-symlink":
+        case "dangling-home-symlink":
+          mkdirSync(dirname(home));
+          if (kind === "home-symlink") mkdirSync(target);
+          symlinkSync(target, home, "dir");
+          break;
+        case "ancestor-symlink":
+          mkdirSync(join(target, "copilot"), { recursive: true });
+          symlinkSync(target, dirname(home), "dir");
+          break;
+        case "project-symlink": {
+          mkdirSync(join(target, "runtime", "copilot"), { recursive: true });
+          const alias = join(project, "synthetic-alias");
+          symlinkSync(target, alias, "dir");
+          vi.mocked(process.cwd).mockReturnValue(alias);
+          break;
+        }
+      }
+      const start = vi.spyOn(CopilotClient.prototype, "start").mockRejectedValue(new GateError("UNEXPECTED_SDK_START"));
+      let runtime: IsolatedRuntime | undefined;
+      try {
+        expect(() => runtimeOptions(runRoot, cli, "service-login", source)).toThrow(code);
+        await expect(async () => {
+          runtime = new IsolatedRuntime("service-login");
+          await runtime.start();
+        }).rejects.toThrow(code);
+        expect(start).not.toHaveBeenCalled();
+        expect(existsSync(resolve(".cache"))).toBe(false);
+        if (kind.startsWith("missing")) expect(existsSync(home)).toBe(false);
+      } finally {
+        if (runtime) {
+          await runtime.stop(true);
+          runtime.removeOwnedFiles();
+        }
+      }
+    });
+
+    it("preserves provisioned state when logged-in environment validation fails", () => {
+      const { home, marker } = provisionSyntheticHome();
+      vi.stubEnv("HOME", "");
+      expect(() => new IsolatedRuntime("service-login")).toThrow("AUTH_HOME_REQUIRED");
+      expect(lstatSync(home).isDirectory()).toBe(true);
+      expect(readFileSync(marker, "utf8")).toBe(state);
+      expect(existsSync(join(project, ".cache"))).toBe(false);
+    });
+
+    it.each(["normal", "startup-failure"] as const)("retains service state through %s cleanup", async (kind) => {
+      const { home, marker } = provisionSyntheticHome();
+      const runtime = new IsolatedRuntime("service-login");
+      const start = vi.spyOn(runtime.client, "start").mockRejectedValue(new GateError("SYNTHETIC_START_FAILURE"));
+      try {
+        expect(runtime.root.startsWith(join(project, ".cache", "sdk-contract"))).toBe(true);
+        expect(existsSync(runtime.workspace)).toBe(true);
+        expect(existsSync(join(runtime.root, "scratch"))).toBe(true);
+        expect(existsSync(join(runtime.root, "copilot"))).toBe(false);
+        expect(() => runtime.removeOwnedFiles()).toThrow("REFUSING_CLEANUP_WITH_UNVERIFIED_RUNTIME");
+        if (kind === "startup-failure") {
+          await expect(runtime.start()).rejects.toThrow("SYNTHETIC_START_FAILURE");
+        } else {
+          expect(start).not.toHaveBeenCalled();
+        }
+      } finally {
+        expect((await runtime.stop()).issues).toEqual([]);
+        runtime.removeOwnedFiles();
+      }
+      expect(existsSync(runtime.root)).toBe(false);
+      expect(lstatSync(home).isDirectory()).toBe(true);
+      expect(readFileSync(marker, "utf8")).toBe(state);
+    });
+
+    it.each(["missing", "symlink", "ancestor-symlink"] as const)("rechecks %s service home immediately before SDK startup", async (kind) => {
+      const { home } = provisionSyntheticHome();
+      const runtime = new IsolatedRuntime("service-login");
+      const start = vi.spyOn(runtime.client, "start").mockRejectedValue(new GateError("UNEXPECTED_SDK_START"));
+      const saved = join(project, "saved-service-state");
+      let marker: string;
+      if (kind === "ancestor-symlink") {
+        renameSync(dirname(home), saved);
+        symlinkSync(saved, dirname(home), "dir");
+        marker = join(saved, "copilot", "service-state", "marker");
+      } else {
+        renameSync(home, saved);
+        if (kind === "symlink") symlinkSync(saved, home, "dir");
+        marker = join(saved, "service-state", "marker");
+      }
+      try {
+        await expect(runtime.start()).rejects.toThrow(
+          kind === "missing" ? "SERVICE_LOGIN_HOME_MISSING" : "SERVICE_LOGIN_HOME_SYMLINKED",
+        );
+        expect(start).not.toHaveBeenCalled();
+      } finally {
+        expect((await runtime.stop()).issues).toEqual([]);
+        runtime.removeOwnedFiles();
+      }
+      expect(existsSync(runtime.root)).toBe(false);
+      expect(readFileSync(marker, "utf8")).toBe(state);
+      if (kind === "missing") expect(existsSync(home)).toBe(false);
+      else expect(lstatSync(kind === "symlink" ? home : dirname(home)).isSymbolicLink()).toBe(true);
+    });
+
+    it.each(["normal", "stop-failure"] as const)("retains service state through emergency %s cleanup", async (kind) => {
+      const { home, marker } = provisionSyntheticHome();
+      // Emergency shutdown is terminal; keep its registry separate from other tests.
+      vi.resetModules();
+      const isolated = await import("../../src/agents/sdk-gate/runtime.js");
+      const runtime = new isolated.IsolatedRuntime("service-login");
+      if (kind === "stop-failure") {
+        vi.spyOn(runtime.client, "forceStop").mockRejectedValue(new Error("synthetic cleanup failure"));
+      }
+      const errors = await isolated.emergencyCleanup();
+      expect(errors).toEqual(kind === "normal" ? [] :
+        ["UPSTREAM_ERROR_REDACTED", "REFUSING_CLEANUP_WITH_UNVERIFIED_RUNTIME"]);
+      expect(existsSync(runtime.root)).toBe(kind === "stop-failure");
+      expect(lstatSync(home).isDirectory()).toBe(true);
+      expect(readFileSync(marker, "utf8")).toBe(state);
+    });
   });
 });
 

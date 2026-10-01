@@ -77,6 +77,7 @@ npm run sdk:gate                           # offline: SKIPPED/BLOCKED, exit 2
 npm run sdk:gate -- --real --readiness --auth=token
 npm run sdk:gate -- --real --readiness --auth=logged-in
 npm run sdk:gate -- --real --readiness --auth=cli-login
+npm run sdk:gate -- --real --readiness --auth=service-login # manual provisioning below
 npm run sdk:gate -- --real --auth=logged-in # also two-runtime forced-stop smoke
 ```
 
@@ -102,7 +103,9 @@ with the failing stage identified. Do not enable debug logging to share errors.
 
 ### Current real evidence and missing coverage
 
-The auth follow-up ran all three modes locally using Node **24.21.0**:
+The earlier auth follow-up ran the three transient modes. A later service-login
+readiness probe used the manually provisioned service home. Both used Node
+**24.21.0**; no model sessions were created:
 
 | Contract | Observation |
 |---|---|
@@ -110,9 +113,10 @@ The auth follow-up ran all three modes locally using Node **24.21.0**:
 | Token mode authentication | BLOCKED: `isAuthenticated === false`; explicit token environment input absent; logged-in fallback disabled |
 | Logged-in mode authentication | BLOCKED: `isAuthenticated === false` with `useLoggedInUser: true`, actual HOME, separate Copilot state and gh-specific discovery |
 | CLI-login mode authentication | BLOCKED: `isAuthenticated === false` also in `mode: "copilot-cli"` with stored-login discovery enabled and separate Copilot state |
-| Real model discovery | BLOCKED: actual `listModels()` RPC rejected; `modelCount: null`, not zero |
+| Service-login mode authentication | PASS: actual `getAuthStatus()` returned `isAuthenticated === true` with the persistent service home |
+| Real model discovery | Service-login PASS: actual `listModels()` returned 24 entries. Earlier transient probes were BLOCKED: RPC rejected; `modelCount: null`, not zero |
 | Forced runtime termination | Earlier smoke PASS: freeze one owned PID with SIGSTOP, observe its unresponsive RPC, terminate it, verify a distinct runtime PID still answers ping |
-| Cleanup | PASS: owned processes exited; per-run files removed; global Copilot config metadata unchanged during auth follow-up |
+| Cleanup | PASS: owned processes exited; per-run files removed. Service-login stopped without force and retained its persistent home. Earlier auth follow-up found global Copilot config metadata unchanged |
 | Full process isolation | BLOCKED: no authenticated active chats, native tool descendants, or model-originated subprocesses were tested |
 
 **Zero model requests were sent.** The remaining authenticated probes are
@@ -122,19 +126,22 @@ native subagents and delegated permission propagation, turn-boundary model
 switching, immediate steering, image input, abort during streaming/question/tool
 execution, resume with restored handlers, and no replay of pending external
 actions. The JSON matrix enumerates them individually. The gate deliberately
-cannot pass yet, even if auth is subsequently provisioned; finish those real
-checks before enabling dependent work.
+cannot pass yet, even with the now-authenticated service-login readiness result
+(exit 2 / BLOCKED); finish those real checks before enabling dependent work.
 
 Offline tests cover auth flag parsing, exact environment allowlists, no token-mode
 fallback, gh config path selection, auth-configuration failure cleanup, report
 completeness, failure/skip semantics, deadline handling, error sanitization,
 installed pins, PID identity and descendant selection, and cancellation of owned
-synthetic Node processes. **They are not mocked proof of SDK permissions,
+synthetic Node processes. Service-login tests use only synthetic owned directories:
+they check the selected persistent home, missing/non-directory/symlinked paths
+(including ancestors), pre-start revalidation, and preservation through normal,
+failed-start, and emergency cleanup. **They are not proof of authentication, SDK permissions,
 delegated policy, abort/idle, or resume.**
 No tool-capable sessions are created by this checkpoint; no real external service
 mutations, arbitrary shell permissions, or blanket approvals are used.
 
-### Explicit authentication modes and current blocker
+### Explicit authentication modes
 
 - **`--auth=token` (default):** uses only externally injected
   `COPILOT_GITHUB_TOKEN`, passed as SDK `gitHubToken`. `useLoggedInUser: false`
@@ -156,6 +163,15 @@ mutations, arbitrary shell permissions, or blanket approvals are used.
   sessions and built-in MCPs are disabled, and no model sessions are created.
   This readiness-only alternative is not approval to load ambient tools in the
   eventual application.
+- **`--auth=service-login`:** uses the same sanitized logged-in environment and
+  `useLoggedInUser: true`, with `mode: "copilot-cli"` and the fixed persistent
+  `resolve("runtime/copilot")` as SDK `baseDirectory` / runtime `COPILOT_HOME`.
+  It ignores ambient `COPILOT_HOME` and token variables. This service-only home
+  must be manually provisioned; the gate never creates it or falls back to the
+  interactive CLI home. Workspace, OS scratch and XDG directories remain
+  per-run. The service home can also contain SDK-generated service state;
+  it must never contain copied interactive CLI config, personas or history.
+  No model sessions are created.
 
 **Pinned-SDK limitation:** `@github/copilot-sdk@1.0.16`'s
 `buildRuntimeEnv()` unconditionally sets `COPILOT_DISABLE_KEYTAR=1` in
@@ -171,8 +187,53 @@ harness choice, not a requirement of Densemble; its keytar setting alone does
 not explain the failure in CLI-login mode. These probes establish missing
 authentication for the tested configurations, not that interactive Copilot is
 logged out or that every possible authentication route is unsupported.
+Those transient-home results do not describe the authenticated service-login
+result above.
 No SDK patch, direct credential extraction, credential copying, or global
 config migration was attempted.
+
+### Manual OAuth login for the service-only home
+
+From the repository root, explicitly provision a private, non-symlinked
+`runtime/copilot` and complete the browser login yourself:
+
+```sh
+mkdir -p runtime/copilot
+chmod 700 runtime/copilot
+env -u COPILOT_GITHUB_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+  COPILOT_HOME="$PWD/runtime/copilot" COPILOT_AUTO_UPDATE=false \
+  ./node_modules/@github/copilot-darwin-arm64/copilot login --web-flow
+```
+
+Do not point this directory (or any ancestor) at a symlink. Do not copy an
+existing login, print/extract stored tokens, share OAuth codes, or use global
+login/logout for this gate. The command is a **manual prerequisite**, never run
+automatically by the gate. It uses the pinned native CLI and only its
+service-specific Copilot home; the user's interactive `~/.copilot` stays untouched.
+
+After completing login, with Node 24 active:
+
+```sh
+npm run sdk:gate -- --real --readiness --auth=service-login
+```
+
+The gate checks the service directory and every ancestor before allocating
+run files, then again immediately before SDK startup. Missing paths report
+`SERVICE_LOGIN_HOME_MISSING`, non-directories report
+`SERVICE_LOGIN_HOME_NOT_DIRECTORY`, symlinks report
+`SERVICE_LOGIN_HOME_SYMLINKED`, and unreadable paths report
+`SERVICE_LOGIN_HOME_UNREADABLE`. No runtime is spawned on these failures.
+Directory/config-file presence is **not** authentication evidence: only the real
+`getAuthStatus()` RPC establishes readiness. No token values are read or copied
+by the harness. The CLI/SDK uses its own supported auth discovery.
+
+Normal cleanup, startup failure and emergency cleanup never remove the service
+home or anything inside it. Treat it as private service state, including any
+SDK-generated files/logs, not a disposable run directory. Readiness performs
+**zero model requests**; even authenticated readiness leaves the entire gate
+**BLOCKED** until the remaining contracts are implemented and pass.
+
+### Other explicit credential sources
 
 A new PAT is **not mandated**. If an existing supported credential is available
 through an external secret launcher, inject it as `COPILOT_GITHUB_TOKEN`:
@@ -184,25 +245,29 @@ npm run sdk:gate -- --real --readiness --auth=token
 Alternatively, already installed/authenticated `gh` can be tested with
 `--auth=logged-in`; that route was unavailable locally and has **not** been
 validated as authenticated. Do not install/login automatically to make the
-gate pass. Keep any newly supplied credential in the existing external canonical
-`secrets.local.json`, never a new store here; leave existing CLI/gh stores
-untouched. Never paste a token into a command line, report, commit, or shared
+gate pass. Keep manually supplied token credentials in the existing external
+canonical `secrets.local.json`, never a new token store here. The explicit manual
+OAuth flow above lets the CLI manage its own service login state; leave existing
+interactive CLI/gh stores untouched. Never paste a token into a command line, report, commit, or shared
 log. Do not copy `~/.copilot`, run global login/logout, or change global CLI
 configuration.
 
 ### Isolation, limits, and boundaries
 
 Each run owns a fresh UUID directory beneath ignored `.cache/sdk-contract/`
-(0700), containing its workspace, Copilot home, OS home and runtime scratch.
+(0700), containing its workspace, OS home and runtime scratch. Transient auth
+modes also keep their Copilot home there; only explicit service-login mode uses
+the persistent, separately provisioned `runtime/copilot`, outside all cleanup.
 Only a small environment allowlist reaches the CLI. All auth modes keep
-an isolated `baseDirectory` (SDK sets `COPILOT_HOME`), an empty
+a service-controlled `baseDirectory` (SDK sets `COPILOT_HOME`), an empty
 workspace, disabled custom instructions/built-in MCPs/remote sessions/export,
 and no model sessions or cross-session searches. Logged-in modes' sole
 discovery exception is existing authentication through HOME/gh config, **not**
 interactive Copilot config, personas, or history. Token and logged-in modes use
-`mode: "empty"`; CLI-login uses `mode: "copilot-cli"`. Log level remains `none`,
-but CLI mode enables the SDK's process file-logging facility inside the owned
-run directory, which is removed on cleanup. This
+`mode: "empty"`; CLI-login and service-login use `mode: "copilot-cli"`.
+Log level remains `none`, but CLI mode enables the SDK's process file-logging
+facility in its Copilot home: disposable for CLI-login, potentially persistent
+service-only state for service-login. This
 is configuration separation, not an OS sandbox or a guarantee about future
 tool-capable sessions.
 

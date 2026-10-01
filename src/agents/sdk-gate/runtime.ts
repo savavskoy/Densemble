@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -76,12 +76,33 @@ export function pinnedCli(): string {
   return cliPath;
 }
 
+function assertServiceLoginHome(home: string): void {
+  const ancestors: string[] = [];
+  for (let path = home; ; path = dirname(path)) {
+    ancestors.push(path);
+    if (dirname(path) === path) break;
+  }
+  for (const path of ancestors.reverse()) {
+    let stat;
+    try {
+      stat = lstatSync(path);
+    } catch (error) {
+      throw new GateError((error as NodeJS.ErrnoException).code === "ENOENT" ?
+        "SERVICE_LOGIN_HOME_MISSING" : "SERVICE_LOGIN_HOME_UNREADABLE");
+    }
+    if (stat.isSymbolicLink()) throw new GateError("SERVICE_LOGIN_HOME_SYMLINKED");
+    if (!stat.isDirectory()) throw new GateError("SERVICE_LOGIN_HOME_NOT_DIRECTORY");
+  }
+}
+
 export function runtimeOptions(
   root: string,
   cliPath: string,
   authMode: AuthMode,
   source: NodeJS.ProcessEnv = process.env,
 ): CopilotClientOptions {
+  const baseDirectory = authMode === "service-login" ? resolve("runtime", "copilot") : join(root, "copilot");
+  if (authMode === "service-login") assertServiceLoginHome(baseDirectory);
   const env: Record<string, string> = {
     HOME: join(root, "home"),
     XDG_CONFIG_HOME: join(root, "home", ".config"),
@@ -93,7 +114,7 @@ export function runtimeOptions(
   if (authMode !== "token") {
     if (!source.HOME || !isAbsolute(source.HOME)) throw new GateError("AUTH_HOME_REQUIRED");
     env.HOME = source.HOME;
-    // Only gh may discover its existing auth configuration; XDG and Copilot stay isolated.
+    // Only gh may discover its existing auth configuration; Copilot uses our explicit baseDirectory.
     const ghConfig = source.GH_CONFIG_DIR ??
       join(source.XDG_CONFIG_HOME || join(source.HOME, ".config"), "gh");
     if (!isAbsolute(ghConfig)) throw new GateError("AUTH_GH_CONFIG_MUST_BE_ABSOLUTE");
@@ -107,8 +128,8 @@ export function runtimeOptions(
       path: cliPath,
       args: ["--no-auto-update", "--no-custom-instructions", "--disable-builtin-mcps", "--no-remote-export", "--no-bash-env"],
     }),
-    mode: authMode === "cli-login" ? "copilot-cli" : "empty",
-    baseDirectory: join(root, "copilot"),
+    mode: authMode === "cli-login" || authMode === "service-login" ? "copilot-cli" : "empty",
+    baseDirectory,
     workingDirectory: join(root, "workspace"),
     env,
     ...(token ? { gitHubToken: token } : {}),
@@ -128,6 +149,7 @@ export class IsolatedRuntime {
   private monitor: NodeJS.Timeout | undefined;
   private monitorError: string | undefined;
   private readonly parentDirectory: string;
+  private readonly serviceHome: string | undefined;
   private removed = false;
   private cleanupVerified = false;
   private closing: Promise<{ forced: boolean; issues: string[] }> | undefined;
@@ -136,20 +158,24 @@ export class IsolatedRuntime {
     if (shuttingDown) throw new GateError("GATE_SHUTTING_DOWN");
     this.cliPath = pinnedCli();
     const cache = resolve(".cache");
+    this.parentDirectory = join(cache, "sdk-contract");
+    this.root = join(this.parentDirectory, randomUUID());
+    this.workspace = join(this.root, "workspace");
+    const options = runtimeOptions(this.root, this.cliPath, authMode);
+    this.serviceHome = authMode === "service-login" ? options.baseDirectory : undefined;
     mkdirSync(cache, { recursive: true, mode: 0o700 });
     if (realpathSync(cache) !== cache) throw new GateError("CACHE_MUST_NOT_BE_SYMLINKED");
-    this.parentDirectory = join(cache, "sdk-contract");
     mkdirSync(this.parentDirectory, { recursive: true, mode: 0o700 });
     if (realpathSync(this.parentDirectory) !== this.parentDirectory) {
       throw new GateError("CACHE_MUST_NOT_BE_SYMLINKED");
     }
-    this.root = join(this.parentDirectory, randomUUID());
-    this.workspace = join(this.root, "workspace");
     try {
-      for (const path of [this.workspace, join(this.root, "home"), join(this.root, "scratch"), join(this.root, "copilot")]) {
+      const directories = [this.workspace, join(this.root, "home"), join(this.root, "scratch")];
+      if (!this.serviceHome) directories.push(join(this.root, "copilot"));
+      for (const path of directories) {
         mkdirSync(path, { recursive: true, mode: 0o700 });
       }
-      this.client = new CopilotClient(runtimeOptions(this.root, this.cliPath, authMode));
+      this.client = new CopilotClient(options);
     } catch (error) {
       if (existsSync(this.root)) rmSync(this.root, { recursive: true });
       throw error;
@@ -159,6 +185,7 @@ export class IsolatedRuntime {
 
   async start(): Promise<void> {
     if (this.closing || this.identity || this.removed) throw new GateError("RUNTIME_ALREADY_USED");
+    if (this.serviceHome) assertServiceLoginHome(this.serviceHome);
     this.monitor = setInterval(() => {
       try {
         this.observeProcesses();

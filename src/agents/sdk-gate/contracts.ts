@@ -80,7 +80,7 @@ export function completeChecks(checks: Check[], missingStatus: "BLOCKED" | "SKIP
   });
 }
 
-export type AuthMode = "token" | "logged-in" | "cli-login";
+export type AuthMode = "token" | "logged-in" | "cli-login" | "service-login";
 export type GateOptions = { real: boolean; readinessOnly: boolean; authMode: AuthMode };
 
 export function parseGateArgs(args: string[]): GateOptions {
@@ -91,7 +91,7 @@ export function parseGateArgs(args: string[]): GateOptions {
     if (!arg.startsWith("--auth=")) throw new GateError("UNKNOWN_GATE_ARGUMENT");
     if (authSelected) throw new GateError("DUPLICATE_AUTH_MODE");
     const value = arg.slice("--auth=".length);
-    if (value !== "token" && value !== "logged-in" && value !== "cli-login") {
+    if (value !== "token" && value !== "logged-in" && value !== "cli-login" && value !== "service-login") {
       throw new GateError("INVALID_AUTH_MODE");
     }
     authMode = value;

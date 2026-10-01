@@ -115,7 +115,7 @@ if (!interrupted) {
     authMode,
     readiness: { isAuthenticated, modelCount },
     modelRequests: 0,
-    provisioning: "Choose --auth=token with externally supplied COPILOT_GITHUB_TOKEN, --auth=logged-in for empty-mode gh discovery, or --auth=cli-login for CLI-mode stored-login discovery. No login or credential migration is performed.",
+    provisioning: "Choose --auth=token with externally supplied COPILOT_GITHUB_TOKEN, --auth=logged-in for empty-mode gh discovery, --auth=cli-login for transient CLI-mode stored-login discovery, or --auth=service-login for a manually provisioned runtime/copilot service home (never removed by gate cleanup). No login or credential migration is performed.",
     checks: complete, observations,
   }, null, 2));
   process.exitCode = status === "PASS" ? 0 : status === "FAIL" ? 1 : 2;
