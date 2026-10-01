@@ -4,7 +4,11 @@
   "agentLaunchersPath": "/absolute/path/to/agent-workspace/.github/agents",
   "secretsPath": "/absolute/path/to/agent-workspace/secrets.local.json",
   "runtimeDataPath": "./data",
-  "ownerId": 0,
+  "runtimeHomePath": "./runtime/copilot",
+  "skillDirectories": [
+    "/absolute/path/to/agent-workspace/agent/skills"
+  ],
+  "ownerId": 1,
   "bots": [
     {
       "id": "example-bot",
@@ -12,5 +16,15 @@
       "tokenRef": "telegram.example_bot_token"
     }
   ],
-  "bindings": []
+  "bindings": [
+    {
+      "botId": "example-bot",
+      "chatId": 1,
+      "kind": "private",
+      "topicId": null
+    }
+  ],
+  "mcp": {
+    "mode": "none"
+  }
 }
