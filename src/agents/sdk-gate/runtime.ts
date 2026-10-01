@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
+import type { CopilotClientOptions } from "@github/copilot-sdk";
 import { bounded, CLI_VERSION, GateError, safeError, SDK_VERSION } from "./contracts.js";
+import type { AuthMode } from "./contracts.js";
 
 export type ProcessIdentity = { pid: number; parent: number; started: string; command: string; state: string };
 
@@ -74,6 +76,48 @@ export function pinnedCli(): string {
   return cliPath;
 }
 
+export function runtimeOptions(
+  root: string,
+  cliPath: string,
+  authMode: AuthMode,
+  source: NodeJS.ProcessEnv = process.env,
+): CopilotClientOptions {
+  const env: Record<string, string> = {
+    HOME: join(root, "home"),
+    XDG_CONFIG_HOME: join(root, "home", ".config"),
+    XDG_CACHE_HOME: join(root, "home", ".cache"),
+    TMPDIR: join(root, "scratch"),
+    PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+    LANG: "en_US.UTF-8",
+  };
+  if (authMode !== "token") {
+    if (!source.HOME || !isAbsolute(source.HOME)) throw new GateError("AUTH_HOME_REQUIRED");
+    env.HOME = source.HOME;
+    // Only gh may discover its existing auth configuration; XDG and Copilot stay isolated.
+    const ghConfig = source.GH_CONFIG_DIR ??
+      join(source.XDG_CONFIG_HOME || join(source.HOME, ".config"), "gh");
+    if (!isAbsolute(ghConfig)) throw new GateError("AUTH_GH_CONFIG_MUST_BE_ABSOLUTE");
+    env.GH_CONFIG_DIR = ghConfig;
+    env.GH_PROMPT_DISABLED = "1";
+    env.PATH = `${dirname(process.execPath)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`;
+  }
+  const token = authMode === "token" ? source.COPILOT_GITHUB_TOKEN : undefined;
+  return {
+    connection: RuntimeConnection.forStdio({
+      path: cliPath,
+      args: ["--no-auto-update", "--no-custom-instructions", "--disable-builtin-mcps", "--no-remote-export", "--no-bash-env"],
+    }),
+    mode: authMode === "cli-login" ? "copilot-cli" : "empty",
+    baseDirectory: join(root, "copilot"),
+    workingDirectory: join(root, "workspace"),
+    env,
+    ...(token ? { gitHubToken: token } : {}),
+    useLoggedInUser: authMode !== "token",
+    enableRemoteSessions: false,
+    logLevel: "none",
+  };
+}
+
 export class IsolatedRuntime {
   readonly root: string;
   readonly workspace: string;
@@ -88,7 +132,7 @@ export class IsolatedRuntime {
   private cleanupVerified = false;
   private closing: Promise<{ forced: boolean; issues: string[] }> | undefined;
 
-  constructor() {
+  constructor(authMode: AuthMode = "token") {
     if (shuttingDown) throw new GateError("GATE_SHUTTING_DOWN");
     this.cliPath = pinnedCli();
     const cache = resolve(".cache");
@@ -105,27 +149,7 @@ export class IsolatedRuntime {
       for (const path of [this.workspace, join(this.root, "home"), join(this.root, "scratch"), join(this.root, "copilot")]) {
         mkdirSync(path, { recursive: true, mode: 0o700 });
       }
-      const token = process.env.COPILOT_GITHUB_TOKEN;
-      this.client = new CopilotClient({
-        connection: RuntimeConnection.forStdio({
-          path: this.cliPath,
-          args: ["--no-auto-update", "--no-custom-instructions", "--disable-builtin-mcps", "--no-remote-export", "--no-bash-env"],
-        }),
-        mode: "empty",
-        baseDirectory: join(this.root, "copilot"),
-        workingDirectory: this.workspace,
-        env: {
-          HOME: join(this.root, "home"),
-          XDG_CONFIG_HOME: join(this.root, "home", ".config"),
-          XDG_CACHE_HOME: join(this.root, "home", ".cache"),
-          TMPDIR: join(this.root, "scratch"),
-          PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
-          LANG: "en_US.UTF-8",
-        },
-        ...(token ? { gitHubToken: token } : {}),
-        useLoggedInUser: false,
-        logLevel: "none",
-      });
+      this.client = new CopilotClient(runtimeOptions(this.root, this.cliPath, authMode));
     } catch (error) {
       if (existsSync(this.root)) rmSync(this.root, { recursive: true });
       throw error;

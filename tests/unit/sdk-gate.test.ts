@@ -1,15 +1,16 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   bounded, CLI_VERSION, completeChecks, GateError, parseGateArgs,
   REQUIRED_CONTRACTS, safeError, SDK_VERSION, summarize,
 } from "../../src/agents/sdk-gate/contracts.js";
 import type { Check } from "../../src/agents/sdk-gate/contracts.js";
 import {
-  descendants, parseProcessList, pinnedCli, processes, sameProcess, signalOwned,
+  descendants, IsolatedRuntime, parseProcessList, pinnedCli, processes, runtimeOptions, sameProcess, signalOwned,
 } from "../../src/agents/sdk-gate/runtime.js";
 import type { ProcessIdentity } from "../../src/agents/sdk-gate/runtime.js";
 
@@ -20,10 +21,33 @@ const root: ProcessIdentity = {
 
 describe("SDK gate bookkeeping (offline, not runtime contract evidence)", () => {
   it("requires explicit real opt-in", () => {
-    expect(parseGateArgs([])).toEqual({ real: false, readinessOnly: false });
-    expect(parseGateArgs(["--readiness"])).toEqual({ real: false, readinessOnly: true });
-    expect(parseGateArgs(["--real", "--readiness"])).toEqual({ real: true, readinessOnly: true });
+    expect(parseGateArgs([])).toEqual({ real: false, readinessOnly: false, authMode: "token" });
+    expect(parseGateArgs(["--readiness"])).toEqual({ real: false, readinessOnly: true, authMode: "token" });
+    expect(parseGateArgs(["--real", "--readiness"])).toEqual({ real: true, readinessOnly: true, authMode: "token" });
     expect(() => parseGateArgs(["--approve-all"])).toThrow("UNKNOWN_GATE_ARGUMENT");
+  });
+
+  it("selects an auth source explicitly without implying real opt-in", () => {
+    expect(parseGateArgs(["--auth=logged-in"])).toEqual({
+      real: false, readinessOnly: false, authMode: "logged-in",
+    });
+    for (const authMode of ["token", "logged-in", "cli-login"] as const) {
+      expect(parseGateArgs(["--real", `--auth=${authMode}`, "--readiness"])).toEqual({
+        real: true, readinessOnly: true, authMode,
+      });
+    }
+  });
+
+  it.each(["--auth=", "--auth=auto", "--auth=TOKEN", "--auth=synthetic-sensitive-value"])(
+    "rejects invalid auth mode without echoing its contents: %s", (arg) => {
+      expect(() => parseGateArgs([arg])).toThrow("INVALID_AUTH_MODE");
+    },
+  );
+
+  it("rejects conflicting or repeated auth selection rather than using last-wins", () => {
+    expect(() => parseGateArgs(["--auth=token", "--auth=logged-in"])).toThrow("DUPLICATE_AUTH_MODE");
+    expect(() => parseGateArgs(["--auth=token", "--auth=token"])).toThrow("DUPLICATE_AUTH_MODE");
+    expect(() => parseGateArgs(["--auth", "logged-in"])).toThrow("UNKNOWN_GATE_ARGUMENT");
   });
 
   it("checks the actually installed pinned packages without starting the CLI", () => {
@@ -82,6 +106,121 @@ describe("SDK gate bookkeeping (offline, not runtime contract evidence)", () => 
     await expect(bounded(pending, 5, "RPC_TIMEOUT")).rejects.toThrow("RPC_TIMEOUT");
     rejectLate(new Error("synthetic late failure"));
     await delay(1);
+  });
+});
+
+describe("SDK auth option isolation (offline, not authentication evidence)", () => {
+  const runRoot = "/synthetic/sdk-run";
+  const cli = "/synthetic/pinned-cli";
+  const source = Object.freeze({
+    HOME: "/synthetic/actual-home",
+    XDG_CONFIG_HOME: "/synthetic/actual-config",
+    XDG_CACHE_HOME: "/synthetic/actual-cache",
+    PATH: "/synthetic/untrusted-bin",
+    TMPDIR: "/synthetic/ambient-scratch",
+    COPILOT_GITHUB_TOKEN: "synthetic-explicit-token",
+    COPILOT_SDK_AUTH_TOKEN: "synthetic-other-sdk-token",
+    GH_TOKEN: "synthetic-other-gh-token",
+    GITHUB_TOKEN: "synthetic-other-github-token",
+    COPILOT_HOME: "/synthetic/private-copilot",
+    COPILOT_CLI_PATH: "/synthetic/untrusted-cli",
+    COPILOT_DISABLE_KEYTAR: "0",
+    COPILOT_PROVIDER_API_KEY: "synthetic-provider-key",
+    COPILOT_PROVIDER_BASE_URL: "https://example.invalid",
+    COPILOT_OFFLINE: "true",
+    COPILOT_RUNTIME_PROCESS_FILE_LOGGING: "1",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "https://example.invalid",
+    NODE_OPTIONS: "--require=/synthetic/untrusted.js",
+    NODE_DEBUG: "*",
+    BASH_ENV: "/synthetic/untrusted.sh",
+    SECRET_UNRELATED: "synthetic-secret",
+  });
+
+  it.each(["token", "logged-in", "cli-login"] as const)("preserves safe runtime boundaries in %s mode", (mode) => {
+    const options = runtimeOptions(runRoot, cli, mode, source);
+    expect(options.mode).toBe(mode === "cli-login" ? "copilot-cli" : "empty");
+    expect(options.baseDirectory).toBe(join(runRoot, "copilot"));
+    expect(options.workingDirectory).toBe(join(runRoot, "workspace"));
+    expect(options.logLevel).toBe("none");
+    expect(options.enableRemoteSessions).toBe(false);
+    expect(options.connection).toMatchObject({
+      kind: "stdio", path: cli,
+      args: ["--no-auto-update", "--no-custom-instructions", "--disable-builtin-mcps", "--no-remote-export", "--no-bash-env"],
+    });
+    expect(options.env?.XDG_CONFIG_HOME).toBe(join(runRoot, "home", ".config"));
+    expect(options.env?.XDG_CACHE_HOME).toBe(join(runRoot, "home", ".cache"));
+    expect(options.env?.TMPDIR).toBe(join(runRoot, "scratch"));
+  });
+
+  it("passes only the explicitly selected token and never opts into account fallback", () => {
+    const options = runtimeOptions(runRoot, cli, "token", source);
+    expect(options.gitHubToken).toBe("synthetic-explicit-token");
+    expect(options.useLoggedInUser).toBe(false);
+    expect(options.env).toEqual({
+      HOME: join(runRoot, "home"),
+      XDG_CONFIG_HOME: join(runRoot, "home", ".config"),
+      XDG_CACHE_HOME: join(runRoot, "home", ".cache"),
+      TMPDIR: join(runRoot, "scratch"),
+      PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+      LANG: "en_US.UTF-8",
+    });
+  });
+
+  it.each([undefined, ""])("does not fall back when the selected token is absent or empty", (token) => {
+    const options = runtimeOptions(runRoot, cli, "token", { ...source, COPILOT_GITHUB_TOKEN: token });
+    expect(options.gitHubToken).toBeUndefined();
+    expect(options.useLoggedInUser).toBe(false);
+    expect(options.env?.GH_TOKEN).toBeUndefined();
+    expect(options.env?.GITHUB_TOKEN).toBeUndefined();
+  });
+
+  it.each(["logged-in", "cli-login"] as const)("allows only HOME and gh discovery in %s, not ambient tokens/settings", (mode) => {
+    const options = runtimeOptions(runRoot, cli, mode, source);
+    expect(options.gitHubToken).toBeUndefined();
+    expect(options.useLoggedInUser).toBe(true);
+    expect(options.env).toEqual({
+      HOME: source.HOME,
+      GH_CONFIG_DIR: join(source.XDG_CONFIG_HOME, "gh"),
+      GH_PROMPT_DISABLED: "1",
+      XDG_CONFIG_HOME: join(runRoot, "home", ".config"),
+      XDG_CACHE_HOME: join(runRoot, "home", ".cache"),
+      TMPDIR: join(runRoot, "scratch"),
+      PATH: `${dirname(process.execPath)}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`,
+      LANG: "en_US.UTF-8",
+    });
+  });
+
+  it("supports the default or explicit gh auth directory without changing XDG discovery", () => {
+    const defaults = runtimeOptions(runRoot, cli, "logged-in", { HOME: source.HOME });
+    expect(defaults.env?.GH_CONFIG_DIR).toBe(join(source.HOME, ".config", "gh"));
+    const explicit = runtimeOptions(runRoot, cli, "logged-in", {
+      ...source, GH_CONFIG_DIR: "/synthetic/custom-gh",
+    });
+    expect(explicit.env?.GH_CONFIG_DIR).toBe("/synthetic/custom-gh");
+    expect(explicit.env?.XDG_CONFIG_HOME).toBe(join(runRoot, "home", ".config"));
+  });
+
+  it.each([undefined, "", "relative-home"])("rejects missing/relative logged-in HOME", (HOME) => {
+    expect(() => runtimeOptions(runRoot, cli, "logged-in", { HOME })).toThrow("AUTH_HOME_REQUIRED");
+  });
+
+  it.each([
+    { GH_CONFIG_DIR: "" }, { GH_CONFIG_DIR: "relative-gh" }, { XDG_CONFIG_HOME: "relative-xdg" },
+  ])("rejects ambiguous gh config paths", (overrides) => {
+    expect(() => runtimeOptions(runRoot, cli, "logged-in", { HOME: source.HOME, ...overrides }))
+      .toThrow("AUTH_GH_CONFIG_MUST_BE_ABSOLUTE");
+  });
+
+  it("removes only newly owned run files when auth configuration fails before startup", () => {
+    const parent = resolve(".cache", "sdk-contract");
+    const before = existsSync(parent) ? readdirSync(parent).sort() : [];
+    vi.stubEnv("HOME", "");
+    try {
+      expect(() => new IsolatedRuntime("logged-in")).toThrow("AUTH_HOME_REQUIRED");
+      expect(readdirSync(parent).sort()).toEqual(before);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 

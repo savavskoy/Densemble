@@ -1,16 +1,19 @@
 import { bounded, CLI_VERSION, completeChecks, parseGateArgs, safeError, SDK_VERSION, summarize } from "./contracts.js";
-import type { Check, Observation } from "./contracts.js";
+import type { AuthMode, Check, Observation } from "./contracts.js";
 import { emergencyCleanup, IsolatedRuntime, isolatedStopSmoke } from "./runtime.js";
 
 const checks: Check[] = [];
 const observations: Observation[] = [];
 let real = false;
 let readinessOnly = false;
+let authMode: AuthMode = "token";
+let isAuthenticated: boolean | null = null;
+let modelCount: number | null = null;
 let runtime: IsolatedRuntime | undefined;
 let blockedBy = "REAL_PROBES_NOT_ENABLED";
 let argumentError = false;
 try {
-  ({ real, readinessOnly } = parseGateArgs(process.argv.slice(2)));
+  ({ real, readinessOnly, authMode } = parseGateArgs(process.argv.slice(2)));
 } catch (error) {
   blockedBy = safeError(error);
   argumentError = true;
@@ -37,7 +40,7 @@ if (argumentError) {
   blockedBy = "NODE_24_REQUIRED";
 } else if (real) {
   try {
-    runtime = new IsolatedRuntime();
+    runtime = new IsolatedRuntime(authMode);
     await runtime.start();
     const status = await bounded(runtime.client.getStatus(), 10_000, "STATUS_TIMEOUT");
     checks.push({
@@ -46,13 +49,15 @@ if (argumentError) {
       evidence: `SDK=${SDK_VERSION}; runtime=${status.version === CLI_VERSION ? CLI_VERSION : "MISMATCH"}; protocol=${status.protocolVersion}`,
     });
     const auth = await bounded(runtime.client.getAuthStatus(), 10_000, "AUTH_TIMEOUT");
+    isAuthenticated = auth.isAuthenticated;
     checks.push({
       contract: "authentication", status: auth.isAuthenticated ? "PASS" : "BLOCKED",
-      evidence: auth.isAuthenticated ? "ISOLATED_HOME_AUTHENTICATED" : "ISOLATED_HOME_NOT_AUTHENTICATED",
+      evidence: `AUTH_MODE=${authMode}; IS_AUTHENTICATED=${isAuthenticated}`,
     });
     // Attempt the actual RPC even when auth says false; do not infer model availability.
     try {
       const models = await bounded(runtime.client.listModels(), 15_000, "MODEL_LIST_TIMEOUT");
+      modelCount = models.length;
       checks.push({
         contract: "model-discovery", status: models.length ? "PASS" : "BLOCKED",
         evidence: `REAL_MODEL_COUNT=${models.length}`,
@@ -107,8 +112,10 @@ if (!interrupted) {
   console.log(JSON.stringify({
     status, sdk: SDK_VERSION, cli: CLI_VERSION,
     scope: "READINESS_AND_AUTH_INDEPENDENT_PROCESS_SMOKE_ONLY",
+    authMode,
+    readiness: { isAuthenticated, modelCount },
     modelRequests: 0,
-    provisioning: "Inject COPILOT_GITHUB_TOKEN from your external canonical secret store; rerun --real --readiness. Interactive CLI auth is not reused.",
+    provisioning: "Choose --auth=token with externally supplied COPILOT_GITHUB_TOKEN, --auth=logged-in for empty-mode gh discovery, or --auth=cli-login for CLI-mode stored-login discovery. No login or credential migration is performed.",
     checks: complete, observations,
   }, null, 2));
   process.exitCode = status === "PASS" ? 0 : status === "FAIL" ? 1 : 2;

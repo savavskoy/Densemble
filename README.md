@@ -74,36 +74,45 @@ npm run typecheck
 npm test
 npm run build
 npm run sdk:gate                           # offline: SKIPPED/BLOCKED, exit 2
-npm run sdk:gate -- --real --readiness      # actual start/status/auth/listModels
-npm run sdk:gate -- --real                  # also two-runtime forced-stop smoke
+npm run sdk:gate -- --real --readiness --auth=token
+npm run sdk:gate -- --real --readiness --auth=logged-in
+npm run sdk:gate -- --real --readiness --auth=cli-login
+npm run sdk:gate -- --real --auth=logged-in # also two-runtime forced-stop smoke
 ```
 
 Without a Node version manager:
 
 ```sh
 npm exec --yes --package=node@24.21.0 --package=npm@11.9.0 -- \
-  sh -c 'node --version && npm run sdk:gate -- --real'
+  sh -c 'node --version && npm run sdk:gate -- --real --readiness --auth=logged-in'
 ```
 
 Exit **0** is reserved for the entire required contract matrix passing; **1**
 means a failed check/cleanup or invalid arguments; **2** means blocked/skipped.
 Readiness-only success cannot unlock dependent work. To consume just the JSON
 report after building, run `node dist/agents/sdk-gate/main.js --real`.
+`--auth=token` is the default; selecting an auth mode alone does not enable
+real probes. Unknown modes and repeated/conflicting auth flags fail before
+launching a runtime. `readiness.isAuthenticated` and `readiness.modelCount`
+contain actual RPC results, or `null` when unavailable/unattempted. A rejected
+model-list RPC is **not** reported as a zero-model result.
 No report contains tokens, login names, model responses, raw RPC errors, or
 tool arguments. An upstream failure is reported as `UPSTREAM_ERROR_REDACTED`,
 with the failing stage identified. Do not enable debug logging to share errors.
 
 ### Current real evidence and missing coverage
 
-The gate was run locally using Node **24.21.0**:
+The auth follow-up ran all three modes locally using Node **24.21.0**:
 
 | Contract | Observation |
 |---|---|
 | Pinned runtime start/status | PASS: CLI 1.0.91, protocol 3 |
-| Isolated authentication | BLOCKED: `getAuthStatus().isAuthenticated === false` |
-| Real model discovery | BLOCKED: the actual `listModels()` RPC rejected |
-| Forced runtime termination | Smoke PASS: freeze one owned PID with SIGSTOP, observe its unresponsive RPC, terminate it, verify a distinct runtime PID still answers ping |
-| Cleanup | PASS: observed owned runtime processes exited; per-run files removed |
+| Token mode authentication | BLOCKED: `isAuthenticated === false`; explicit token environment input absent; logged-in fallback disabled |
+| Logged-in mode authentication | BLOCKED: `isAuthenticated === false` with `useLoggedInUser: true`, actual HOME, separate Copilot state and gh-specific discovery |
+| CLI-login mode authentication | BLOCKED: `isAuthenticated === false` also in `mode: "copilot-cli"` with stored-login discovery enabled and separate Copilot state |
+| Real model discovery | BLOCKED: actual `listModels()` RPC rejected; `modelCount: null`, not zero |
+| Forced runtime termination | Earlier smoke PASS: freeze one owned PID with SIGSTOP, observe its unresponsive RPC, terminate it, verify a distinct runtime PID still answers ping |
+| Cleanup | PASS: owned processes exited; per-run files removed; global Copilot config metadata unchanged during auth follow-up |
 | Full process isolation | BLOCKED: no authenticated active chats, native tool descendants, or model-originated subprocesses were tested |
 
 **Zero model requests were sent.** The remaining authenticated probes are
@@ -116,43 +125,86 @@ actions. The JSON matrix enumerates them individually. The gate deliberately
 cannot pass yet, even if auth is subsequently provisioned; finish those real
 checks before enabling dependent work.
 
-Offline tests cover report completeness, failure/skip semantics, deadline
-handling, error sanitization, installed pins, PID identity and descendant
-selection, and cancellation of owned synthetic Node processes. **They are not
-mocked proof of SDK permissions, delegated policy, abort/idle, or resume.**
+Offline tests cover auth flag parsing, exact environment allowlists, no token-mode
+fallback, gh config path selection, auth-configuration failure cleanup, report
+completeness, failure/skip semantics, deadline handling, error sanitization,
+installed pins, PID identity and descendant selection, and cancellation of owned
+synthetic Node processes. **They are not mocked proof of SDK permissions,
+delegated policy, abort/idle, or resume.**
 No tool-capable sessions are created by this checkpoint; no real external service
 mutations, arbitrary shell permissions, or blanket approvals are used.
 
-### Safe authentication provisioning
+### Explicit authentication modes and current blocker
 
-The probe intentionally does **not** reuse interactive CLI authentication:
-`mode: "empty"`, isolated `HOME`/`COPILOT_HOME`, and `useLoggedInUser: false`
-prevent ambient configuration/keychain/`gh` fallback. An unauthenticated probe
-does not imply that the user's interactive CLI is logged out.
+- **`--auth=token` (default):** uses only externally injected
+  `COPILOT_GITHUB_TOKEN`, passed as SDK `gitHubToken`. `useLoggedInUser: false`
+  prevents account fallback even when the token is missing or invalid.
+  `HOME` and XDG paths stay inside the run directory. Other token variables
+  (`GH_TOKEN`, `GITHUB_TOKEN`, `COPILOT_SDK_AUTH_TOKEN`) are not inherited.
+- **`--auth=logged-in`:** opts into the SDK's documented
+  `useLoggedInUser: true` stored-login/`gh` discovery, without supplying a token.
+  Ambient token variables are still excluded, so they cannot silently override
+  the selected source. Actual `HOME` is retained; `GH_CONFIG_DIR` comes from that
+  explicit variable, otherwise `$XDG_CONFIG_HOME/gh` or `$HOME/.config/gh`.
+  HOME and gh config paths must be absolute. XDG config/cache remain isolated.
+  The fixed PATH additionally allows `/opt/homebrew/bin` and `/usr/local/bin`
+  for installed `gh`; it does not inherit arbitrary PATH entries. gh prompts
+  are disabled. No login/logout or token extraction command is run.
+- **`--auth=cli-login`:** uses the same explicit logged-in discovery settings,
+  but selects the SDK's supported `mode: "copilot-cli"` so keychain access is not
+  disabled by empty mode. The Copilot home/workspace are still separate, remote
+  sessions and built-in MCPs are disabled, and no model sessions are created.
+  This readiness-only alternative is not approval to load ambient tools in the
+  eventual application.
 
-Provision a fine-grained GitHub PAT with **Copilot Requests** permission for a
-Copilot-enabled account, as described in the pinned CLI README. Keep it only in
-the existing **external canonical `secrets.local.json`**; do not create a second
-credential store here. Have your local secret launcher inject it into
-**`COPILOT_GITHUB_TOKEN`** for this process, then rerun:
+**Pinned-SDK limitation:** `@github/copilot-sdk@1.0.16`'s
+`buildRuntimeEnv()` unconditionally sets `COPILOT_DISABLE_KEYTAR=1` in
+`mode: "empty"`, including when `useLoggedInUser` is true. Merely retaining HOME
+does **not** re-enable keychain access. See the
+[pinned SDK source](https://github.com/github/copilot-sdk/blob/f8ae645902b74b62cd47aac1fd9b29adaec3aff2/nodejs/src/client.ts)
+and [documented CLI auth discovery](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli).
+The local metadata-only check found a `copilot-cli` keychain entry, but no
+installed `gh` or gh auth directory, and no injected token. The additional
+CLI-login probe was also unauthenticated: enabling keychain discovery alone
+did not supply a usable login to the separate Copilot home. Empty mode is a
+harness choice, not a requirement of Densemble; its keytar setting alone does
+not explain the failure in CLI-login mode. These probes establish missing
+authentication for the tested configurations, not that interactive Copilot is
+logged out or that every possible authentication route is unsupported.
+No SDK patch, direct credential extraction, credential copying, or global
+config migration was attempted.
+
+A new PAT is **not mandated**. If an existing supported credential is available
+through an external secret launcher, inject it as `COPILOT_GITHUB_TOKEN`:
 
 ```sh
-npm run sdk:gate -- --real --readiness
+npm run sdk:gate -- --real --readiness --auth=token
 ```
 
-`COPILOT_GITHUB_TOKEN` is the gate's input; it is explicitly passed as SDK
-`gitHubToken`, not a claim about the CLI's environment-variable precedence.
-Never paste a token into a command line, report, commit, or shared log. Do not
-copy `~/.copilot`, run global login/logout, or change global CLI configuration
-to make this check pass.
+Alternatively, already installed/authenticated `gh` can be tested with
+`--auth=logged-in`; that route was unavailable locally and has **not** been
+validated as authenticated. Do not install/login automatically to make the
+gate pass. Keep any newly supplied credential in the existing external canonical
+`secrets.local.json`, never a new store here; leave existing CLI/gh stores
+untouched. Never paste a token into a command line, report, commit, or shared
+log. Do not copy `~/.copilot`, run global login/logout, or change global CLI
+configuration.
 
 ### Isolation, limits, and boundaries
 
 Each run owns a fresh UUID directory beneath ignored `.cache/sdk-contract/`
 (0700), containing its workspace, Copilot home, OS home and runtime scratch.
-Only a small environment allowlist reaches the CLI. No private workspace,
-personas, user configuration, cross-session searches, or built-in MCP services
-are loaded. Logs and remote export are disabled.
+Only a small environment allowlist reaches the CLI. All auth modes keep
+an isolated `baseDirectory` (SDK sets `COPILOT_HOME`), an empty
+workspace, disabled custom instructions/built-in MCPs/remote sessions/export,
+and no model sessions or cross-session searches. Logged-in modes' sole
+discovery exception is existing authentication through HOME/gh config, **not**
+interactive Copilot config, personas, or history. Token and logged-in modes use
+`mode: "empty"`; CLI-login uses `mode: "copilot-cli"`. Log level remains `none`,
+but CLI mode enables the SDK's process file-logging facility inside the owned
+run directory, which is removed on cleanup. This
+is configuration separation, not an OS sandbox or a guarantee about future
+tool-capable sessions.
 
 RPC deadlines: start 25 s, status/auth 10 s, model list 15 s, graceful stop 8 s,
 transport close 2 s. A 180 s watchdog and SIGINT/SIGTERM handlers invoke owned

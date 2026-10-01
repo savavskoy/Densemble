@@ -80,9 +80,22 @@ export function completeChecks(checks: Check[], missingStatus: "BLOCKED" | "SKIP
   });
 }
 
-export function parseGateArgs(args: string[]): { real: boolean; readinessOnly: boolean } {
-  if (args.some((arg) => arg !== "--real" && arg !== "--readiness")) {
-    throw new GateError("UNKNOWN_GATE_ARGUMENT");
+export type AuthMode = "token" | "logged-in" | "cli-login";
+export type GateOptions = { real: boolean; readinessOnly: boolean; authMode: AuthMode };
+
+export function parseGateArgs(args: string[]): GateOptions {
+  let authMode: AuthMode = "token";
+  let authSelected = false;
+  for (const arg of args) {
+    if (arg === "--real" || arg === "--readiness") continue;
+    if (!arg.startsWith("--auth=")) throw new GateError("UNKNOWN_GATE_ARGUMENT");
+    if (authSelected) throw new GateError("DUPLICATE_AUTH_MODE");
+    const value = arg.slice("--auth=".length);
+    if (value !== "token" && value !== "logged-in" && value !== "cli-login") {
+      throw new GateError("INVALID_AUTH_MODE");
+    }
+    authMode = value;
+    authSelected = true;
   }
-  return { real: args.includes("--real"), readinessOnly: args.includes("--readiness") };
+  return { real: args.includes("--real"), readinessOnly: args.includes("--readiness"), authMode };
 }
