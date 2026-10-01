@@ -25,7 +25,7 @@ export function checkedPath(path: string, kind: "file" | "directory" | "any"): s
       if (parent === cursor) break;
       cursor = parent;
     }
-    const actual = realpathSync(absolute);
+    const actual = realpathSync.native(absolute);
     const stat = statSync(actual);
     if (kind === "file" ? !stat.isFile() : kind === "directory" ? !stat.isDirectory() : !stat.isFile() && !stat.isDirectory()) {
       throw new ConfigError("PATH_KIND_INVALID");

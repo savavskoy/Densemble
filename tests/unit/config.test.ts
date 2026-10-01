@@ -59,6 +59,16 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe("private configuration and discovery", () => {
+  it("resolves optional audio paths without installing tools or requiring a model for text", () => {
+    config.audio = { modelPath: "../models/ggml-small.bin", ffmpegPath: "ffmpeg",
+      whisperPath: "./tools/whisper-cli", language: "uk", threads: 4 };
+    expect(load().config.audio).toMatchObject({
+      modelPath: join(root, "models/ggml-small.bin"), ffmpegPath: "ffmpeg",
+      whisperPath: join(code, "tools/whisper-cli"), language: "uk", threads: 4,
+    });
+    config.audio.threads = 9;
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+  });
   it("discovers all personas and workers with references, launcher-only models and explicit skills", () => {
     const result = load();
     expect(result.agents).toHaveLength(6);

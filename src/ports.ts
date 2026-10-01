@@ -141,11 +141,14 @@ export interface MediaPreparation {
   transcribe(attachment: IncomingMessage["attachments"][number], scope: Scope, signal: AbortSignal): Promise<string>;
   exportFile(identity: RunIdentity, path: string, signal: AbortSignal): Promise<Attachment>;
   cleanup(): Promise<void>;
+  releaseRun?(identity: RunIdentity): void;
+  removeArtifacts?(artifacts: Attachment[]): Promise<void>;
 }
 export interface DeliveryTransport {
   deliver(item: OutboxItem, signal?: AbortSignal): Promise<DeliveryOutcome>;
   preview(identity: RunIdentity, text: string): Promise<void>;
   acknowledgeCallback(botId: string, callbackId: string, text?: string): Promise<void>;
+  invalidatePreview?(identity: RunIdentity): Promise<void>;
 }
 export interface IngressHandler {
   handle(ingress: NormalizedIngress): Promise<void>;

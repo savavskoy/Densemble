@@ -43,6 +43,11 @@ explicitly if launched from elsewhere.
   supplies `url` and `headers`. Environment/header values are `{ secretRef }`;
   arguments may be plain nonsecret strings or `{ secretRef }`. URL credentials
   and query strings are rejected. There is no implicit global or IDE-only MCP.
+- Optional `audio` selects local FFmpeg/ffprobe/whisper.cpp executables, the
+  explicitly provisioned multilingual small GGML model, language/threads and
+  bounded timeouts. Relative paths resolve beside the configuration file;
+  bare executable names use PATH. Missing audio tools/model do not prevent text
+  service startup, but voice fails explicitly. No automatic model download.
 
 `ConfigError.code` is a fixed diagnostic, never a serialized Zod/YAML error with
 configuration values. Examples are deliberately not executable private settings.
@@ -162,8 +167,13 @@ and does not copy a live database/WAL with raw filesystem operations.
 `deleteSession`, `shutdown`) uses `RuntimeCommand`/`RuntimeEvent`, never SDK types.
 `MediaPreparation` (`prepare`, `transcribe`, `exportFile`, `cleanup`) handles IO,
 format/resource validation, subprocess cancellation and filesystem confinement.
+Its production `releaseRun`/`removeArtifacts` hooks release pins only after
+confirmed termination and remove only session-deletion artifacts.
 `DeliveryTransport` (`deliver`, `preview`, `acknowledgeCallback`) and
 `IngressHandler.handle` join Telegram to the application without Telegram types.
+Telegram owns the only durable outbox consumer and maps prompts to the final
+keyboard-bearing chunk. Application only enqueues; terminal transitions call
+`invalidatePreview` to clear cached and remote interim content.
 `DiagnosticSink.record` accepts fixed codes and non-object metadata, not prompts.
 
 Bootstrap/process locking, runtime ownership and permission callbacks, ordered

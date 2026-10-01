@@ -45,6 +45,17 @@ export const configSchema = z.object({
     z.object({ mode: z.literal("none") }).strict(),
     z.object({ mode: z.literal("allowlist"), servers: z.array(mcpSchema).min(1) }).strict(),
   ]),
+  audio: z.object({
+    ffmpegPath: nonempty.optional(),
+    ffprobePath: nonempty.optional(),
+    whisperPath: nonempty.optional(),
+    modelPath: nonempty.optional(),
+    language: z.string().regex(/^(auto|[a-z]{2,3})$/).optional(),
+    threads: z.number().int().min(1).max(8).optional(),
+    probeTimeoutMs: z.number().int().min(1).max(15_000).optional(),
+    decodeTimeoutMs: z.number().int().min(1).max(120_000).optional(),
+    asrTimeoutMs: z.number().int().min(1).max(900_000).optional(),
+  }).strict().optional(),
 }).strict();
 export type ServiceConfig = z.infer<typeof configSchema>;
 export type BotConfig = ServiceConfig["bots"][number];
@@ -86,6 +97,13 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   if (!parsed.success) throw new ConfigError("CONFIG_SCHEMA_INVALID");
   const config = parsed.data;
   const fromConfig = (path: string) => resolve(dirname(file), path);
+  if (config.audio) {
+    if (config.audio.modelPath) config.audio.modelPath = fromConfig(config.audio.modelPath);
+    for (const key of ["ffmpegPath", "ffprobePath", "whisperPath"] as const) {
+      const command = config.audio[key];
+      if (command?.includes("/")) config.audio[key] = fromConfig(command);
+    }
+  }
   const code = checkedPath(options.codeRoot ?? process.cwd(), "directory");
   config.workspacePath = checkedPath(fromConfig(config.workspacePath), "directory");
   assertDisjoint(code, config.workspacePath);
