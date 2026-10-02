@@ -121,6 +121,8 @@ export interface QuestionField {
   multiple: boolean;
   allowFreeform: boolean;
 }
+// Keep legacy question payloads for persisted records and shared request handling.
+// The Telegram Copilot runtime no longer creates them; no storage migration is needed.
 export type RequestPayload =
   | { kind: "question"; fields: QuestionField[] }
   | { kind: "permission"; action: string; parameters: Json };

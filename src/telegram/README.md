@@ -56,6 +56,16 @@ Authorized unsupported content receives a durable, controlled explanation,
 never an invented model input. The first such message may initialize its normal
 configured conversation/session solely to hold that response.
 
+## Clarifications and permissions
+
+The managed Copilot runtime disables `ask_user` and elicitation for both new and
+resumed sessions. Clarifying questions arrive as ordinary final text, one question
+at a time; the agent ends its turn and waits for the next normal message. No
+inline choices or reply-to-prompt is required. Manual tool approvals remain the
+existing scoped «Дозволити один раз / Відхилити» buttons; plain text never grants
+permission. Legacy question request rendering remains only for compatibility with
+the stored request format; production sessions no longer generate those requests.
+
 ## Delivery and formatting
 
 Plain content is HTML-escaped. Supported Markdown-like syntax is complete fenced
@@ -148,7 +158,7 @@ Startup does not wait for menu synchronization. Removed bindings and existing
 BotFather/global or language-specific command lists are not cleaned up.
 
 Starting a run does not enqueue an automatic acknowledgement or Stop button.
-Send `/stop` to cancel the current conversation's work; request/permission
+Send `/stop` to cancel the current conversation's work; manual permission
 buttons and explicitly requested menus retain their existing behavior.
 
 ## Limits and operations

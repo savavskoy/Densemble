@@ -100,7 +100,11 @@ missing ASR prerequisites produce an explicit voice error, never cloud fallback.
 Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`.
 The bot registers its command menu at startup so Telegram suggests commands when
 you type `/`. New runs do not post an automatic Stop button; send `/stop` to stop.
-Questions/manual permissions and session/model controls use scoped, expiring buttons.
+Clarifications are ordinary text messages: the agent asks one question at a time,
+ends its turn, and waits for your normal reply. No form, inline choices, or reply
+to a specific message is required. Manual permissions and session/model controls
+still use scoped, expiring buttons. This service has only a Telegram front-end;
+desktop Copilot CLI forms are unaffected.
 `/new` retains old history; deletion needs confirmation. `/stop` is scoped to
 the current bot/chat/topic and does not undo external actions. An unknown
 external-action or Telegram-send outcome is reported as uncertain, not retried
@@ -117,7 +121,7 @@ shell/network/MCP actions and explicit file exports: use trusted agents and
 workspaces. Set `"permissionMode": "manual"` in `config.local.json` to require
 per-action confirmation instead, or `"autopilot"` to select the default explicitly.
 Restart the service after changing this setting. Agent clarification questions
-still require an answer.
+still wait for your ordinary chat reply, not a structured form.
 
 Autopilot does not bypass managed policy, enable undeclared MCP servers, allow
 detached processes or revive stopped/stale runs. `/stop` retains its normal
@@ -244,7 +248,9 @@ local macOS ARM64 native CLI package directly, not the global `copilot` launcher
 or the SDK's bundled 1.0.90 runtime. `--no-auto-update` is explicit; the real
 `getStatus()` RPC must report 1.0.91. The executable gate now verifies the
 required authenticated SDK contracts below. This is **not** Telegram, media,
-or production-service acceptance.
+or production-service acceptance. The isolated question/abort/resume probes
+intentionally retain `ask_user` to test SDK capabilities. Telegram sessions instead
+exclude that tool and register no user-input or elicitation handlers.
 
 ### Runbook
 

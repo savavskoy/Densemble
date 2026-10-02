@@ -5,6 +5,15 @@ PLIST := $(HOME)/Library/LaunchAgents/dev.densemble.agent.plist
 DOMAIN := gui/$(shell id -u)
 SERVICE := $(DOMAIN)/dev.densemble.agent
 
+# The service requires Node 24 (see .nvmrc). The IDE/launchd may invoke make with a
+# PATH that resolves a different node (e.g. Homebrew), so pin the pinned nvm binary
+# explicitly and fall back to any installed v24.x, then finally to PATH node.
+NODE_VERSION := $(shell cat .nvmrc 2>/dev/null)
+NODE := $(firstword \
+	$(wildcard $(HOME)/.nvm/versions/node/v$(NODE_VERSION)/bin/node) \
+	$(sort $(wildcard $(HOME)/.nvm/versions/node/v24.*/bin/node)) \
+	node)
+
 .PHONY: help build typecheck test doctor run install start stop restart status logs
 
 help:
@@ -35,17 +44,17 @@ test:
 	npm test
 
 doctor: build
-	node dist/main.js doctor --config "$(CONFIG)"
+	$(NODE) dist/main.js doctor --config "$(CONFIG)"
 
 run: build
-	node dist/main.js start --config "$(CONFIG)"
+	$(NODE) dist/main.js start --config "$(CONFIG)"
 
 install: build
 	@set -eu; \
 	mkdir -p "$(HOME)/Library/LaunchAgents"; \
 	tmp=$$(mktemp "$(PLIST).XXXXXX"); \
 	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
-	node dist/main.js launchd --config "$(CONFIG)" > "$$tmp"; \
+	$(NODE) dist/main.js launchd --config "$(CONFIG)" > "$$tmp"; \
 	plutil -lint "$$tmp"; \
 	chmod 600 "$$tmp"; \
 	mv "$$tmp" "$(PLIST)"; \

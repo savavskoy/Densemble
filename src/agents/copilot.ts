@@ -3,7 +3,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CopilotClient, defineTool, RuntimeConnection, ToolSet } from "@github/copilot-sdk";
 import type {
-  CopilotClientOptions, CopilotSession, ElicitationFieldValue, ElicitationSchema, MCPServerConfig,
+  CopilotClientOptions, CopilotSession, MCPServerConfig,
   ModelInfo as SdkModel, PermissionRequest, ResumeSessionConfig, SessionConfig, SessionEvent,
 } from "@github/copilot-sdk";
 import type { LoadedConfig } from "../config/index.js";
@@ -18,9 +18,10 @@ import type { ProcessFailure } from "./supervisor.js";
 
 const builtinTools = [
   "bash", "read_bash", "stop_bash", "list_bash", "view", "glob", "grep", "rg", "edit", "create",
-  "apply_patch", "skill", "task", "read_agent", "write_agent", "list_agents", "ask_user", "report_intent", "web_fetch",
+  "apply_patch", "skill", "task", "read_agent", "write_agent", "list_agents", "report_intent", "web_fetch",
 ];
-const excludedTools = ["store_memory", "session_store", "session_store_sql", "session_history", "search_sessions"];
+// Telegram clarification is a normal completed turn, never an SDK form.
+const excludedTools = ["ask_user", "store_memory", "session_store", "session_store_sql", "session_history", "search_sessions"];
 const ownedSessionPattern = /^densemble-[a-f0-9-]{36}$/;
 const permissionNames: Partial<Record<PermissionRequest["kind"], string>> = {
   shell: "Виконати команду", read: "Прочитати файл", write: "Змінити файл", mcp: "Викликати MCP-інструмент",
@@ -167,49 +168,6 @@ async function sessionHistoryExists(home: string, sessionId: string): Promise<bo
   }
 }
 
-export function questionFields(schema: ElicitationSchema, message: string): RequestPayload {
-  const fields = Object.entries(schema.properties).map(([sourceId, field], index) => {
-    const id = `field_${index}`;
-    if (field.type === "array") {
-      const choices = "enum" in field.items ? field.items.enum : field.items.anyOf.map((entry) => entry.const);
-      return { id, prompt: field.title ?? field.description ?? sourceId, choices, multiple: true, allowFreeform: false };
-    }
-    const choices = field.type === "boolean" ? ["Так", "Ні"] :
-      "enum" in field ? field.enum : "oneOf" in field ? field.oneOf.map((entry) => entry.const) : [];
-    return { id, prompt: field.title ?? field.description ?? sourceId, choices, multiple: false, allowFreeform: choices.length === 0 };
-  });
-  if (!fields.length || fields.length > 20) throw new RuntimeError("QUESTION_SCHEMA_UNSUPPORTED");
-  fields[0]!.prompt = `${message}\n${fields[0]!.prompt}`;
-  return { kind: "question", fields };
-}
-function elicitationContent(schema: ElicitationSchema, answer: RequestAnswer | null): Record<string, ElicitationFieldValue> | null {
-  if (answer?.kind !== "question") return null;
-  const content: Record<string, ElicitationFieldValue> = Object.create(null) as Record<string, ElicitationFieldValue>;
-  for (const [index, [key, field]] of Object.entries(schema.properties).entries()) {
-    const values = answer.answers[`field_${index}`];
-    if (!values?.length) return null;
-    const value = values[0]!;
-    if (field.type === "number" || field.type === "integer") {
-      const number = Number(value);
-      if (!Number.isFinite(number) || (field.type === "integer" && !Number.isInteger(number)) ||
-          (field.minimum !== undefined && number < field.minimum) || (field.maximum !== undefined && number > field.maximum)) return null;
-      content[key] = number;
-    } else if (field.type === "boolean") {
-      if (!["Так", "Ні"].includes(value)) return null;
-      content[key] = value === "Так";
-    } else if (field.type === "array") {
-      if ((field.minItems !== undefined && values.length < field.minItems) ||
-          (field.maxItems !== undefined && values.length > field.maxItems)) return null;
-      content[key] = values;
-    } else {
-      if (("minLength" in field && field.minLength !== undefined && value.length < field.minLength) ||
-          ("maxLength" in field && field.maxLength !== undefined && value.length > field.maxLength)) return null;
-      content[key] = value;
-    }
-  }
-  return content;
-}
-
 export function createCopilotRuntime(options: CopilotRuntimeOptions): ControlledRuntime {
   const { config, diagnostics } = options;
   const slots = new Map<string, Slot>();
@@ -350,8 +308,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
     if (!live(slot, turn) || !turn.idle || turn.sending > 0) return;
     turn.terminal = true;
     revoke(slot);
-    const text = [...turn.messages.values()].filter((message) => message.origin && turn.sendIds.has(message.origin))
-      .map((message) => message.text).join("\n\n");
+    const roots = [...turn.messages.values()].filter((message) => message.origin && turn.sendIds.has(message.origin));
+    const text = roots.length ? roots[roots.length - 1]!.text : "";
     if (turn.errored || turn.aborted || !text) emit(slot, { ...turn.identity, kind: "failed", code: "RUNTIME_TURN_FAILED" });
     else emit(slot, { ...turn.identity, kind: "completed", text });
   }
@@ -373,6 +331,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         }
         break;
       case "assistant.message":
+        turn.preview = "";
+        turn.lastPreview = 0;
         turn.messages.set(event.data.messageId, { text: event.data.content,
           ...(event.data.originatingMessageId ? { origin: event.data.originatingMessageId } : {}) });
         break;
@@ -436,6 +396,10 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       embeddingCacheStorage: "in-memory", enableSessionTelemetry: false, manageScheduleEnabled: false,
       remoteSession: "off", streaming: true, includeSubAgentStreamingEvents: true,
       availableTools: tools, excludedTools,
+      // No user-input/elicitation handlers: do not advertise either SDK capability.
+      systemMessage: { mode: "append", content:
+        "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
+        "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply." },
       onEvent: (event) => eventFor(slot, event),
       onPermissionRequest: async (permission, invocation) => {
         const turn = slot.turn;
@@ -456,31 +420,6 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
           slot.exportGrants.set(permission.toolCallId, args.path);
         }
         return { kind: "approve-once" };
-      },
-      onUserInputRequest: async (question, invocation) => {
-        const turn = slot.turn;
-        if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId) throw new RuntimeError("QUESTION_SESSION_MISMATCH");
-        const choices = question.choices ?? [];
-        const answer = await request(slot, { kind: "question", fields: [{
-          id: "answer", prompt: question.question, choices, multiple: false, allowFreeform: question.allowFreeform ?? true,
-        }] });
-        if (!live(slot, turn) || answer?.kind !== "question" || !answer.answers.answer?.[0]) throw new RuntimeError("QUESTION_CANCELLED");
-        return { answer: answer.answers.answer[0], wasFreeform: !choices.includes(answer.answers.answer[0]) };
-      },
-      askUserVariant: "elicitation",
-      onElicitationRequest: async (context) => {
-        const turn = slot.turn;
-        if (!turn || !live(slot, turn) || context.sessionId !== slot.native?.sessionId ||
-            context.mode === "url" || !context.requestedSchema) return { action: "cancel" };
-        const schema = context.requestedSchema;
-        for (;;) {
-          const answer = await request(slot, questionFields(schema, context.message));
-          if (!answer || !live(slot, turn)) return { action: "cancel" };
-          const content = elicitationContent(schema, answer);
-          if (content) return { action: "accept", content };
-          if (!slot.turn || !live(slot, slot.turn)) return { action: "cancel" };
-          emit(slot, { ...slot.turn.identity, kind: "status", status: "Відповідь не відповідає формі. Спробуйте ще раз." });
-        }
       },
       hooks: { onPreToolUse: (input, invocation) => {
         if (invocation.sessionId !== slot.native?.sessionId || !slot.turn || !live(slot, slot.turn)) {

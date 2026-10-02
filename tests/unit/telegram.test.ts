@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { open, truncate } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Api, GrammyError, InputFile } from "grammy";
@@ -1197,6 +1197,7 @@ describe("scoped bounded download/upload IO", () => {
   it("rejects pre-created shared/nonprivate destinations and leaves media-owned cleanup to media", async () => {
     const options = downloadOptions();
     writeFileSync(options.destination, "", { flag: "wx", mode: 0o644 });
+    chmodSync(options.destination, 0o644); // Exercise nonprivate mode even under umask 0077.
     await expect(downloadTelegramFile(options)).rejects.toThrow("TG_DESTINATION_REJECTED");
     expect(options.fetch).not.toHaveBeenCalled();
     unlinkSync(options.destination);

@@ -122,9 +122,20 @@ relative seconds. `StateError.code` signals guard/configuration errors.
 ### Requests and delivery
 
 `requests.create(identity, payload, { expiresAt })` generates a short opaque ID.
-Question fields have IDs, choices, multiplicity, and freeform policy; permissions
-carry a concrete action/parameters. Redact secret parameters before presentation.
-`saveDraft` stores valid partial fields without resolving the callback.
+Production Telegram sessions never create question requests: `ask_user` is absent
+from the tool allowlist and explicitly excluded, with neither `onUserInputRequest`
+nor `onElicitationRequest` registered and no `askUserVariant`. The pinned SDK
+1.0.16 maps absent handlers to `requestUserInput: false` and
+`requestElicitation: false`; exclusions take precedence over the allowlist.
+Both create and resume append a system instruction to ask one plain-text question,
+end the turn, and wait for an ordinary reply. No desktop CLI settings are changed.
+
+Permissions still carry a concrete action/parameters and use the existing
+approve-once/reject buttons in manual mode. Redact secret parameters before
+presentation. Legacy question payloads, `saveDraft`, rendering, and validation
+remain for persisted-record compatibility and to avoid changing the shared
+permission/storage lifecycle in this patch; the runtime schema converters were
+removed. Compatibility tests do not enable forms in production.
 `claim` checks scope/session/run/generation, live status, expiry and the complete
 answer in one transaction; only the first valid response wins. Call runtime once,
 then `resolve`. Do not store executable SDK callbacks in SQLite.

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireProcessLock } from "../../src/storage/process-lock.js";
@@ -31,6 +31,7 @@ describe("single service process ownership", () => {
   it("rejects symlinked lock artifacts without touching their targets", () => {
     const outside = join(root, "do-not-change");
     writeFileSync(outside, "synthetic foreign file", { mode: 0o644 });
+    chmodSync(outside, 0o644); // Fixture permissions must not depend on the inherited umask.
     symlinkSync(outside, join(root, "instance.sqlite"));
     expect(() => acquireProcessLock(root)).toThrow("UNSAFE_LOCK_PATH");
     expect(readFileSync(outside, "utf8")).toBe("synthetic foreign file");

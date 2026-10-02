@@ -7,6 +7,27 @@ function setup(options: Parameters<typeof fixture>[0] = {}) { const f = fixture(
 afterEach(async () => { for (const f of fixtures.splice(0)) await f.close(); });
 
 describe("opaque permission and form controls", () => {
+  it("delivers clarification as plain text and accepts a normal reply without prompt linkage", async () => {
+    const f = setup();
+    await f.app.handle(f.message()); await f.app.drain();
+    const run = f.store.runs.active(scope)!;
+    f.emit({ ...run, kind: "completed", text: "Який workspace використати?" });
+    await f.app.drain();
+    expect(f.store.runs.active(scope)).toBeNull();
+    expect(f.store.requests.pending(scope)).toHaveLength(0);
+    const question = f.store.outbox.list(scope).find((item) => item.runId === run.runId &&
+      item.payload.kind === "text" && item.payload.text === "Який workspace використати?");
+    expect(question?.payload).toEqual({ kind: "text", text: "Який workspace використати?" });
+    const reply = f.message("Densemble");
+    expect(reply.replyToMessageId).toBeUndefined();
+    await f.app.handle(reply); await f.app.drain();
+    expect(f.store.runs.active(scope)?.sessionId).toBe(run.sessionId);
+    expect(f.store.runs.active(scope)?.runId).not.toBe(run.runId);
+    expect(f.commands.filter((command) => command.kind === "send")).toHaveLength(2);
+    expect(f.commands.at(-1)).toMatchObject({ kind: "send", input: { text: "Densemble" } });
+    expect(f.store.requests.pending(scope)).toHaveLength(0);
+    expect(f.commands.some((command) => command.kind === "answer")).toBe(false);
+  });
   it("redacts nested known secrets and token-shaped values without approving anything", () => {
     expect(sanitizeParameters({ command: "TOKEN=topsecret command", headers: { Authorization: "Bearer private" },
       other: "known-private-value" }, ["known-private-value"])).toEqual({
@@ -47,6 +68,7 @@ describe("opaque permission and form controls", () => {
     expect(f.store.requests.get(scope, request.id)?.status).toBe("resolved");
     expect(f.commands.filter((command) => command.kind === "answer")).toHaveLength(1);
   });
+  // Legacy persisted question compatibility; the production runtime no longer emits forms.
   it("supports multi-select done and sequential freeform fields without partial runtime answers", async () => {
     const f = setup();
     await f.app.handle(f.message()); await f.app.drain();
