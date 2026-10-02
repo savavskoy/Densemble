@@ -1,6 +1,7 @@
 import { Api } from "grammy";
-import type { UserFromGetMe } from "grammy/types";
+import type { BotCommand, BotCommandScope, UserFromGetMe } from "grammy/types";
 import type { LoadedConfig } from "../config/index.js";
+import { scopeKey, type RunIdentity } from "../domain.js";
 import type { DiagnosticSink, IngressHandler, StateStore } from "../ports.js";
 import { apiFailure, RateLimiter, sleep, TelegramError, type TelegramApi } from "./common.js";
 import { createDeliveryTransport, type TelegramDeliveryTransport } from "./delivery.js";
@@ -41,6 +42,22 @@ interface ManagedBot {
   fatal: boolean;
   retryAt: number;
 }
+interface TypingState {
+  run: RunIdentity;
+  controller: AbortController;
+  nextAt: number;
+  busy: boolean;
+}
+
+const commands: BotCommand[] = [
+  { command: "start", description: "Інформація про агента та початок роботи" },
+  { command: "help", description: "Довідка про доступні команди" },
+  { command: "status", description: "Стан виконання, модель і доставки" },
+  { command: "model", description: "Переглянути та змінити модель" },
+  { command: "new", description: "Створити нову сесію зі збереженням попередньої" },
+  { command: "sessions", description: "Переглянути та керувати сесіями цієї розмови" },
+  { command: "stop", description: "Зупинити виконання в цій розмові" },
+];
 
 export function createTelegramAdapter(options: TelegramAdapterOptions): TelegramAdapter {
   const master = new AbortController();
@@ -177,6 +194,42 @@ export function createTelegramAdapter(options: TelegramAdapterOptions): Telegram
     }
   }
 
+  async function registerCommands(bot: ManagedBot) {
+    const signal = AbortSignal.any([master.signal, bot.controller.signal]);
+    while (!bot.identity) await sleep(250, signal);
+    const chats = new Set<number>();
+    for (const binding of config.config.bindings) {
+      if (binding.botId !== bot.id || chats.has(binding.chatId)) continue;
+      chats.add(binding.chatId);
+      // Telegram command scopes cannot target individual forum topics.
+      const scope: BotCommandScope = binding.kind === "private"
+        ? { type: "chat", chat_id: binding.chatId }
+        : { type: "chat_member", chat_id: binding.chatId, user_id: config.config.ownerId };
+      let retry = 500;
+      for (;;) {
+        try {
+          await limiter.take(bot.id, binding.chatId, signal);
+          await bot.api.setMyCommands({ commands, scope },
+            AbortSignal.any([signal, AbortSignal.timeout(10_000)]));
+          break;
+        } catch (error) {
+          if (signal.aborted) return;
+          const failure = apiFailure(error);
+          if (failure.fatal) { fatal(bot, failure.code); return; }
+          if (failure.known && failure.retryMs === undefined) {
+            diagnostics.record("TG_COMMANDS_REGISTRATION_FAILED", { botId: bot.id });
+            break;
+          }
+          const delay = failure.retryMs ?? retry;
+          diagnostics.record("TG_COMMANDS_REGISTRATION_RETRY", { botId: bot.id, retryAfter: Date.now() + delay });
+          if (failure.retryMs !== undefined) limiter.block(bot.id, failure.retryMs);
+          await sleep(delay, signal);
+          retry = Math.min(30_000, retry * 2);
+        }
+      }
+    }
+  }
+
   async function delivery(bot: ManagedBot) {
     const signal = AbortSignal.any([master.signal, bot.controller.signal]);
     while (!signal.aborted) {
@@ -186,6 +239,66 @@ export function createTelegramAdapter(options: TelegramAdapterOptions): Telegram
       const outcome = await transport.deliver(item, signal);
       store.outbox.settle(item.id, item.attempts, outcome);
       if (outcome.errorCode === "TG_TOKEN_INVALID") { fatal(bot, outcome.errorCode); return; }
+    }
+  }
+  function isThinking(identity: RunIdentity): boolean {
+    const run = store.runs.get(identity.scope, identity.runId);
+    return !!run && store.runs.isLive(identity) && (run.status === "preparing" || run.status === "running");
+  }
+  async function sendTyping(bot: ManagedBot, state: TypingState, signal: AbortSignal): Promise<void> {
+    const { run } = state;
+    try {
+      const current = AbortSignal.any([signal, state.controller.signal]);
+      await limiter.takeChatAction(bot.id, current);
+      current.throwIfAborted();
+      if (!isThinking(run)) return;
+      state.nextAt = Date.now() + 4000;
+      await bot.api.sendChatAction({
+        chat_id: run.scope.chatId, action: "typing",
+        ...(run.scope.topicId === null ? {} : { message_thread_id: run.scope.topicId }),
+      }, AbortSignal.any([current, AbortSignal.timeout(3000)]));
+    } catch (error) {
+      if (signal.aborted || state.controller.signal.aborted || !isThinking(run)) return;
+      const failure = apiFailure(error);
+      diagnostics.record("TG_TYPING_UNAVAILABLE", { botId: bot.id });
+      if (failure.fatal) { fatal(bot, failure.code); return; }
+      if (failure.retryMs !== undefined) limiter.block(bot.id, failure.retryMs);
+      state.nextAt = failure.known && failure.retryMs === undefined
+        ? Infinity : Date.now() + Math.max(4000, failure.retryMs ?? 0);
+    } finally { state.busy = false; }
+  }
+  async function maintainTyping(bot: ManagedBot): Promise<void> {
+    const signal = AbortSignal.any([master.signal, bot.controller.signal]);
+    const states = new Map<string, TypingState>();
+    const scopes = config.config.bindings.filter((binding) => binding.botId === bot.id).map((binding) => ({
+      ownerId: config.config.ownerId, botId: bot.id, chatId: binding.chatId, topicId: binding.topicId,
+    }));
+    try {
+      while (!signal.aborted) {
+        if (bot.identity) for (const scope of scopes) {
+          const key = scopeKey(scope);
+          const run = store.runs.active(scope);
+          let state = states.get(key);
+          if (state && (!run || state.run.runId !== run.runId || !isThinking(state.run))) {
+            state.controller.abort();
+            states.delete(key);
+            state = undefined;
+          }
+          if (!run || !isThinking(run)) continue;
+          if (!state) {
+            state = { run, controller: new AbortController(), nextAt: 0, busy: false };
+            states.set(key, state);
+          }
+          if (!state.busy && Date.now() >= state.nextAt) {
+            state.busy = true;
+            state.nextAt = Date.now() + 4000;
+            launch(sendTyping(bot, state, signal), bot);
+          }
+        }
+        await sleep(500, signal);
+      }
+    } finally {
+      for (const state of states.values()) state.controller.abort();
     }
   }
   async function maintainPreviews() {
@@ -221,8 +334,10 @@ export function createTelegramAdapter(options: TelegramAdapterOptions): Telegram
       await Promise.all([...bots.values()].filter((bot) => !bot.fatal).map(initialize));
       for (const bot of bots.values()) {
         if (bot.fatal || master.signal.aborted) continue;
+        launch(registerCommands(bot), bot);
         launch(polling(bot, handler), bot);
         launch(delivery(bot), bot);
+        launch(maintainTyping(bot), bot);
       }
       if (!master.signal.aborted) launch(maintainPreviews());
     },

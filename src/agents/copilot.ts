@@ -102,7 +102,50 @@ export function detachedAction(tool: string, args: unknown): boolean {
   if (values.detach === true) return true;
   if (tool !== "bash") return false;
   const command = typeof values.command === "string" ? values.command : "";
-  return /\b(nohup|disown|setsid)\b|(?<!&)&(?!&)/.test(command);
+  return /\b(nohup|disown|setsid)\b/.test(command) || hasBackgroundOperator(command);
+}
+
+// Inspect shell syntax, not literal URL/query-string ampersands. This is an
+// admission guard; the process supervisor still owns and stops all descendants.
+function hasBackgroundOperator(command: string): boolean {
+  type Frame = { quote: "'" | '"' | null; close: ")" | "`" | null };
+  const frames: Frame[] = [{ quote: null, close: null }];
+  for (let index = 0; index < command.length; index++) {
+    const frame = frames.at(-1)!;
+    const char = command[index];
+    const next = command[index + 1];
+    if (frame.quote === "'") {
+      if (char === "'") frame.quote = null;
+      continue;
+    }
+    if (char === "\\") { index++; continue; }
+    if (char === "$" && next === "(") {
+      frames.push({ quote: null, close: ")" }); index++; continue;
+    }
+    if (char === "`") {
+      if (frame.close === "`" && !frame.quote) frames.pop();
+      else frames.push({ quote: null, close: "`" });
+      continue;
+    }
+    if (frame.quote === '"') {
+      if (char === '"') frame.quote = null;
+      continue;
+    }
+    if (char === "'" || char === '"') { frame.quote = char; continue; }
+    if (char === "#" && (index === 0 || /[\s;|&()]/.test(command[index - 1]!))) {
+      const end = command.indexOf("\n", index);
+      if (end < 0) break;
+      index = end; continue;
+    }
+    if (char === "(") { frames.push({ quote: null, close: ")" }); continue; }
+    if (char === ")" && frame.close === ")") { frames.pop(); continue; }
+    if (char !== "&") continue;
+    if (next === "&") { index++; continue; }
+    // Bash redirections (&>, &>>, >&fd, <&fd) and |& are not background jobs.
+    if (next === ">" || /[<>|]/.test(command[index - 1] ?? "")) continue;
+    return true;
+  }
+  return false;
 }
 
 async function sessionHistoryExists(home: string, sessionId: string): Promise<boolean> {
@@ -398,10 +441,11 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         const turn = slot.turn;
         const native = slot.native;
         if (!native || !turn || !live(slot, turn) || invocation.sessionId !== native.sessionId || permissionDenied(permission)) return { kind: "reject" };
-        const answer = await request(slot, { kind: "permission", action: permissionNames[permission.kind] ?? "Зовнішня дія",
-          parameters: sanitizeParameters(permission, secrets) });
-        const approved = answer?.kind === "permission" && answer.approved && live(slot, turn);
-        if (!approved) return { kind: "reject" };
+        if (config.config.permissionMode === "manual") {
+          const answer = await request(slot, { kind: "permission", action: permissionNames[permission.kind] ?? "Зовнішня дія",
+            parameters: sanitizeParameters(permission, secrets) });
+          if (answer?.kind !== "permission" || !answer.approved || !live(slot, turn)) return { kind: "reject" };
+        }
         try { await bounded(native.rpc.model.getCurrent(), 2_000, "PERMISSION_CONNECTION_UNCONFIRMED"); }
         catch { loseRuntime(slot, "RUNTIME_CONNECTION_LOST"); return { kind: "reject" }; }
         if (!live(slot, turn)) return { kind: "reject" };
@@ -439,14 +483,22 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         }
       },
       hooks: { onPreToolUse: (input, invocation) => {
-        if (invocation.sessionId !== slot.native?.sessionId || !slot.turn || !live(slot, slot.turn) ||
-            detachedAction(input.toolName, input.toolArgs) || excludedTools.includes(input.toolName)) {
+        if (invocation.sessionId !== slot.native?.sessionId || !slot.turn || !live(slot, slot.turn)) {
+          diagnostics.record("TOOL_STALE_RUN_REJECTED");
           return { permissionDecision: "deny", permissionDecisionReason: "Дія не належить живому керованому виконанню." };
+        }
+        if (detachedAction(input.toolName, input.toolArgs)) {
+          diagnostics.record("TOOL_DETACHED_ACTION_REJECTED");
+          return { permissionDecision: "deny", permissionDecisionReason: "Запуск відокремленого процесу заборонено: /stop має зупиняти всю роботу." };
+        }
+        if (excludedTools.includes(input.toolName)) {
+          diagnostics.record("TOOL_EXCLUDED_REJECTED");
+          return { permissionDecision: "deny", permissionDecisionReason: "Цей інструмент вимкнений у керованому сервісі." };
         }
         return { permissionDecision: "ask" };
       } },
       tools: [defineTool("densemble_export_file", {
-        description: "Return a generated workspace file to this conversation. Requires explicit user permission. A path mentioned in text is not an export.",
+        description: "Return a generated workspace file to this conversation under the configured permission policy. A path mentioned in text is not an export.",
         parameters: { type: "object", properties: { path: { type: "string", minLength: 1,
           description: "Absolute path or a path relative to the configured workspace." } }, required: ["path"], additionalProperties: false },
         handler: async (args: { path: string }, invocation) => {

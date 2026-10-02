@@ -9,6 +9,7 @@
     "/absolute/path/to/agent-workspace/agent/skills"
   ],
   "ownerId": 1,
+  "permissionMode": "autopilot",
   "bots": [
     {
       "id": "example-bot",

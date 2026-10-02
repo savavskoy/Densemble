@@ -214,6 +214,102 @@ describe("normalization and owner/topic boundary", () => {
 });
 
 describe("durable ordered polling with actual grammY API", () => {
+  it("registers supported Ukrainian slash commands only for the owner's bound chats", async () => {
+    config.config.bindings.push(
+      { botId: "bot-one", chatId: -202, kind: "forum", topicId: 5 },
+      { botId: "bot-other", chatId: -303, kind: "group", topicId: null },
+    );
+    const fake = fakeApi();
+    await adapter(fake.api).start({ handle: async () => undefined });
+    const registrations = () => fake.calls.filter((call) => call.method === "setMyCommands");
+    await vi.waitFor(() => expect(registrations()).toHaveLength(3));
+    const commands = [
+      { command: "start", description: "Інформація про агента та початок роботи" },
+      { command: "help", description: "Довідка про доступні команди" },
+      { command: "status", description: "Стан виконання, модель і доставки" },
+      { command: "model", description: "Переглянути та змінити модель" },
+      { command: "new", description: "Створити нову сесію зі збереженням попередньої" },
+      { command: "sessions", description: "Переглянути та керувати сесіями цієї розмови" },
+      { command: "stop", description: "Зупинити виконання в цій розмові" },
+    ];
+    expect(registrations().map((call) => call.payload)).toEqual([
+      { commands, scope: { type: "chat", chat_id: 101 } },
+      { commands, scope: { type: "chat_member", chat_id: -201, user_id: 101 } },
+      { commands, scope: { type: "chat_member", chat_id: -202, user_id: 101 } },
+    ]);
+    expect(fake.calls.some((call) => call.method === "sendMessage")).toBe(false);
+  });
+  it.each([
+    ["network", () => new Error("synthetic network failure"), 500],
+    ["429", () => apiError(429, "Synthetic rate limit", 1), 1000],
+    ["500", () => apiError(500), 2000],
+  ] as const)("retries %s command registration without delaying polling", async (_name, error, delay) => {
+    config.config.bindings = config.config.bindings.slice(0, 1);
+    const attempts: number[] = [];
+    const limiter = fastLimiter();
+    const block = vi.spyOn(limiter, "block");
+    const fake = fakeApi({
+      setMyCommands: () => {
+        attempts.push(Date.now());
+        if (attempts.length === 1) throw error();
+        return true;
+      },
+      getUpdates: (payload) => Number(payload.offset) === 0 ? [update(9)] : [],
+    });
+    await adapter(fake.api, { limiter }).start({ handle: async (ingress) => accepted(ingress) });
+    await vi.waitFor(() => expect(store.inbox.offset("bot-one")).toBe(10));
+    expect(attempts).toHaveLength(1);
+    await vi.waitFor(() => expect(attempts).toHaveLength(2), { timeout: 3500 });
+    expect(attempts[1]! - attempts[0]!).toBeGreaterThanOrEqual(delay - 10);
+    const calls = fake.calls.filter((call) => call.method === "setMyCommands");
+    expect(calls[1]?.payload).toEqual(calls[0]?.payload);
+    expect(diagnostics.record).toHaveBeenCalledWith("TG_COMMANDS_REGISTRATION_RETRY",
+      { botId: "bot-one", retryAfter: expect.any(Number) });
+    if (_name !== "network") expect(block).toHaveBeenCalledWith("bot-one", delay);
+  });
+  it.each([400, 403])("does not endlessly retry a %i menu rejection or block other bindings", async (code) => {
+    const fake = fakeApi({ setMyCommands: (payload) => {
+      if ((payload.scope as { chat_id: number }).chat_id === 101) throw apiError(code);
+      return true;
+    } });
+    await adapter(fake.api).start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(fake.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(3));
+    expect(diagnostics.record).toHaveBeenCalledWith("TG_COMMANDS_REGISTRATION_FAILED", { botId: "bot-one" });
+    expect(fake.calls.some((call) => call.method === "getUpdates")).toBe(true);
+  });
+  it("aborts command-registration retry waits on shutdown", async () => {
+    const fake = fakeApi({ setMyCommands: () => { throw apiError(429, "Synthetic rate limit", 60); } });
+    const instance = adapter(fake.api);
+    await instance.start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(fake.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(1));
+    await instance.stop();
+    expect(fake.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(1);
+  });
+  it("registers menus after transient identity initialization recovers", async () => {
+    let identities = 0;
+    const fake = fakeApi({ getMe: () => {
+      if (++identities === 1) throw new Error("Synthetic initialization failure");
+      return identity;
+    } });
+    await adapter(fake.api).start({ handle: async () => undefined });
+    expect(fake.calls.some((call) => call.method === "setMyCommands")).toBe(false);
+    await vi.waitFor(() => expect(fake.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(3),
+      { timeout: 2000 });
+  });
+  it("disables only a bot whose command registration reports an invalid token", async () => {
+    config.config.bots.push({ id: "bot-two", agentId: "first", tokenRef: "other" });
+    config.config.bindings.push({ botId: "bot-two", chatId: 101, kind: "private", topicId: null });
+    config.tokenForBot = (id) => id === "bot-one" ? "701:synthetic_token" : "702:synthetic_token";
+    const first = fakeApi({ setMyCommands: () => { throw apiError(401); } });
+    const second = fakeApi({ getUpdates: (payload) => Number(payload.offset) === 0 ? [update(9)] : [] },
+      { ...identity, id: 702, username: "SecondBot" });
+    await adapter(first.api, { apiFactory: (token) => token.startsWith("701:") ? first.api : second.api })
+      .start({ handle: async (ingress) => accepted(ingress) });
+    await vi.waitFor(() => expect(store.inbox.offset("bot-two")).toBe(10));
+    expect(diagnostics.record).toHaveBeenCalledWith("TG_TOKEN_INVALID", { botId: "bot-one" });
+    expect(first.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(1);
+    expect(second.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(1);
+  });
   it("records ignored updates, rejects owner/topic before effects and survives duplicate sparse polls", async () => {
     let polls = 0;
     const unauthorized = update(7, { from: { id: 102, is_bot: false }, document: { file_id: "never", file_unique_id: "never" } });
@@ -278,6 +374,7 @@ describe("durable ordered polling with actual grammY API", () => {
     await vi.waitFor(() => expect(diagnostics.record).toHaveBeenCalledWith("TG_POLLING_CONFLICT", { botId: "bot-two" }));
     expect(diagnostics.record).toHaveBeenCalledWith("TG_WEBHOOK_CONFLICT", { botId: "bot-one" });
     expect(first.calls.filter((call) => call.method === "getUpdates")).toHaveLength(0);
+    expect(first.calls.some((call) => call.method === "setMyCommands")).toBe(false);
     expect([...first.calls, ...second.calls].some((call) => call.method === "deleteWebhook")).toBe(false);
   });
   it.each([401, 409])("keeps a healthy bot polling after another bot's %i error", async (code) => {
@@ -298,6 +395,7 @@ describe("durable ordered polling with actual grammY API", () => {
     await adapter(fake.api).start({ handle: async () => undefined });
     expect(diagnostics.record).toHaveBeenCalledWith("TG_BOT_IDENTITY_MISMATCH", { botId: "bot-one" });
     expect(fake.calls.some((call) => call.method === "getUpdates")).toBe(false);
+    expect(fake.calls.some((call) => call.method === "setMyCommands")).toBe(false);
     config.config.bots.push({ id: "bot-two", agentId: "second", tokenRef: "other" });
     const dup = fakeApi();
     await adapter(dup.api).start({ handle: async () => undefined });
@@ -387,6 +485,147 @@ describe("durable ordered polling with actual grammY API", () => {
     }
     expect(store.inbox.offset("bot-one")).toBe(0);
   }, 10_000);
+});
+
+describe("run-scoped typing indicators", () => {
+  const actions = (fake: ReturnType<typeof fakeApi>) => fake.calls.filter((call) => call.method === "sendChatAction");
+  it("starts before any answer delta and refreshes while preparing or running", async () => {
+    const active = run();
+    const times: number[] = [];
+    const fake = fakeApi({ sendChatAction: () => { times.push(Date.now()); return true; } });
+    const instance = adapter(fake.api);
+    await instance.start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(times).toHaveLength(1));
+    expect(actions(fake)[0]?.payload).toEqual({ chat_id: scope.chatId, action: "typing" });
+    expect(fake.calls.some((call) => call.method === "sendMessage")).toBe(false);
+    store.runs.markRunning(active);
+    await vi.waitFor(() => expect(times).toHaveLength(2), { timeout: 5000 });
+    expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(4000);
+    await instance.stop();
+  }, 8000);
+
+  it("pauses for a user answer, resumes work, and stops after completion", async () => {
+    const active = run();
+    store.runs.markWaiting(active);
+    const fake = fakeApi();
+    await adapter(fake.api).start({ handle: async () => undefined });
+    await new Promise((done) => setTimeout(done, 1100));
+    expect(actions(fake)).toHaveLength(0);
+    store.runs.markRunning(active);
+    await vi.waitFor(() => expect(actions(fake)).toHaveLength(1), { timeout: 1500 });
+    store.runs.finish(active, "succeeded");
+    await new Promise((done) => setTimeout(done, 4200));
+    expect(actions(fake)).toHaveLength(1);
+  }, 8000);
+
+  it("sends only to the configured bot/chat/topic, never an idle or unbound scope", async () => {
+    const forum: Scope = { ...scope, chatId: -202, topicId: 4 };
+    const unbound: Scope = { ...scope, chatId: -202, topicId: 5 };
+    for (const [index, target] of [forum, unbound].entries()) {
+      store.inbox.admit({ ...incoming(200 + index), scope: target, chatKind: "forum" },
+        { sessionId: session(target).id, reserveRun: true });
+    }
+    const fake = fakeApi();
+    await adapter(fake.api).start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(actions(fake)).toHaveLength(1));
+    expect(actions(fake)[0]?.payload).toEqual({ chat_id: -202, message_thread_id: 4, action: "typing" });
+  });
+
+  it("rechecks cancellation after a queued rate permit and does not send stale typing", async () => {
+    const fake = fakeApi();
+    const limiter = fastLimiter();
+    await adapter(fake.api, { limiter }).start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(fake.calls.filter((call) => call.method === "setMyCommands")).toHaveLength(3));
+    let release!: () => void;
+    const queued = new Promise<void>((resolveWait) => { release = resolveWait; });
+    const take = vi.spyOn(limiter, "takeChatAction").mockImplementationOnce(() => queued);
+    const active = run();
+    await vi.waitFor(() => expect(take).toHaveBeenCalled(), { timeout: 1500 });
+    store.runs.cancel(active);
+    release();
+    await new Promise((done) => setTimeout(done, 100));
+    expect(actions(fake)).toHaveLength(0);
+  });
+
+  it("aborts an in-flight typing request when the run is stopped", async () => {
+    const active = run();
+    let requestSignal: AbortSignal | undefined;
+    const fake = fakeApi({ sendChatAction: (_payload, signal) => new Promise((_resolve, reject) => {
+      requestSignal = signal;
+      signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+    }) });
+    await adapter(fake.api).start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+    store.runs.cancel(active);
+    await vi.waitFor(() => expect(requestSignal!.aborted).toBe(true), { timeout: 1500 });
+    expect(actions(fake)).toHaveLength(1);
+  });
+
+  it("honors typing rate-limit cooldowns without blocking polling", async () => {
+    run();
+    const limiter = fastLimiter();
+    const block = vi.spyOn(limiter, "block");
+    const fake = fakeApi({
+      sendChatAction: () => { throw apiError(429, "Synthetic limit", 60); },
+      getUpdates: (payload) => Number(payload.offset) === 0 ? [update(999)] : [],
+    });
+    const instance = adapter(fake.api, { limiter });
+    await instance.start({ handle: async (ingress) => accepted(ingress) });
+    await vi.waitFor(() => expect(block).toHaveBeenCalledWith("bot-one", 60000));
+    expect(diagnostics.record).toHaveBeenCalledWith("TG_TYPING_UNAVAILABLE", { botId: "bot-one" });
+    await vi.waitFor(() => expect(store.inbox.offset("bot-one")).toBe(1000));
+    await instance.stop();
+    expect(actions(fake)).toHaveLength(1);
+  });
+
+  it("aborts in-flight typing on service shutdown and does not overlap requests", async () => {
+    run();
+    let requestSignal: AbortSignal | undefined;
+    const fake = fakeApi({ sendChatAction: (_payload, signal) => new Promise((_resolve, reject) => {
+      requestSignal = signal;
+      signal!.addEventListener("abort", () => reject(signal!.reason), { once: true });
+    }) });
+    const instance = adapter(fake.api);
+    await instance.start({ handle: async () => undefined });
+    await vi.waitFor(() => expect(requestSignal).toBeDefined());
+    await instance.stop();
+    expect(requestSignal!.aborted).toBe(true);
+    expect(actions(fake)).toHaveLength(1);
+  });
+
+  it("refreshes concurrent forum topics with production pacing despite group-message cooldown", async () => {
+    config.config.bindings = [
+      { botId: "bot-one", chatId: -202, kind: "forum", topicId: 4 },
+      { botId: "bot-one", chatId: -202, kind: "forum", topicId: 5 },
+    ];
+    for (const topicId of [4, 5]) {
+      const target: Scope = { ...scope, chatId: -202, topicId };
+      store.inbox.admit({ ...incoming(300 + topicId), scope: target, chatKind: "forum" },
+        { sessionId: session(target).id, reserveRun: true });
+    }
+    const times = new Map<number, number[]>();
+    const fake = fakeApi({ sendChatAction: (payload) => {
+      const topic = Number(payload.message_thread_id);
+      const values = times.get(topic) ?? [];
+      values.push(Date.now());
+      times.set(topic, values);
+      return true;
+    } });
+    const instance = adapter(fake.api, { limiter: new RateLimiter() });
+    await instance.start({ handle: async () => undefined });
+    await vi.waitFor(() => {
+      expect(times.get(4)).toHaveLength(1);
+      expect(times.get(5)).toHaveLength(1);
+    }, { timeout: 1000 });
+    await vi.waitFor(() => {
+      expect(times.get(4)).toHaveLength(2);
+      expect(times.get(5)).toHaveLength(2);
+    }, { timeout: 5500 });
+    for (const values of times.values()) {
+      expect(values[1]! - values[0]!).toBeLessThan(4900);
+    }
+    await instance.stop();
+  }, 8000);
 });
 
 describe("safe HTML formatting and scalar-safe splitting", () => {
@@ -778,6 +1017,39 @@ describe("outbox delivery outcomes, rate limiting and requests", () => {
     await limiter.take("one", 12, signal);
     await limiter.take("two", 12, signal);
     expect(waits).toEqual([3100, 40, 5000]);
+  });
+  it("shares bot cooldowns with chat actions without consuming the group-message budget", async () => {
+    const waits: number[] = [];
+    let now = 0;
+    const limiter = new RateLimiter(async (ms) => { waits.push(ms); now += ms; }, () => now);
+    const signal = new AbortController().signal;
+    await limiter.take("one", -10, signal);
+    await limiter.takeChatAction("one", signal);
+    await limiter.takeChatAction("one", signal);
+    expect(waits).toEqual([40, 40]);
+    await limiter.take("one", -10, signal);
+    expect(now).toBe(3100);
+    limiter.block("one", 5000);
+    await limiter.takeChatAction("one", signal);
+    expect(now).toBe(8100);
+    await limiter.take("one", 11, signal);
+    expect(now).toBe(8140);
+  });
+  it("rechecks extended bot cooldowns before releasing a chat action", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const limiter = clockLimiter();
+    const signal = new AbortController().signal;
+    limiter.block("one", 5000);
+    const released = vi.fn();
+    const action = limiter.takeChatAction("one", signal).then(released);
+    await vi.advanceTimersByTimeAsync(4000);
+    limiter.block("one", 6000);
+    await vi.advanceTimersByTimeAsync(5999);
+    expect(released).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await action;
+    expect(released).toHaveBeenCalledOnce();
   });
   it("keeps two concurrent reservations spaced when both previously converged on 5000", async () => {
     vi.useFakeTimers();

@@ -98,13 +98,32 @@ MCP acceptance remain incomplete. Audio is optional for starting text service:
 missing ASR prerequisites produce an explicit voice error, never cloud fallback.
 
 Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`.
-Questions/permissions and session/model controls use scoped, expiring buttons.
+The bot registers its command menu at startup so Telegram suggests commands when
+you type `/`. New runs do not post an automatic Stop button; send `/stop` to stop.
+Questions/manual permissions and session/model controls use scoped, expiring buttons.
 `/new` retains old history; deletion needs confirmation. `/stop` is scoped to
 the current bot/chat/topic and does not undo external actions. An unknown
 external-action or Telegram-send outcome is reported as uncertain, not retried
 as a new agent task. `/status` provides explicit delivery-retry controls with
 duplicate warnings. After restart, queued input requires an explicit decision;
 interrupted actions and stale permissions are never automatically replayed.
+
+### Autopilot
+
+**Autopilot is the default for every agent**, including existing configurations
+that omit `permissionMode`. It approves ordinary tool actions automatically for
+the authenticated owner's live managed runs. This includes file reads/writes,
+shell/network/MCP actions and explicit file exports: use trusted agents and
+workspaces. Set `"permissionMode": "manual"` in `config.local.json` to require
+per-action confirmation instead, or `"autopilot"` to select the default explicitly.
+Restart the service after changing this setting. Agent clarification questions
+still require an answer.
+
+Autopilot does not bypass managed policy, enable undeclared MCP servers, allow
+detached processes or revive stopped/stale runs. `/stop` retains its normal
+scope and process cleanup; it cannot undo actions already taken.
+Quoted URL query-string ampersands are treated as data, not background shell
+operators, so ordinary Trello requests are not rejected as detached work.
 
 SIGINT/SIGTERM stop polling/media/runtime work before closing SQLite and releasing
 the OS process lock. If pending work cannot be confirmed stopped, shutdown reports
@@ -120,7 +139,8 @@ Documents: text PDF, DOCX, UTF-8 TXT/Markdown/CSV. Photos are PNG/JPEG/WebP;
 model vision capability is checked without silently switching models. Image-only
 PDF, unsupported encodings, oversized or corrupt documents fail explicitly.
 Incoming files are limited to 20 MB, exports to 50 MB. Export is an explicit
-permission-controlled tool, not automatic sending of a model-mentioned path.
+tool governed by the configured permission mode, not automatic sending of a
+model-mentioned path.
 
 Provision FFmpeg and whisper.cpp explicitly, and download a **multilingual
 Whisper small GGML** model yourself (not `small.en` or Python `.pt`). Optional
@@ -144,6 +164,37 @@ after seven days unless retained for active work/delivery. See the
 [media adapter](src/media/README.md) and [Telegram adapter](src/telegram/README.md).
 
 ## macOS background operation
+
+The [Makefile](Makefile) wraps the existing service and macOS commands. Run
+`make` for the command list. It does not install or start anything by default.
+Stop any existing foreground/`npm start` instance before the first background
+launch; the service's process lock prevents two instances sharing its data.
+
+```sh
+make install              # build and install the LaunchAgent; does not start it
+make start                # run in background, independent of this terminal
+make status               # launchd state, not application readiness
+make logs                 # follow both logs; Ctrl+C stops only the log viewer
+make restart              # stop, rebuild/reinstall, then start
+make stop                 # unload the background service
+```
+
+The installed LaunchAgent starts on login and restarts after a crash.
+`make stop` unloads it for the current login session; the installed plist can
+load again on the next login. Remove the installed plist after stopping if you
+want to permanently remove login autostart.
+`make restart` requires a currently loaded service; if it is stopped, use
+`make install && make start`. These commands do not manage an independently
+started `npm start` process. `/stop` in Telegram stops only the current agent
+run, not the service.
+
+For terminal-only operation use `make run` (Ctrl+C stops the service).
+`make build`, `make typecheck`, `make test`, and `make doctor` wrap the development
+commands; doctor requires the service to be stopped. Select a non-default
+configuration with `make install CONFIG=/absolute/path/to/config.local.json`;
+repeat the same `CONFIG=...` when reinstalling/restarting or using run/doctor.
+Logs use the paths recorded in the installed plist. Install with a stable Node
+24 executable, because its absolute path is saved in the LaunchAgent.
 
 Generate a **user** LaunchAgent template after configuring and building:
 

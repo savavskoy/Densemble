@@ -60,6 +60,7 @@ it("wires authorized durable Telegram ingress through document workers, runtime 
   const api: TelegramApi = {
     getMe: async () => identity,
     getWebhookInfo: async () => ({ url: "", pending_update_count: 0, has_custom_certificate: false }),
+    setMyCommands: async () => true,
     getUpdates: async (_payload, signal) => {
       await pause(5, undefined, { ...(signal ? { signal } : {}) });
       return updates.splice(0);

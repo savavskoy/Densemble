@@ -45,7 +45,6 @@ export interface Application extends IngressHandler {
   drain(): Promise<void>;
 }
 type Action =
-  | { kind: "stop"; identity: RunIdentity }
   | { kind: "models"; page: number }
   | { kind: "model"; model: string }
   | { kind: "cancel-model"; model: string }
@@ -65,7 +64,8 @@ const runLabels: Record<string, string> = {
   preparing: "підготовка вкладень", running: "працює", waiting: "очікує відповіді",
   cancelling: "зупиняється", succeeded: "завершено", failed: "помилка", cancelled: "зупинено", interrupted: "перервано",
 };
-const help = "Команди: /help, /status, /model, /new, /sessions, /stop.\n" +
+const help = "Команди: /start, /help, /status, /model, /new, /sessions, /stop.\n" +
+  "Введіть /, щоб побачити підказки команд. Для зупинки виконання надішліть /stop.\n" +
   "У цій розмові працює закріплений агент. Уточнення під час роботи передаються активному виконанню. " +
   "На запитання відповідайте кнопками або відповіддю на повідомлення форми. Дозволи — лише кнопками.\n" +
   "/stop не відкочує зовнішні дії.";
@@ -129,11 +129,6 @@ export function createApplication(options: ApplicationOptions): Application {
     text(session, failureMessage(code), runId ? `run:${runId}:error` : opaqueId(), runId);
   }
   function sessionFor(identity: RunIdentity): Session | null { return store.sessions.get(identity.scope, identity.sessionId); }
-  function runControl(run: Run): void {
-    const session = sessionFor(run);
-    if (session) menu(session, "Виконання прийнято. Результат ще не готовий.",
-      [[{ text: "Зупинити", action: { kind: "stop", identity: run } }]], `run:${run.runId}:control`);
-  }
   async function exportFile(identity: RunIdentity, path: string, signal: AbortSignal): Promise<Attachment> {
     const context = contexts.get(identity.runId);
     if (!context || !live(identity)) throw new RuntimeError("EXPORT_STALE_RUN");
@@ -199,7 +194,7 @@ export function createApplication(options: ApplicationOptions): Application {
     if (!run) return;
     const context: Context = { run, controller: new AbortController(), jobs: new Set(), exports: [],
       preparingSteer: false, requestIds: new Set() };
-    contexts.set(run.runId, context); runControl(run);
+    contexts.set(run.runId, context);
     const reserved = store.inbox.get(scope, input.id);
     if (!reserved) { launch(failRun(context, "INPUT_MISSING")); return; }
     launch(executeInput(context, reserved), context);
@@ -638,7 +633,6 @@ export function createApplication(options: ApplicationOptions): Application {
     const action = controls.take(ingress.scope, `${session.id}:${session.generation}`, ingress.data);
     launch(delivery.acknowledgeCallback(ingress.scope.botId, ingress.callbackId, action ? undefined : "Кнопка недійсна або застаріла."));
     if (!action) return;
-    if (action.kind === "stop") { launch(stopRun(action.identity)); return; }
     if (store.runs.active(session.scope)?.status === "cancelling") { text(session, "Спочатку дочекайтесь підтвердженої зупинки."); return; }
     switch (action.kind) {
       case "request":

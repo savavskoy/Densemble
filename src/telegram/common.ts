@@ -3,7 +3,7 @@ import { setTimeout as pause } from "node:timers/promises";
 
 type Methods =
   "getMe" | "getWebhookInfo" | "getUpdates" | "sendMessage" | "sendDocument" | "editMessageText" |
-  "answerCallbackQuery" | "getFile" | "sendChatAction" | "deleteMessage";
+  "answerCallbackQuery" | "getFile" | "sendChatAction" | "deleteMessage" | "setMyCommands";
 // grammY's Node declarations use the legacy abort-controller type. Node's native signal is runtime-compatible.
 export type TelegramApi = { [M in Methods]: M extends "getMe" | "getWebhookInfo" ?
   (signal?: AbortSignal) => ReturnType<Api["raw"][M]> :
@@ -55,6 +55,17 @@ export class RateLimiter {
 
   block(botId: string, ms: number): void {
     this.blockedUntil.set(botId, Math.max(this.blockedUntil.get(botId) ?? 0, this.now() + ms));
+  }
+  async takeChatAction(botId: string, signal: AbortSignal): Promise<void> {
+    // Chat actions share the bot budget/backoff, but are not chat messages.
+    for (;;) {
+      signal.throwIfAborted();
+      const now = this.now();
+      const at = Math.max(now, this.botNext.get(botId) ?? 0, this.blockedUntil.get(botId) ?? 0);
+      if (at > now) { await this.wait(at - now, signal); continue; }
+      this.botNext.set(botId, now + 40);
+      return;
+    }
   }
   async take(botId: string, chatId: number, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();

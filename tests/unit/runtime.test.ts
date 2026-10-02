@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CopilotClient } from "@github/copilot-sdk";
-import type { ModelInfo as SdkModel, SessionConfig, SessionEvent } from "@github/copilot-sdk";
+import type { ModelInfo as SdkModel, PermissionRequest, SessionConfig, SessionEvent } from "@github/copilot-sdk";
 import type { LoadedConfig } from "../../src/config/index.js";
 import type { RuntimeEvent, RunIdentity, Session } from "../../src/domain.js";
 import { createCopilotRuntime, detachedAction, questionFields, serviceClientOptions } from "../../src/agents/copilot.js";
@@ -28,6 +28,7 @@ function setup(options: { requestTimeoutMs?: number } = {}) {
     config: {
       workspacePath: root, agentDefinitionsPath: root, agentLaunchersPath: root, secretsPath: join(root, "secrets.local.json"),
       runtimeDataPath: root, runtimeHomePath: join(root, "service-home"), skillDirectories: [root], ownerId: scope.ownerId,
+      permissionMode: "manual",
       bots: [{ id: scope.botId, agentId: "synthetic-agent", tokenRef: "bot.token" }],
       bindings: [{ botId: scope.botId, chatId: scope.chatId, topicId: null, kind: "private" }], mcp: { mode: "none" },
     },
@@ -142,6 +143,69 @@ describe("pinned Copilot runtime adapter", () => {
     await f.runtime.execute({ kind: "answer", identity: f.identity, requestId: event.requestId,
       answer: { kind: "permission", approved: true } });
     await expect(permission).resolves.toEqual({ kind: "approve-once" });
+  });
+  it.each(["autopilot", undefined] as const)("routes quoted Trello URLs without a prompt with permissionMode=%s", async (mode) => {
+    const f = setup();
+    if (mode) f.config.config.permissionMode = mode;
+    else delete f.config.config.permissionMode;
+    await f.open(); await f.send();
+    const command = 'KEY=synthetic && curl -s "https://api.trello.com/1/boards/synthetic/cards?key=$KEY&token=synthetic&fields=name"';
+    const hook = f.settings().hooks!.onPreToolUse!;
+    expect(await hook({ sessionId: f.native.sessionId, timestamp: new Date(), workingDirectory: f.root,
+      toolName: "bash", toolArgs: { command } }, { sessionId: f.native.sessionId })).toEqual({ permissionDecision: "ask" });
+    const permission: PermissionRequest = { kind: "shell", fullCommandText: command,
+      canOfferSessionApproval: false, commands: [], hasWriteFileRedirection: false,
+      intention: "Read synthetic board", possiblePaths: [], possibleUrls: [] };
+    await expect(f.settings().onPermissionRequest!(permission, { sessionId: f.native.sessionId }))
+      .resolves.toEqual({ kind: "approve-once" });
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
+    expect(f.native.rpc.model.getCurrent).toHaveBeenCalledTimes(2);
+    expect(await f.settings().onPermissionRequest!({ ...permission, requestSandboxBypass: true },
+      { sessionId: f.native.sessionId })).toEqual({ kind: "reject" });
+    expect(await f.settings().onPermissionRequest!({ ...permission, fullCommandText: "node worker &" },
+      { sessionId: f.native.sessionId })).toEqual({ kind: "reject" });
+  });
+  it("keeps autopilot scoped to a live session and rejects mandatory managed approval", async () => {
+    const f = setup(); f.config.config.permissionMode = "autopilot"; await f.open();
+    const permission: PermissionRequest = { kind: "custom-tool", toolName: "synthetic", toolDescription: "Synthetic", args: {} };
+    const decide = f.settings().onPermissionRequest!;
+    expect(await decide(permission, { sessionId: f.native.sessionId })).toEqual({ kind: "reject" });
+    await f.send();
+    expect(await decide(permission, { sessionId: "other-session" })).toEqual({ kind: "reject" });
+    expect(await decide({ ...permission, managedApprovalRequired: true }, { sessionId: f.native.sessionId }))
+      .toEqual({ kind: "reject" });
+    await f.runtime.execute({ kind: "stop", identity: f.identity });
+    expect(await decide(permission, { sessionId: f.native.sessionId })).toEqual({ kind: "reject" });
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
+  });
+  it.each(["stop", "disconnect"] as const)("revokes autopilot approval when %s races its connection check", async (race) => {
+    const f = setup(); f.config.config.permissionMode = "autopilot";
+    await f.open(); await f.send();
+    const check = deferred<{ modelId: string }>();
+    f.native.rpc.model.getCurrent.mockReturnValueOnce(check.promise);
+    const permission = f.settings().onPermissionRequest!({
+      kind: "custom-tool", toolName: "synthetic", toolDescription: "Synthetic", args: {},
+    }, { sessionId: f.native.sessionId });
+    if (race === "stop") {
+      const stop = f.runtime.execute({ kind: "stop", identity: f.identity });
+      check.resolve({ modelId: "model-one" });
+      await stop;
+    } else check.reject(new Error("Synthetic disconnected transport"));
+    await expect(permission).resolves.toEqual({ kind: "reject" });
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
+  });
+  it("distinguishes a stale run from forbidden detached execution in hook errors", async () => {
+    const f = setup(); await f.open();
+    const hook = f.settings().hooks!.onPreToolUse!;
+    const input = { sessionId: f.native.sessionId, timestamp: new Date(), workingDirectory: f.root,
+      toolName: "bash", toolArgs: { command: "node worker &" } };
+    expect(await hook(input, { sessionId: f.native.sessionId })).toMatchObject({
+      permissionDecision: "deny", permissionDecisionReason: "Дія не належить живому керованому виконанню.",
+    });
+    await f.send();
+    expect(await hook(input, { sessionId: f.native.sessionId })).toMatchObject({
+      permissionDecision: "deny", permissionDecisionReason: expect.stringContaining("відокремленого процесу"),
+    });
   });
   it("default-denies waits on stop and only reports stopped after owned host termination", async () => {
     const f = setup(); await f.open(); await f.send();
@@ -309,8 +373,8 @@ describe("pinned Copilot runtime adapter", () => {
       vi.useRealTimers();
     }
   });
-  it("exports only the approved exact tool invocation through the service bridge, once", async () => {
-    const f = setup();
+  it.each(["manual", "autopilot"] as const)("exports only the approved exact tool invocation once in %s mode", async (mode) => {
+    const f = setup(); f.config.config.permissionMode = mode;
     const exportFile = vi.fn(async () => ({
       id: "artifact", scope, sessionId: f.session.id, runId: f.identity.runId, kind: "output" as const,
       relativePath: "output/synthetic.txt", fileName: "synthetic.txt", mimeType: "text/plain", sizeBytes: 1,
@@ -326,10 +390,12 @@ describe("pinned Copilot runtime adapter", () => {
       kind: "custom-tool", toolName: "densemble_export_file", toolDescription: "Export", toolCallId: invocation.toolCallId,
       args: { path: "synthetic.txt" },
     }, { sessionId: f.native.sessionId });
-    const event = f.events.find((event) => event.kind === "request")!;
-    if (event.kind !== "request") throw new Error("Expected permission");
-    await f.runtime.execute({ kind: "answer", identity: f.identity, requestId: event.requestId,
-      answer: { kind: "permission", approved: true } });
+    if (mode === "manual") {
+      const event = f.events.find((event) => event.kind === "request")!;
+      if (event.kind !== "request") throw new Error("Expected permission");
+      await f.runtime.execute({ kind: "answer", identity: f.identity, requestId: event.requestId,
+        answer: { kind: "permission", approved: true } });
+    } else expect(f.events.some((event) => event.kind === "request")).toBe(false);
     await expect(permission).resolves.toEqual({ kind: "approve-once" });
     await expect(handler({ path: "other.txt" }, invocation)).rejects.toThrow("EXPORT_NOT_AUTHORIZED");
     await handler({ path: "synthetic.txt" }, invocation);
@@ -470,6 +536,29 @@ describe("pinned Copilot runtime adapter", () => {
     expect(detachedAction("bash", { command: "nohup node worker" })).toBe(true);
     expect(detachedAction("bash", { command: "git status && git diff" })).toBe(false);
     expect(detachedAction("bash", { command: "node worker", detach: true })).toBe(true);
+  });
+  it.each([
+    'curl "https://example.invalid/?key=synthetic&token=synthetic"',
+    "curl 'https://example.invalid/?a=1&b=2'",
+    "curl https://example.invalid/?a=1\\&b=2",
+    'KEY=$(printf synthetic) && curl "https://example.invalid/?key=$KEY&fields=name"',
+    "printf '%s' 'fish & chips' && printf done",
+    "node worker 2>&1",
+    "node worker &>output.txt",
+    "node worker &>>output.txt",
+    "node worker |& cat",
+    "node worker # a comment &",
+  ])("does not mistake literals or redirections for detached execution: %s", (command) => {
+    expect(detachedAction("bash", { command })).toBe(false);
+  });
+  it.each([
+    "node worker &", "node worker & wait", 'printf "%s" "$(node worker &)"',
+    "printf '%s' \"`node worker &`\"", "result=$(node worker &) && printf done",
+    'curl "https://example.invalid/?a=1&b=2" &', "node worker 2>&1 &",
+    "node worker &>output.txt &", "node worker # literal &\nnode other &",
+    "node worker &\nwait", "(node worker &) ", "bash -c 'nohup node worker'",
+  ])("still rejects real background or detached execution: %s", (command) => {
+    expect(detachedAction("bash", { command })).toBe(true);
   });
 });
 

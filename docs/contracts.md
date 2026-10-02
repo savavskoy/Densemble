@@ -31,6 +31,13 @@ explicitly if launched from elsewhere.
   may independently bind the same private chat.
 - `authorizeScope(config, candidate)` checks the numeric owner, bot sender flag,
   bot, chat, kind, and exact topic before any expensive or external operation.
+- Optional `permissionMode` defaults to `"autopilot"` for all agents; `"manual"`
+  explicitly enables per-action confirmation. Autopilot grants ordinary tool requests once without a Telegram
+  approval prompt, including exports. Both modes require a matching live native
+  session and a confirmed SDK connection, rechecking liveness after the check.
+  Managed-policy approval requirements, sandbox escalation, detached processes
+  and excluded tools remain denied. Questions are not auto-answered. This
+  service-wide owner setting takes effect on restart, never via agent input.
 - `discoverAgents(sources)` parses launcher YAML, checks metadata/canonical files
   and local Markdown links, and returns **all** agents. `userInvocable` governs bot
   bindings only. `infer` is independent and absent unless explicitly declared.

@@ -21,6 +21,9 @@ describe("durable admission and priority cancellation", () => {
     expect(setPrompt).not.toHaveBeenCalled();
     expect(f.delivery.deliver).not.toHaveBeenCalled();
     expect(f.store.outbox.list(scope).every((item) => item.status === "pending")).toBe(true);
+    expect(f.store.outbox.list(scope)[0]?.payload).toMatchObject({
+      kind: "text", text: expect.stringContaining("Введіть /, щоб побачити підказки команд."),
+    });
     await f.flushDeliveries();
     expect(f.delivery.deliver).toHaveBeenCalledTimes(1);
     expect(f.store.outbox.list(scope)[0]?.status).toBe("sent");
@@ -57,6 +60,7 @@ describe("durable admission and priority cancellation", () => {
     expect(run.status).toBe("preparing");
     await f.app.handle(incoming);
     expect(f.media.prepare).toHaveBeenCalledTimes(1);
+    expect(f.store.outbox.list(scope)).toEqual([]);
     await f.app.handle(f.command("stop"));
     expect(signal?.aborted).toBe(true);
     expect(f.store.runs.active(scope)?.status).toBe("cancelling");
@@ -319,17 +323,23 @@ describe("FIFO media, steering, and conversation controls", () => {
     expect(f.store.sessions.current(scope)).toMatchObject({ id: saved.id, appliedModel: "model-2" });
     expect(f.commands.some((entry) => entry.kind === "send")).toBe(false);
   });
-  it("makes a stopped run button unusable after the next generation starts", async () => {
+  it("starts runs without an automatic stop message or button and stops the current run with /stop", async () => {
     const f = setup();
     await f.app.handle(f.message()); await f.app.drain();
     const old = f.store.runs.active(scope)!;
-    const button = f.button("Зупинити");
+    expect(f.store.outbox.list(scope)).toEqual([]);
+    expect(f.delivery.deliver).not.toHaveBeenCalled();
     f.emit({ ...old, kind: "completed", text: "Завершено" }); await f.app.drain();
     await f.app.handle(f.message("Новий запит")); await f.app.drain();
     const active = f.store.runs.active(scope)!;
-    await f.click("", scope, { data: button.data, messageId: button.item.remoteMessageIds[0]! });
-    expect(f.store.runs.active(scope)?.runId).toBe(active.runId);
-    expect(f.commands.some((entry) => entry.kind === "stop")).toBe(false);
+    expect(f.store.outbox.list(scope).map((item) => item.payload)).toEqual([{ kind: "text", text: "Завершено" }]);
+    await f.app.handle(f.command("stop")); await f.app.drain();
+    expect(f.store.runs.active(scope)).toBeNull();
+    expect(f.store.runs.get(scope, old.runId)?.status).toBe("succeeded");
+    expect(f.store.runs.get(scope, active.runId)?.status).toBe("cancelled");
+    expect(f.commands.filter((entry) => entry.kind === "stop")).toEqual([
+      expect.objectContaining({ identity: expect.objectContaining({ runId: active.runId }) }),
+    ]);
   });
   it("invalidates forged and cross-scope menu tokens; requires a separate deletion confirmation", async () => {
     const f = setup();

@@ -59,6 +59,15 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe("private configuration and discovery", () => {
+  it("defaults to autopilot and accepts explicit manual/autopilot permissions", () => {
+    expect(load().config.permissionMode).toBe("autopilot");
+    for (const mode of ["manual", "autopilot"] as const) {
+      config.permissionMode = mode;
+      expect(load().config.permissionMode).toBe(mode);
+    }
+    write(configPath, JSON.stringify({ ...config, permissionMode: "allow-everything" }));
+    expect(() => loadConfig(configPath, { codeRoot: code })).toThrow("CONFIG_SCHEMA_INVALID");
+  });
   it("resolves optional audio paths without installing tools or requiring a model for text", () => {
     config.audio = { modelPath: "../models/ggml-small.bin", ffmpegPath: "ffmpeg",
       whisperPath: "./tools/whisper-cli", language: "uk", threads: 4 };

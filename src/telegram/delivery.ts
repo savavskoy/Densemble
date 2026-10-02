@@ -103,8 +103,6 @@ export function createDeliveryTransport(options: DeliveryOptions): ManagedTelegr
         link_preview_options: { is_disabled: true },
       }, signal);
       else {
-        void api.sendChatAction({ chat_id: identity.scope.chatId, action: "typing",
-          ...(identity.scope.topicId === null ? {} : { message_thread_id: identity.scope.topicId }) }, signal).catch(() => undefined);
         const message = await api.sendMessage({
           chat_id: identity.scope.chatId, text: first.html, parse_mode: "HTML",
           ...(identity.scope.topicId === null ? {} : { message_thread_id: identity.scope.topicId }),

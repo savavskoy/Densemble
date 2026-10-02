@@ -6,7 +6,8 @@ exports:
 - `transport: TelegramDeliveryTransport` extends the shared `DeliveryTransport`
   with `invalidatePreview(identity: RunIdentity): Promise<void>`.
 - `start(handler: IngressHandler): Promise<void>` — bounded identity/webhook
-  checks, then independent polling and outbox loops per configured bot.
+  checks, then independent polling, outbox, typing and command-registration loops per
+  configured bot.
 - `stop(): Promise<void>` — aborts polling, rate waits, sends and downloads;
   waits at most five seconds, then logs and rejects with
   `TelegramError("TG_SHUTDOWN_INCOMPLETE")` if any owned work remains.
@@ -69,6 +70,19 @@ unbroken/code text is retained. Extra caption chunks are sent as messages.
 No reasoning/tool arguments are requested or displayed by this module; previews
 must be supplied only user-visible answer deltas by the application.
 
+The native Telegram `typing` indicator starts during run preparation, before
+the first answer delta, and refreshes about every four seconds while preparing
+or running. A half-second state sweep pauses it while waiting for a user answer
+and cancels pending refreshes after cancellation, completion or shutdown.
+Every refresh uses the exact configured bot/chat/topic and shares the bot-wide
+budget and 429 cooldown, but not the slower per-chat message spacing. The API
+call has a three-second deadline after an abortable rate wait and fresh live-run
+check. This keeps simultaneous forum topics from starving each other's typing.
+Typing is best-effort, not a durable message; failures are diagnosed, 429
+cooldowns are honored, and permanent rejections disable it for that active
+state. Telegram clears typing on message delivery or within roughly five
+seconds of the last action; the Bot API has no explicit "stop typing" action.
+
 Previews are throttled to 1.5 seconds and recheck live run identity after rate
 waits. They are explicitly transient (`⏳`) and removed best-effort after a
 confirmed final send. A separate one-second sweep invalidates terminal-run
@@ -111,6 +125,31 @@ into a burst. Cancelled queued callers cannot bypass the current head.
 Reply fallback is only for Telegram's specific 400 “message to be replied [to]
 not found” response. The retry omits the reply but **retains the original topic**.
 There is no fallback to another topic/chat, including for missing-topic errors.
+
+## Slash-command menu
+
+At startup, after successful identity/webhook checks, the adapter registers
+`/start`, `/help`, `/status`, `/model`, `/new`, `/sessions` and `/stop` using
+`setMyCommands`, with Ukrainian descriptions and no language restriction.
+Typing `/` in Telegram displays these suggestions. Registration targets only
+configured bindings: private-chat scope for the owner and `chat_member` scope
+for that owner in groups/forums. Multiple forum topics share one registration:
+Telegram has no topic-specific command scope, so suggestions may also appear
+in unbound topics of that same forum. Ingress still enforces the exact binding.
+No default/global command scope is published or modified.
+
+Registration runs independently of polling and delivery; an unavailable menu
+does not prevent typed `/stop`. Calls use shared rate permits, a ten-second
+deadline, abortable exponential retries for network failures, and Bot API
+`retry_after`/server backoff. Permanent menu rejections are diagnosed and skipped
+for that binding; invalid tokens disable only the affected bot. Retry attempts
+are idempotent replacements and are cancelled on shutdown.
+Startup does not wait for menu synchronization. Removed bindings and existing
+BotFather/global or language-specific command lists are not cleaned up.
+
+Starting a run does not enqueue an automatic acknowledgement or Stop button.
+Send `/stop` to cancel the current conversation's work; request/permission
+buttons and explicitly requested menus retain their existing behavior.
 
 ## Limits and operations
 

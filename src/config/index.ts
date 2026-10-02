@@ -36,6 +36,7 @@ export const configSchema = z.object({
   interactiveHomePath: nonempty.optional(),
   skillDirectories: z.array(nonempty).min(1),
   ownerId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  permissionMode: z.enum(["manual", "autopilot"]).optional(),
   bots: z.array(z.object({ id: name, agentId: name, tokenRef: secretRef }).strict()).min(1),
   bindings: z.array(z.object({
     botId: name, chatId: numericId, kind: z.enum(["private", "group", "forum"]),
@@ -96,6 +97,7 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   const parsed = configSchema.safeParse(readJson(file));
   if (!parsed.success) throw new ConfigError("CONFIG_SCHEMA_INVALID");
   const config = parsed.data;
+  config.permissionMode ??= "autopilot";
   const fromConfig = (path: string) => resolve(dirname(file), path);
   if (config.audio) {
     if (config.audio.modelPath) config.audio.modelPath = fromConfig(config.audio.modelPath);
