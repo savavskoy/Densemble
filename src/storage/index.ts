@@ -5,6 +5,7 @@ import { attachmentStore } from "./attachments.js";
 import { activeStates, Connection, StateError } from "./database.js";
 import { inboxStore } from "./inbox.js";
 import { outboxStore } from "./outbox.js";
+import { proactivityStore } from "./proactivity.js";
 import { requestStore } from "./requests.js";
 import { runRow } from "./rows.js";
 import { runStore } from "./runs.js";
@@ -33,7 +34,7 @@ export function openStore(options: { path: string }): StateStore {
   const outbox = outboxStore(db);
   const store: StateStore = {
     sessions: sessionStore(db), inbox, runs: runStore(db, outbox), requests: requestStore(db),
-    outbox, attachments: attachmentStore(db),
+    outbox, attachments: attachmentStore(db), proactivity: proactivityStore(db),
     recover(now = Date.now()) {
       return db.atomic(() => {
         const interruptedRuns = db.all(`SELECT * FROM runs WHERE status IN (${activeStates})`).map((row) => runRow(db, row));
@@ -75,6 +76,7 @@ export function openStore(options: { path: string }): StateStore {
       }
     },
     close() { db.db.close(); },
+    atomic(fn) { return db.atomic(fn); },
   };
   return store;
 }

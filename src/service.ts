@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import type { LoadedConfig } from "./config/index.js";
+import { defaultQuietHours } from "./config/index.js";
 import { createApplication, type Application } from "./application/index.js";
 import { createCopilotRuntime, type ControlledRuntime } from "./agents/index.js";
 import { bounded } from "./agents/contracts.js";
@@ -7,6 +8,7 @@ import { createMediaPipeline } from "./media/index.js";
 import type { MediaPipeline } from "./media/index.js";
 import { createTelegramAdapter, type TelegramAdapter } from "./telegram/index.js";
 import type { StateStore } from "./ports.js";
+import { createProactiveScheduler } from "./scheduling/scheduler.js";
 import { openStore } from "./storage/index.js";
 import { acquireProcessLock } from "./storage/process-lock.js";
 import { createDiagnostics } from "./operations/diagnostics.js";
@@ -22,8 +24,10 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
   let telegram: TelegramAdapter | undefined;
   let maintenance: Promise<void> | undefined;
   let timer: NodeJS.Timeout | undefined;
+  let scheduler: { start(): void; stop(): void } | undefined;
   function stop(): Promise<void> {
     return closing ??= (async () => {
+      scheduler?.stop();
       clearInterval(timer);
       const errors: unknown[] = [];
       let confirmed = true;
@@ -64,6 +68,12 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
     await media.cleanup();
     application = createApplication({ config, store, runtime, media, delivery: telegram.transport, diagnostics });
     await application.start(recovery);
+    scheduler = createProactiveScheduler({
+      store,
+      quietHours: config.config.quietHours ?? defaultQuietHours,
+      onDue: (item) => application!.triggerProactive(item),
+    });
+    scheduler.start();
     await telegram.start(application);
     timer = setInterval(() => {
       if (closing || maintenance) return;

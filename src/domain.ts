@@ -85,6 +85,38 @@ export interface Session {
   updatedAt: number;
 }
 
+export type ProactiveKind = "oneoff" | "recurring" | "silent";
+export type ProactiveStatus = "active" | "paused" | "cancelled" | "done";
+export type ProactiveInitiator = "oleh" | "agent";
+export type ProactiveOccurrenceOutcome = "pending" | "sent" | "nothing" | "late" | "failed" | "uncertain";
+export type ProactiveSchedule =
+  | { type: "once"; at: number }
+  | { type: "interval"; everyMs: number }
+  | { type: "weekly"; daysOfWeek: number[]; hour: number; minute: number }
+  | { type: "monthly"; daysOfMonth: number[]; hour: number; minute: number };
+export interface ProactiveItem {
+  id: string;
+  scope: Scope;
+  agentId: string;
+  kind: ProactiveKind;
+  schedule: ProactiveSchedule;
+  purpose: string;
+  initiator: ProactiveInitiator;
+  status: ProactiveStatus;
+  nextDueAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+export interface ProactiveOccurrence {
+  id: string;
+  itemId: string;
+  dueAt: number;
+  outcome: ProactiveOccurrenceOutcome;
+  late: boolean;
+  settledAt: number | null;
+  createdAt: number;
+}
+
 export type RunStatus = "preparing" | "running" | "waiting" | "cancelling" |
   "succeeded" | "failed" | "cancelled" | "interrupted";
 export type TerminalRunStatus = Extract<RunStatus, "succeeded" | "failed" | "cancelled" | "interrupted">;

@@ -2,7 +2,15 @@ import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "nod
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { authorizeScope, ConfigError, loadConfig, secretResolver, type ServiceConfig } from "../../src/config/index.js";
+import {
+  authorizeScope,
+  ConfigError,
+  defaultProactivityGuardrails,
+  defaultQuietHours,
+  loadConfig,
+  secretResolver,
+  type ServiceConfig,
+} from "../../src/config/index.js";
 
 let root: string;
 let source: string;
@@ -223,5 +231,28 @@ describe("explicit private/group/forum bindings", () => {
     config.bindings.pop();
     config.bindings[0]!.botId = "unknown";
     expect(load).toThrow("BINDING_UNKNOWN_BOT");
+  });
+});
+
+describe("proactivity configuration defaults and validation", () => {
+  it("applies quiet-hours and proactivity defaults when absent or partial", () => {
+    expect(load().config.quietHours).toEqual(defaultQuietHours);
+    expect(load().config.proactivity).toEqual(defaultProactivityGuardrails);
+    config.proactivity = { maxActiveItemsPerAgent: 7 };
+    expect(load().config.proactivity).toEqual({
+      minIntervalMs: defaultProactivityGuardrails.minIntervalMs,
+      maxActiveItemsPerAgent: 7,
+    });
+  });
+  it.each([
+    { start: "9:30", end: "10:00", timezone: "Europe/Kyiv" },
+    { start: "09:30", end: "24:00", timezone: "Europe/Kyiv" },
+  ])("rejects malformed quiet-hours values", (quietHours) => {
+    config.quietHours = quietHours;
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+  });
+  it("rejects too-small proactive intervals", () => {
+    config.proactivity = { minIntervalMs: 59_999 };
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
   });
 });

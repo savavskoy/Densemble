@@ -1,7 +1,9 @@
 import type {
   Attachment, Conversation, DeliveryPayload, IncomingMessage, Json, LogicalInput, ModelInfo,
-  NormalizedIngress, OutboxItem, PendingRequest, PreparedInput, RequestAnswer, RequestPayload,
-  Run, RunIdentity, RuntimeCommand, RuntimeEvent, Scope, Session, TerminalRunStatus,
+  NormalizedIngress, OutboxItem, PendingRequest, PreparedInput, ProactiveInitiator,
+  ProactiveItem, ProactiveKind, ProactiveOccurrence, ProactiveOccurrenceOutcome, ProactiveSchedule,
+  ProactiveStatus, RequestAnswer, RequestPayload, Run, RunIdentity, RuntimeCommand, RuntimeEvent,
+  Scope, Session, TerminalRunStatus,
 } from "./domain.js";
 
 export interface SessionStore {
@@ -104,6 +106,28 @@ export interface AttachmentStore {
   expired(now?: number): Attachment[];
   removeExpired(id: string, now?: number): Attachment | null;
 }
+export interface ProactivityStore {
+  create(scope: Scope, options: {
+    agentId: string;
+    kind: ProactiveKind;
+    schedule: ProactiveSchedule;
+    purpose: string;
+    initiator: ProactiveInitiator;
+    nextDueAt: number | null;
+    now?: number;
+  }): ProactiveItem;
+  get(scope: Scope, id: string): ProactiveItem | null;
+  listForScope(scope: Scope): ProactiveItem[];
+  listDue(now: number): ProactiveItem[];
+  countActive(scope: Scope): number;
+  setStatus(scope: Scope, id: string, status: ProactiveStatus, now?: number): boolean;
+  reschedule(scope: Scope, id: string, nextDueAt: number | null, now?: number): boolean;
+  isAgentPaused(scope: Scope): boolean;
+  setAgentPaused(scope: Scope, paused: boolean, now?: number): boolean;
+  recordOccurrence(itemId: string, dueAt: number, late: boolean, now?: number): ProactiveOccurrence;
+  settleOccurrence(id: string, outcome: ProactiveOccurrenceOutcome, now?: number): boolean;
+  syntheticId(occurrenceId: string): number;
+}
 export interface Recovery {
   interruptedRuns: Run[];
   invalidatedRequests: number;
@@ -117,10 +141,13 @@ export interface StateStore {
   requests: RequestStore;
   outbox: OutboxStore;
   attachments: AttachmentStore;
+  proactivity: ProactivityStore;
   recover(now?: number): Recovery;
   cleanup(options: { before: number; now?: number }): { inputs: number; requests: number; outbox: number };
   backup(destination: string): Promise<void>;
   close(): void;
+  /** Runs `fn` inside a single durable transaction spanning any of the sub-stores above. */
+  atomic<T>(fn: () => T): T;
 }
 
 export interface RuntimeSessionOptions {

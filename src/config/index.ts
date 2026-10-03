@@ -9,6 +9,7 @@ import { assertDisjoint, checkedPath, ConfigError, isWithin, sourcePath } from "
 const name = z.string().regex(/^[a-z0-9][a-z0-9_-]*$/);
 const nonempty = z.string().trim().min(1);
 const numericId = z.number().int().min(Number.MIN_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER).refine((n) => n !== 0);
+const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
 const secretRef = z.string().regex(/^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$/)
   .refine((ref) => !ref.split(".").some((part) => ["__proto__", "prototype", "constructor"].includes(part)));
 const secretValue = z.object({ secretRef }).strict();
@@ -37,6 +38,15 @@ export const configSchema = z.object({
   skillDirectories: z.array(nonempty).min(1),
   ownerId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   permissionMode: z.enum(["manual", "autopilot"]).optional(),
+  quietHours: z.object({
+    start: z.string().regex(hhmm),
+    end: z.string().regex(hhmm),
+    timezone: nonempty,
+  }).strict().optional(),
+  proactivity: z.object({
+    minIntervalMs: z.number().int().min(60_000).optional(),
+    maxActiveItemsPerAgent: z.number().int().min(1).optional(),
+  }).strict().optional(),
   bots: z.array(z.object({ id: name, agentId: name, tokenRef: secretRef }).strict()).min(1),
   bindings: z.array(z.object({
     botId: name, chatId: numericId, kind: z.enum(["private", "group", "forum"]),
@@ -62,6 +72,15 @@ export type ServiceConfig = z.infer<typeof configSchema>;
 export type BotConfig = ServiceConfig["bots"][number];
 export type ChatBinding = ServiceConfig["bindings"][number];
 export type McpDeclaration = z.infer<typeof mcpSchema>;
+export const defaultQuietHours = Object.freeze({
+  start: "01:00",
+  end: "09:30",
+  timezone: "Europe/Kyiv",
+});
+export const defaultProactivityGuardrails = Object.freeze({
+  minIntervalMs: 1_800_000,
+  maxActiveItemsPerAgent: 20,
+});
 
 export interface LoadedConfig {
   config: ServiceConfig;
@@ -98,6 +117,8 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   if (!parsed.success) throw new ConfigError("CONFIG_SCHEMA_INVALID");
   const config = parsed.data;
   config.permissionMode ??= "autopilot";
+  config.quietHours ??= { ...defaultQuietHours };
+  config.proactivity = { ...defaultProactivityGuardrails, ...config.proactivity };
   const fromConfig = (path: string) => resolve(dirname(file), path);
   if (config.audio) {
     if (config.audio.modelPath) config.audio.modelPath = fromConfig(config.audio.modelPath);

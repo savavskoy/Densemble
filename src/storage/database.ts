@@ -106,6 +106,28 @@ CREATE TABLE outbox_attachments (
 CREATE INDEX inputs_queue ON inputs(status,ready_at);
 CREATE INDEX requests_run ON requests(run_id,status);
 CREATE INDEX outbox_queue ON outbox(status,retry_after,created_at);
+`, `
+CREATE TABLE proactive_items (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('oneoff','recurring','silent')),
+ schedule TEXT NOT NULL, purpose TEXT NOT NULL,
+ initiator TEXT NOT NULL CHECK(initiator IN ('oleh','agent')),
+ status TEXT NOT NULL CHECK(status IN ('active','paused','cancelled','done')),
+ next_due_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX proactive_items_due ON proactive_items(status,next_due_at);
+CREATE INDEX proactive_items_conversation ON proactive_items(conversation_id,status);
+CREATE TABLE proactive_occurrences (
+ id TEXT PRIMARY KEY, item_id TEXT NOT NULL REFERENCES proactive_items(id) ON DELETE CASCADE,
+ due_at INTEGER NOT NULL, late INTEGER NOT NULL DEFAULT 0,
+ outcome TEXT NOT NULL CHECK(outcome IN ('pending','sent','nothing','late','failed','uncertain')),
+ settled_at INTEGER, created_at INTEGER NOT NULL
+);
+CREATE INDEX proactive_occurrences_item ON proactive_occurrences(item_id);
+CREATE TABLE proactivity_state (
+ conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+ paused INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+);
 `];
 
 export class Connection {

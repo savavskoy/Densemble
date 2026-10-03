@@ -1,21 +1,25 @@
 import { isAbsolute, resolve } from "node:path";
-import { authorizeScope, discoverAgents } from "../config/index.js";
+import { authorizeScope, defaultProactivityGuardrails, defaultQuietHours, discoverAgents } from "../config/index.js";
 import type { LoadedConfig } from "../config/index.js";
 import type {
   Attachment, DeliveryPayload, IncomingCallback, IncomingMessage, LogicalInput, ModelInfo,
-  PendingRequest, RequestAnswer, Run, RunIdentity, RuntimeEvent, Scope, Session,
+  PendingRequest, ProactiveItem, ProactiveKind, RequestAnswer, Run, RunIdentity, RuntimeEvent, Scope, Session,
 } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type {
   AgentRuntime, DeliveryTransport, DiagnosticSink, IngressHandler, MediaPreparation, Recovery, StateStore,
 } from "../ports.js";
-import type { ControlledSessionOptions } from "../agents/contracts.js";
+import type { ControlledSessionOptions, ProactivityRequest, ProactivityResponse } from "../agents/contracts.js";
 import { bounded, RuntimeError } from "../agents/contracts.js";
 import { Controls, currentField, opaqueId, questionAnswer, sanitizeParameters } from "../permissions/index.js";
+import { nextOccurrence } from "../scheduling/rrule.js";
 import type { MenuPayload } from "./menu.js";
 import { DeletionJournal } from "./deletion.js";
 import type { DeletionIntent } from "./deletion.js";
 import { failureCode, failureMessage, mediaNotice } from "./messages.js";
+import { handleProactiveCommand } from "./proactive-commands.js";
+import { handleProactivityRequest } from "./proactive-tool.js";
+import type { ProactivityGuardrails } from "./proactive-tool.js";
 
 export interface ApplicationMedia extends MediaPreparation {
   releaseRun(identity: RunIdentity): void;
@@ -40,6 +44,7 @@ export interface ApplicationOptions {
 export interface Application extends IngressHandler {
   start(recovery?: Recovery): Promise<void>;
   recover(recovery: Recovery): void;
+  triggerProactive(item: ProactiveItem): Promise<boolean>;
   shutdown(): Promise<void>;
   /** Wait for admitted work; useful for shutdown/tests, never the polling loop. */
   drain(): Promise<void>;
@@ -57,8 +62,17 @@ type Action =
 type Context = {
   run: Run; controller: AbortController; jobs: Set<Promise<unknown>>; exports: Attachment[];
   stopping?: Promise<void>; preparingSteer: boolean; failureCode?: string; requestIds: Set<string>; stopForced?: boolean;
+  proactive?: ProactiveBatchEntry[];
 };
 type Barrier = { controller: AbortController; promise: Promise<void>; runtimeSessionId: string };
+interface ProactiveBatchEntry {
+  occurrenceId: string;
+  itemId: string;
+  agentId: string;
+  kind: ProactiveKind;
+  purpose: string;
+  late: boolean;
+}
 
 const runLabels: Record<string, string> = {
   preparing: "підготовка вкладень", running: "працює", waiting: "очікує відповіді",
@@ -69,12 +83,39 @@ const help = "Команди: /start, /help, /status, /model, /new, /sessions, /
   "У цій розмові працює закріплений агент. Уточнення під час роботи передаються активному виконанню. " +
   "На запитання відповідайте кнопками або відповіддю на повідомлення форми. Дозволи — лише кнопками.\n" +
   "/stop не відкочує зовнішні дії.";
+const proactiveKindLabels: Record<ProactiveKind, string> = {
+  oneoff: "одноразове нагадування",
+  recurring: "періодична перевірка",
+  silent: "тиха перевірка — повідомляй лише якщо дійсно є що сказати",
+};
+
+function buildProactiveTriggerText(entries: ProactiveBatchEntry[], sentinelEligible: boolean): string {
+  const lines = [
+    "Системний проактивний тригер для цієї розмови.",
+    entries.length > 1
+      ? "Нижче кілька одночасних причин написати Олегу. Дайте одне природне повідомлення, об'єднавши теми без службових пояснень."
+      : "Сформуйте одне доречне повідомлення для Олега без згадки внутрішнього службового тригера.",
+    "",
+    "Пункти:",
+  ];
+  entries.forEach((entry, index) => {
+    lines.push(`${index + 1}. ${proactiveKindLabels[entry.kind]}: ${entry.purpose}`);
+    if (entry.late) {
+      lines.push("   Це спрацювання мало відбутися раніше через тихі години або простій сервісу. Можете просто виконати його зараз.");
+    }
+  });
+  if (sentinelEligible) {
+    lines.push("", "Якщо зараз справді немає нічого вартого окремого повідомлення, відповідайте рівно текстом NO_PROACTIVE_MESSAGE і більше нічого не додавайте: без крапок, без лапок, без додаткових слів.");
+  }
+  return lines.join("\n");
+}
 
 export function createApplication(options: ApplicationOptions): Application {
   const { config, store, runtime, media, delivery, diagnostics } = options;
   const controls = new Controls<Action>();
   const contexts = new Map<string, Context>();
   const barriers = new Map<string, Barrier>();
+  const pendingProactiveBatches = new Map<string, ProactiveBatchEntry[]>();
   const held = new Set<string>();
   const jobs = new Set<Promise<unknown>>();
   const timers = new Map<string, NodeJS.Timeout>();
@@ -129,6 +170,17 @@ export function createApplication(options: ApplicationOptions): Application {
     text(session, failureMessage(code), runId ? `run:${runId}:error` : opaqueId(), runId);
   }
   function sessionFor(identity: RunIdentity): Session | null { return store.sessions.get(identity.scope, identity.sessionId); }
+  function proactivityGuardrails(): ProactivityGuardrails {
+    const configured = config.config.proactivity;
+    return {
+      maxActiveItemsPerAgent: configured?.maxActiveItemsPerAgent ?? defaultProactivityGuardrails.maxActiveItemsPerAgent,
+      minIntervalMs: configured?.minIntervalMs ?? defaultProactivityGuardrails.minIntervalMs,
+      timezone: config.config.quietHours?.timezone ?? defaultQuietHours.timezone,
+    };
+  }
+  async function proactivity(scope: Scope, agentId: string, request: ProactivityRequest): Promise<ProactivityResponse> {
+    return handleProactivityRequest(store, proactivityGuardrails(), scope, agentId, request);
+  }
   async function exportFile(identity: RunIdentity, path: string, signal: AbortSignal): Promise<Attachment> {
     const context = contexts.get(identity.runId);
     if (!context || !live(identity)) throw new RuntimeError("EXPORT_STALE_RUN");
@@ -155,7 +207,7 @@ export function createApplication(options: ApplicationOptions): Application {
     const active = store.runs.active(session.scope);
     const emptyHistory = session.generation === 0 || (session.generation === 1 &&
       active?.sessionId === session.id && active.generation === 1 && active.status === "preparing");
-    const supplied: ControlledSessionOptions = { session, signal, emptyHistory, onEvent, exportFile };
+    const supplied: ControlledSessionOptions = { session, signal, emptyHistory, onEvent, exportFile, proactivity };
     const result = await runtime.open(supplied);
     signal.throwIfAborted();
     if (!store.sessions.setProviderSessionId(session.scope, session.id, result.providerSessionId)) {
@@ -197,6 +249,11 @@ export function createApplication(options: ApplicationOptions): Application {
     contexts.set(run.runId, context);
     const reserved = store.inbox.get(scope, input.id);
     if (!reserved) { launch(failRun(context, "INPUT_MISSING")); return; }
+    const batch = pendingProactiveBatches.get(reserved.id);
+    if (batch) {
+      context.proactive = batch;
+      pendingProactiveBatches.delete(reserved.id);
+    }
     launch(executeInput(context, reserved), context);
   }
   async function executeInput(context: Context, input: LogicalInput): Promise<void> {
@@ -268,6 +325,17 @@ export function createApplication(options: ApplicationOptions): Application {
     if (!session) return;
     // Do not release the live slot while an errored send may still be executing.
     context.failureCode = code;
+    if (context.proactive) {
+      try {
+        for (const entry of context.proactive) {
+          store.proactivity.settleOccurrence(entry.occurrenceId, "failed");
+          if (entry.kind !== "oneoff") continue;
+          text(session,
+            `⏰ Нагадування не вдалося виконати через агента (одноразове): ${entry.purpose}`,
+            `proactive-fallback:${entry.occurrenceId}`, context.run.runId);
+        }
+      } catch { diagnostics.record("PROACTIVE_FAILURE_HANDLING_FAILED"); }
+    }
     try { reportFailure(session, code, context.run.runId); } catch { diagnostics.record("FAILURE_DELIVERY_PERSIST_FAILED"); }
     await stopRun(context.run);
   }
@@ -319,7 +387,11 @@ export function createApplication(options: ApplicationOptions): Application {
         break;
       }
       case "completed": {
-        const deliveries = [{ dedupKey: `run:${event.runId}:result`, payload: { kind: "text" as const, text: event.text },
+        const sentinelMatched = Boolean(context.proactive?.length === 1 &&
+          context.proactive[0]!.kind === "silent" &&
+          !context.proactive[0]!.late &&
+          event.text.trim().toUpperCase() === "NO_PROACTIVE_MESSAGE");
+        let deliveries = [{ dedupKey: `run:${event.runId}:result`, payload: { kind: "text" as const, text: event.text },
           replyToMessageId: store.inbox.get(event.scope, context.run.inputId)?.messages[0]?.messageId },
         ...context.exports.map((attachment) => ({
           dedupKey: `run:${event.runId}:file:${attachment.id}`,
@@ -330,7 +402,13 @@ export function createApplication(options: ApplicationOptions): Application {
           }
           return item;
         });
+        if (sentinelMatched) deliveries = [];
         if (store.runs.complete(event, deliveries)) {
+          if (context.proactive) {
+            for (const entry of context.proactive) {
+              store.proactivity.settleOccurrence(entry.occurrenceId, sentinelMatched ? "nothing" : (entry.late ? "late" : "sent"));
+            }
+          }
           runtimeFaults.delete(scopeKey(event.scope));
           finishContext(context);
         }
@@ -338,6 +416,70 @@ export function createApplication(options: ApplicationOptions): Application {
       }
       case "failed": launch(failRun(context, event.code)); break;
     }
+  }
+  async function triggerProactive(item: ProactiveItem): Promise<boolean> {
+    if (stopped || closing) return false;
+    const key = scopeKey(item.scope);
+    if (barriers.has(key) || held.has(key)) return false;
+    if (store.runs.active(item.scope)) return false;
+    if (store.proactivity.isAgentPaused(item.scope)) return false;
+
+    const now = Date.now();
+    const quietHours = config.config.quietHours ?? defaultQuietHours;
+    const lateThresholdMs = 90_000;
+    const session = current(item.scope);
+    const binding = config.config.bindings.find((entry) =>
+      entry.botId === item.scope.botId && entry.chatId === item.scope.chatId);
+    const chatKind = binding?.kind ?? (item.scope.topicId === null ? "private" : "forum");
+
+    // Record/advance the whole batch and admit the synthetic message as one durable transaction,
+    // so a crash or thrown error mid-batch never leaves a sibling advanced without being delivered
+    // (or an occurrence recorded without the triggering item being advanced).
+    const { entries, admitted } = store.atomic(() => {
+      const siblings = store.proactivity.listDue(now).filter((candidate) => scopeKey(candidate.scope) === key);
+      const batchItems = siblings.some((candidate) => candidate.id === item.id) ? siblings : [...siblings, item];
+
+      const entries: ProactiveBatchEntry[] = [];
+      for (const batchItem of batchItems) {
+        const late = batchItem.nextDueAt !== null && (now - batchItem.nextDueAt) > lateThresholdMs;
+        const occurrence = store.proactivity.recordOccurrence(batchItem.id, batchItem.nextDueAt ?? now, late, now);
+        entries.push({
+          occurrenceId: occurrence.id,
+          itemId: batchItem.id,
+          agentId: batchItem.agentId,
+          kind: batchItem.kind,
+          purpose: batchItem.purpose,
+          late,
+        });
+        if (batchItem.id === item.id) continue;
+        if (batchItem.schedule.type === "once") {
+          store.proactivity.setStatus(batchItem.scope, batchItem.id, "done", now);
+          continue;
+        }
+        const next = nextOccurrence(batchItem.schedule, now, quietHours.timezone);
+        if (next === null) store.proactivity.setStatus(batchItem.scope, batchItem.id, "done", now);
+        else store.proactivity.reschedule(batchItem.scope, batchItem.id, next, now);
+      }
+
+      const primaryOccurrenceId = entries[0]!.occurrenceId;
+      const syntheticId = store.proactivity.syntheticId(primaryOccurrenceId);
+      const sentinelEligible = entries.length === 1 && entries[0]!.kind === "silent" && !entries[0]!.late;
+      const message: IncomingMessage = {
+        kind: "message",
+        scope: item.scope,
+        chatKind,
+        updateId: syntheticId,
+        messageId: syntheticId,
+        receivedAt: now,
+        text: buildProactiveTriggerText(entries, sentinelEligible),
+        attachments: [],
+      };
+      return { entries, admitted: store.inbox.admit(message, { sessionId: session.id, reserveRun: false, now }) };
+    });
+    if (!admitted.accepted || !admitted.input) return false;
+    pendingProactiveBatches.set(admitted.input.id, entries);
+    pump(item.scope);
+    return true;
   }
   function stopRun(identity: RunIdentity): Promise<void> {
     const context = contexts.get(identity.runId);
@@ -723,6 +865,7 @@ export function createApplication(options: ApplicationOptions): Application {
       case "status": status(session); break;
       case "model": barrier(session, (signal) => models(session, 0, signal)); break;
       case "sessions": sessions(session, 0); break;
+      case "proactive": text(session, handleProactiveCommand(store, config, session.scope, message.command!.arguments).text); break;
       case "new":
         launch((async () => {
           await stopScope(session);
@@ -827,6 +970,7 @@ export function createApplication(options: ApplicationOptions): Application {
     async drain() {
       while (jobs.size) await Promise.allSettled([...jobs]);
     },
+    triggerProactive,
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       closing = true;

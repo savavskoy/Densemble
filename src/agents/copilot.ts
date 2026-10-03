@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CopilotClient, defineTool, RuntimeConnection, ToolSet } from "@github/copilot-sdk";
+import { z } from "zod";
 import type {
   CopilotClientOptions, CopilotSession, MCPServerConfig,
   ModelInfo as SdkModel, PermissionRequest, ResumeSessionConfig, SessionConfig, SessionEvent,
@@ -11,7 +12,7 @@ import type { ModelInfo, RequestAnswer, RequestPayload, RunIdentity, RuntimeComm
 import { scopeKey } from "../domain.js";
 import type { DiagnosticSink } from "../ports.js";
 import { opaqueId, sanitizeParameters } from "../permissions/index.js";
-import type { ControlledRuntime, ControlledSessionOptions } from "./contracts.js";
+import type { ControlledRuntime, ControlledSessionOptions, ProactivityRequest } from "./contracts.js";
 import { bounded, RuntimeError } from "./contracts.js";
 import { ProcessSupervisor, recoverOwnedProcesses } from "./supervisor.js";
 import type { ProcessFailure } from "./supervisor.js";
@@ -27,6 +28,33 @@ const permissionNames: Partial<Record<PermissionRequest["kind"], string>> = {
   shell: "Виконати команду", read: "Прочитати файл", write: "Змінити файл", mcp: "Викликати MCP-інструмент",
   url: "Відкрити мережевий ресурс", "custom-tool": "Викликати інструмент сервісу", hook: "Виконати обробник",
 };
+const proactivityRequestSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("schedule"),
+    kind: z.enum(["oneoff", "recurring", "silent"]),
+    schedule: z.discriminatedUnion("type", [
+      z.object({ type: z.literal("once"), at: z.number().int().nonnegative() }).strict(),
+      z.object({ type: z.literal("interval"), everyMs: z.number().int().positive() }).strict(),
+      z.object({
+        type: z.literal("weekly"),
+        daysOfWeek: z.array(z.number().int().min(0).max(6)).min(1),
+        hour: z.number().int().min(0).max(23),
+        minute: z.number().int().min(0).max(59),
+      }).strict(),
+      z.object({
+        type: z.literal("monthly"),
+        daysOfMonth: z.array(z.number().int().min(1).max(31)).min(1),
+        hour: z.number().int().min(0).max(23),
+        minute: z.number().int().min(0).max(59),
+      }).strict(),
+    ]),
+    purpose: z.string().trim().min(1),
+  }).strict(),
+  z.object({ action: z.literal("list") }).strict(),
+  z.object({ action: z.literal("cancel"), id: z.string().trim().min(1) }).strict(),
+  z.object({ action: z.literal("pause") }).strict(),
+  z.object({ action: z.literal("resume") }).strict(),
+]);
 type NativeSession = Pick<CopilotSession, "sessionId" | "send" | "abort" | "disconnect" | "setModel"> & {
   rpc: { model: Pick<CopilotSession["rpc"]["model"], "getCurrent"> };
 };
@@ -174,7 +202,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
   let shuttingDown = false;
   const secrets: string[] = [];
   const mcpServers: Record<string, MCPServerConfig> = {};
-  const tools = new ToolSet().addBuiltIn(builtinTools).addCustom("densemble_export_file");
+  const tools = new ToolSet().addBuiltIn(builtinTools).addCustom("densemble_export_file").addCustom("densemble_manage_proactivity");
   if (config.config.mcp.mode === "allowlist") {
     for (const declaration of config.config.mcp.servers) {
       const secret = (reference: string): string => {
@@ -225,7 +253,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       return existing;
     }
     const host = hostFactory();
-    const slot: Slot = { scope, sessionId, host, ready: Promise.resolve(), requests: new Map(), exportGrants: new Map(),
+    const slot: Slot = { scope, sessionId, host, ready: Promise.resolve(), requests: new Map(),
+      exportGrants: new Map(),
       closing: false, switching: false, forcedClose: false };
     slots.set(key, slot);
     slot.ready = host.then(async (owner) => {
@@ -434,25 +463,88 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
           diagnostics.record("TOOL_EXCLUDED_REJECTED");
           return { permissionDecision: "deny", permissionDecisionReason: "Цей інструмент вимкнений у керованому сервісі." };
         }
+        if (input.toolName === "densemble_manage_proactivity") {
+          return { permissionDecision: "allow", permissionDecisionReason: "Дозволений інструмент управління нагадуваннями Densemble." };
+        }
         return { permissionDecision: "ask" };
       } },
-      tools: [defineTool("densemble_export_file", {
-        description: "Return a generated workspace file to this conversation under the configured permission policy. A path mentioned in text is not an export.",
-        parameters: { type: "object", properties: { path: { type: "string", minLength: 1,
-          description: "Absolute path or a path relative to the configured workspace." } }, required: ["path"], additionalProperties: false },
-        handler: async (args: { path: string }, invocation) => {
-          const turn = slot.turn;
-          if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId || !supplied.exportFile) {
-            throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
-          }
-          if (slot.exportGrants.get(invocation.toolCallId) !== args.path) throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
-          slot.exportGrants.delete(invocation.toolCallId);
-          const signal = invocation.signal ? AbortSignal.any([turn.controller.signal, invocation.signal]) : turn.controller.signal;
-          const attachment = await supplied.exportFile(turn.identity, args.path, signal);
-          if (!live(slot, turn)) throw new RuntimeError("EXPORT_CANCELLED");
-          return { status: "prepared_for_delivery", fileName: attachment.fileName };
-        },
-      })],
+      tools: [
+        defineTool("densemble_export_file", {
+          description: "Return a generated workspace file to this conversation under the configured permission policy. A path mentioned in text is not an export.",
+          parameters: { type: "object", properties: { path: { type: "string", minLength: 1,
+            description: "Absolute path or a path relative to the configured workspace." } }, required: ["path"], additionalProperties: false },
+          handler: async (args: { path: string }, invocation) => {
+            const turn = slot.turn;
+            if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId || !supplied.exportFile) {
+              throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
+            }
+            if (slot.exportGrants.get(invocation.toolCallId) !== args.path) throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
+            slot.exportGrants.delete(invocation.toolCallId);
+            const signal = invocation.signal ? AbortSignal.any([turn.controller.signal, invocation.signal]) : turn.controller.signal;
+            const attachment = await supplied.exportFile(turn.identity, args.path, signal);
+            if (!live(slot, turn)) throw new RuntimeError("EXPORT_CANCELLED");
+            return { status: "prepared_for_delivery", fileName: attachment.fileName };
+          },
+        }),
+        defineTool("densemble_manage_proactivity", {
+          description: "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to Oleh.",
+          skipPermission: true,
+          parameters: {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["schedule", "list", "cancel", "pause", "resume"] },
+              kind: { type: "string", enum: ["oneoff", "recurring", "silent"] },
+              schedule: {
+                oneOf: [
+                  { type: "object", properties: { type: { const: "once" }, at: { type: "integer", minimum: 0 } },
+                    required: ["type", "at"], additionalProperties: false },
+                  { type: "object", properties: { type: { const: "interval" }, everyMs: { type: "integer", minimum: 1 } },
+                    required: ["type", "everyMs"], additionalProperties: false },
+                  { type: "object", properties: {
+                    type: { const: "weekly" },
+                    daysOfWeek: { type: "array", minItems: 1, items: { type: "integer", minimum: 0, maximum: 6 } },
+                    hour: { type: "integer", minimum: 0, maximum: 23 },
+                    minute: { type: "integer", minimum: 0, maximum: 59 },
+                  }, required: ["type", "daysOfWeek", "hour", "minute"], additionalProperties: false },
+                  { type: "object", properties: {
+                    type: { const: "monthly" },
+                    daysOfMonth: { type: "array", minItems: 1, items: { type: "integer", minimum: 1, maximum: 31 } },
+                    hour: { type: "integer", minimum: 0, maximum: 23 },
+                    minute: { type: "integer", minimum: 0, maximum: 59 },
+                  }, required: ["type", "daysOfMonth", "hour", "minute"], additionalProperties: false },
+                ],
+              },
+              purpose: { type: "string", minLength: 1 },
+              id: { type: "string", minLength: 1 },
+            },
+            required: ["action"],
+            additionalProperties: false,
+          },
+          handler: async (args: ProactivityRequest, invocation) => {
+            const turn = slot.turn;
+            const parsed = proactivityRequestSchema.safeParse(args);
+            const action = parsed.success ? parsed.data.action : (typeof args?.action === "string" ? (args.action as ProactivityRequest["action"]) : "schedule");
+            if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId) {
+              diagnostics.record("PROACTIVITY_TOOL_REJECTED", { reason: "stale_or_not_live" });
+              return { ok: false, action, code: "RUNTIME_NOT_LIVE", message: "Кероване виконання неактивне або запит не належить поточній сесії." };
+            }
+            if (!supplied.proactivity) {
+              diagnostics.record("PROACTIVITY_TOOL_REJECTED", { reason: "not_configured" });
+              return { ok: false, action, code: "NOT_CONFIGURED", message: "Проактивність не підключена до цього агента." };
+            }
+            if (!parsed.success) {
+              diagnostics.record("PROACTIVITY_TOOL_INVALID_REQUEST");
+              return { ok: false, action, code: "INVALID_REQUEST", message: `Невірний запит до proactivity: ${parsed.error.message}` };
+            }
+            const result = await supplied.proactivity(slot.scope, supplied.session.agentId, parsed.data);
+            if (!live(slot, turn)) {
+              diagnostics.record("PROACTIVITY_TOOL_CANCELLED");
+              return { ok: false, action: parsed.data.action, code: "CANCELLED", message: "Виконання було зупинено до завершення запиту." };
+            }
+            return result;
+          },
+        }),
+      ],
     };
   }
   function close(slot: Slot): Promise<void> {

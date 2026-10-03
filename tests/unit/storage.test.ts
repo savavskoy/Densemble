@@ -46,7 +46,7 @@ describe("real SQLite migrations and scope isolation", () => {
     store.close();
     const raw = new Database(path);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(raw.pragma("user_version", { simple: true })).toBe(1);
+    expect(raw.pragma("user_version", { simple: true })).toBe(2);
     expect(raw.pragma("foreign_key_check")).toEqual([]);
     raw.close();
     store = openStore({ path });

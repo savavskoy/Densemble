@@ -68,7 +68,7 @@ database and sidecar symlinks are rejected. Tests use synthetic `.cache` fixture
 
 Each mutating multi-row operation is a short immediate SQLite transaction.
 No transaction encloses SDK, Telegram, filesystem deletion, or media processing.
-The six sub-ports are defined fully in `src/ports.ts`:
+The seven sub-ports are defined fully in `src/ports.ts`:
 
 | Port | Methods |
 |---|---|
@@ -78,6 +78,7 @@ The six sub-ports are defined fully in `src/ports.ts`:
 | `requests` | `create`, `get`, `pending`, `setPrompt`, `saveDraft`, `claim`, `resolve`, `cancel`, `invalidateRun`, `expire` |
 | `outbox` | `enqueue`, `get`, `list`, `claim`, `settle`, `retry`, `discard`, `pinnedAttachmentIds` |
 | `attachments` | `add`, `get`, `list`, `pin`, `unpin`, `expired`, `removeExpired` |
+| `proactivity` | `create`, `get`, `listForScope`, `listDue`, `countActive`, `setStatus`, `reschedule`, `isAgentPaused`, `setAgentPaused`, `recordOccurrence`, `settleOccurrence`, `syntheticId` |
 
 The store also exposes `recover`, `cleanup`, `backup`, and `close`.
 All clocks are Unix milliseconds; methods with optional `now` default to

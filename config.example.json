@@ -10,6 +10,15 @@
   ],
   "ownerId": 1,
   "permissionMode": "autopilot",
+  "quietHours": {
+    "start": "01:00",
+    "end": "09:30",
+    "timezone": "Europe/Kyiv"
+  },
+  "proactivity": {
+    "minIntervalMs": 1800000,
+    "maxActiveItemsPerAgent": 20
+  },
   "bots": [
     {
       "id": "example-bot",

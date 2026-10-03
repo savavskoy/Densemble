@@ -1,6 +1,6 @@
 import type { DiagnosticSink } from "../ports.js";
 
-const scalarFields = new Set(["attempt", "count", "forced", "retryAfter", "externalOutcomeUnknown"]);
+const scalarFields = new Set(["attempt", "count", "forced", "retryAfter", "externalOutcomeUnknown", "reason"]);
 
 export function createDiagnostics(options: {
   botIds?: string[];

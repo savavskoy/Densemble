@@ -56,6 +56,7 @@ const commands: BotCommand[] = [
   { command: "model", description: "Переглянути та змінити модель" },
   { command: "new", description: "Створити нову сесію зі збереженням попередньої" },
   { command: "sessions", description: "Переглянути та керувати сесіями цієї розмови" },
+  { command: "proactive", description: "Керування проактивними нагадуваннями агента" },
   { command: "stop", description: "Зупинити виконання в цій розмові" },
 ];
 

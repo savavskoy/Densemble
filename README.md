@@ -97,8 +97,8 @@ messages, poll updates or invoke MCP tools. Exit 2 means prerequisites or actual
 MCP acceptance remain incomplete. Audio is optional for starting text service:
 missing ASR prerequisites produce an explicit voice error, never cloud fallback.
 
-Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`.
-The bot registers its command menu at startup so Telegram suggests commands when
+Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`,
+`/proactive`. The bot registers its command menu at startup so Telegram suggests commands when
 you type `/`. New runs do not post an automatic Stop button; send `/stop` to stop.
 Clarifications are ordinary text messages: the agent asks one question at a time,
 ends its turn, and waits for your normal reply. No form, inline choices, or reply
@@ -136,6 +136,32 @@ instance to race it. A second service/doctor/backup process fails fast. After a
 crash, owned runtimes are reconciled before database recovery. The service is
 unavailable while the Mac sleeps; reconnect cannot recover messages older than
 Telegram's update-retention window.
+
+### Proactivity
+
+Each persona agent can schedule its own one-off reminders, recurring check-ins
+and silent checks (via the `densemble_manage_proactivity` tool) within its own
+chat/scope; it can only see and manage its own items. A background scheduler
+(polling every 30s, no cron/timezone dependency beyond `Intl`) fires due items
+through the normal inbox/run/outbox pipeline, so replies, `/stop`, and
+restart-recovery all work exactly as for an ordinary Telegram message. A firing
+never interleaves into an already-running turn; it waits and retries on the next
+poll. Multiple items due for the same chat are batched into a single message
+instead of one ping per item. Silent checks reply with nothing when there is
+nothing worth reporting.
+
+Configure `quietHours` (default `01:00`–`09:30`, `Europe/Kyiv`) and `proactivity`
+guardrails (`minIntervalMs`, default 30 minutes; `maxActiveItemsPerAgent`, default
+20) in `config.local.json` — see [`config.example.json`](config.example.json).
+No proactive message is sent during quiet hours; accumulated items fire once,
+batched, right after the window ends or on restart.
+
+Oleh oversees and overrides proactivity per chat with `/proactive`:
+`/proactive` or `/proactive list` shows that agent's active/paused items and
+next due times; `/proactive pause [id]` / `/proactive resume [id]` / `/proactive
+cancel <id>` act on one item, or on the whole agent's proactivity when no id is
+given. Resuming a paused agent drops anything missed during the pause instead of
+firing a catch-up batch.
 
 ## Local voice and media
 

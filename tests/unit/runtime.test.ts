@@ -6,6 +6,7 @@ import { CopilotClient, ToolSet } from "@github/copilot-sdk";
 import type { ModelInfo as SdkModel, PermissionRequest, SessionConfig, SessionEvent } from "@github/copilot-sdk";
 import type { LoadedConfig } from "../../src/config/index.js";
 import type { RuntimeEvent, RunIdentity, Session } from "../../src/domain.js";
+import type { ProactivityResponse } from "../../src/agents/contracts.js";
 import { createCopilotRuntime, detachedAction, serviceClientOptions } from "../../src/agents/copilot.js";
 import type { CopilotHost } from "../../src/agents/copilot.js";
 import type { ProcessAccess, ProcessFailure, ProcessIdentity } from "../../src/agents/supervisor.js";
@@ -454,6 +455,43 @@ describe("pinned Copilot runtime adapter", () => {
     expect(exportFile).toHaveBeenCalledWith(f.identity, "synthetic.txt", expect.any(AbortSignal));
     await expect(handler({ path: "synthetic.txt" }, invocation)).rejects.toThrow("EXPORT_NOT_AUTHORIZED");
     expect(exportFile).toHaveBeenCalledTimes(1);
+  });
+  it.each(["manual", "autopilot"] as const)("executes proactivity without a permission prompt in %s mode", async (mode) => {
+    const f = setup(); f.config.config.permissionMode = mode;
+    const response: ProactivityResponse = {
+      ok: true,
+      action: "schedule",
+      item: {
+        id: "proactive-1",
+        kind: "recurring",
+        schedule: { type: "interval", everyMs: 3_600_000 },
+        purpose: "Weekly review",
+        initiator: "agent",
+        status: "active",
+        nextDueAt: 3_600_000,
+      },
+      message: "Scheduled proactive item proactive-1.",
+    };
+    const proactivity = vi.fn(async () => response);
+    await f.runtime.open({ session: f.session, proactivity, onEvent: (event) => f.events.push(event) });
+    await f.send();
+    const handler = f.settings().tools!.find((tool) => tool.name === "densemble_manage_proactivity")!.handler!;
+    const hook = f.settings().hooks!.onPreToolUse!;
+    const args = {
+      action: "schedule",
+      kind: "recurring",
+      schedule: { type: "interval", everyMs: 3_600_000 },
+      purpose: "Weekly review",
+    } as const;
+    const invocation = { sessionId: f.native.sessionId, toolCallId: "proactivity-call", toolName: "densemble_manage_proactivity", arguments: args };
+    expect(await hook({ sessionId: f.native.sessionId, timestamp: new Date(), workingDirectory: f.root,
+      toolName: "densemble_manage_proactivity", toolArgs: args }, invocation)).toEqual({
+      permissionDecision: "allow", permissionDecisionReason: expect.stringContaining("Densemble"),
+    });
+    await expect(handler(args, invocation)).resolves.toEqual(response);
+    expect(proactivity).toHaveBeenCalledWith(scope, f.session.agentId, args);
+    expect(proactivity).toHaveBeenCalledTimes(1);
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
   });
   it("stops the owned host while SDK startup is still pending", async () => {
     const f = setup();
