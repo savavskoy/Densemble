@@ -6,6 +6,9 @@ DOMAIN := gui/$(shell id -u)
 SERVICE := $(DOMAIN)/dev.densemble.agent
 NBUV_SYNC_REPO := /Users/oleh/StudioProjects/nbuv-management
 NBUV_SYNC_MAKEFILE := $(NBUV_SYNC_REPO)/Makefile
+# TODO(oleh): nbuv-management autosync is unreliable and temporarily disabled. When it is fixed,
+# set NBUV_SYNC_ENABLED := 1 (or run `make start NBUV_SYNC_ENABLED=1`) to start/stop it with the service again.
+NBUV_SYNC_ENABLED ?= 0
 
 # The service requires Node 24 (see .nvmrc). The IDE/launchd may invoke make with a
 # PATH that resolves a different node (e.g. Homebrew), so pin the pinned nvm binary
@@ -50,7 +53,7 @@ doctor: build
 
 run: build
 	@set -eu; \
-	if [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
+	if [ "$(NBUV_SYNC_ENABLED)" = 1 ] && [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
 		$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-start; \
 		trap '$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-stop >/dev/null 2>&1 || true' EXIT INT TERM; \
 	fi; \
@@ -70,14 +73,14 @@ install: build
 start:
 	@test -f "$(PLIST)" || { printf '%s\n' 'LaunchAgent is not installed. Run make install first.' >&2; exit 1; }
 	launchctl bootstrap "$(DOMAIN)" "$(PLIST)"
-	@if [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
+	@if [ "$(NBUV_SYNC_ENABLED)" = 1 ] && [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
 		$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-start; \
 	fi
 
 stop:
 	@set -eu; \
 	launchctl bootout "$(SERVICE)"; \
-	if [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
+	if [ "$(NBUV_SYNC_ENABLED)" = 1 ] && [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
 		$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-stop; \
 	fi
 
