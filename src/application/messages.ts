@@ -3,6 +3,7 @@ import { RuntimeError } from "../agents/contracts.js";
 const failures: Record<string, string> = {
   MODEL_UNAVAILABLE: "Налаштована модель недоступна. Оберіть доступну через /model; модель субагента змінюється в його launcher.",
   MODEL_IMAGES_UNSUPPORTED: "Поточна модель не підтримує зображення. Оберіть іншу через /model і надішліть фото знову.",
+  WORKSPACE_ACCESS_DENIED: "Доступ до цього workspace відсутній. Оберіть доступний через /workspace.",
   MEDIA_ABORTED: "Обробку вкладення скасовано.",
   MEDIA_STALE_RUN: "Виконання вже завершене. Надішліть вкладення в поточну розмову знову.",
   MEDIA_SCOPE_INVALID: "Вкладення не належить цій розмові.",

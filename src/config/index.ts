@@ -3,8 +3,9 @@ import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { z } from "zod";
 import type { ChatKind, Scope } from "../domain.js";
-import { discoverAgents, type AgentDefinition } from "./agents.js";
+import { discoverAllAgents, type AgentDefinition } from "./agents.js";
 import { assertDisjoint, checkedPath, ConfigError, isWithin, sourcePath } from "./paths.js";
+import { canUseBot, resolveWorkspaces, userSchema, validateUsers, workspaceSchema } from "./workspaces.js";
 
 const name = z.string().regex(/^[a-z0-9][a-z0-9_-]*$/);
 const nonempty = z.string().trim().min(1);
@@ -37,6 +38,8 @@ export const configSchema = z.object({
   interactiveHomePath: nonempty.optional(),
   skillDirectories: z.array(nonempty).min(1),
   ownerId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  users: z.array(userSchema).optional(),
+  workspaces: z.array(workspaceSchema).optional(),
   permissionMode: z.enum(["manual", "autopilot"]).optional(),
   quietHours: z.object({
     start: z.string().regex(hhmm),
@@ -161,7 +164,12 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   config.skillDirectories = config.skillDirectories.map((path) => sourcePath(config.workspacePath, fromConfig(path), "directory"));
   if (!config.skillDirectories.includes(resolve(config.workspacePath, "agent", "skills")) ||
       new Set(config.skillDirectories).size !== config.skillDirectories.length) throw new ConfigError("SKILL_DIRECTORIES_INVALID");
-  const agents = discoverAgents(config);
+  const agents = discoverAllAgents({
+    ...config,
+    workspaces: (config.workspaces ?? []).map((workspace) => ({
+      path: checkedPath(fromConfig(workspace.path), "directory"), agentSource: workspace.agentSource,
+    })),
+  });
   const resolveSecret = secretResolver(readJson(config.secretsPath));
   const tokens = new Map<string, string>();
   const tokenIdentities = new Set<string>();
@@ -191,6 +199,13 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
     if (bindings.has(key)) throw new ConfigError("BINDING_CONFLICT");
     bindings.add(key);
   }
+  validateUsers(config);
+  if (config.workspaces?.length) {
+    config.workspaces = resolveWorkspaces(config, agents, {
+      code, configFile: file, secretsPath: config.secretsPath, serviceWorkspace: config.workspacePath,
+      runtimeDataPath: config.runtimeDataPath, runtimeHomePath: config.runtimeHomePath, interactiveHomePath: interactive,
+    }, fromConfig);
+  }
   if (config.mcp.mode === "allowlist") {
     const names = new Set<string>();
     for (const server of config.mcp.servers) {
@@ -218,11 +233,15 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
 export function authorizeScope(config: ServiceConfig, candidate: {
   ownerId: number; botId: string; chatId: number; topicId: number | null; chatKind: ChatKind; isBot: boolean;
 }): Scope | null {
-  if (candidate.isBot || candidate.ownerId !== config.ownerId) return null;
+  if (candidate.isBot) return null;
+  if (candidate.ownerId !== config.ownerId &&
+      (candidate.chatKind !== "private" || candidate.topicId !== null || candidate.chatId !== candidate.ownerId ||
+       !canUseBot(config, candidate.ownerId, candidate.botId))) return null;
   const binding = config.bindings.find((entry) => entry.botId === candidate.botId && entry.chatId === candidate.chatId &&
     entry.topicId === candidate.topicId && entry.kind === candidate.chatKind);
   return binding ? { ownerId: candidate.ownerId, botId: candidate.botId, chatId: candidate.chatId, topicId: candidate.topicId } : null;
 }
 
-export { discoverAgents, type AgentDefinition } from "./agents.js";
+export { discoverAgents, discoverAllAgents, type AgentDefinition } from "./agents.js";
 export { ConfigError } from "./paths.js";
+export * from "./workspaces.js";

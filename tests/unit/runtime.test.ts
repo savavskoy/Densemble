@@ -127,6 +127,23 @@ describe("pinned Copilot runtime adapter", () => {
       .toMatchObject({ permissionDecision: "deny" });
     expect(f.events.some((event) => event.kind === "request")).toBe(false);
   });
+  it.each([
+    ["Sonya", "You are chatting with Sonya (a configured user) in Telegram."],
+    ["  Sonya\n Savenko ", "You are chatting with Sonya Savenko (a configured user) in Telegram."],
+    [undefined, "You are chatting with a user in Telegram."],
+  ])("names a non-owner by configured displayName %j in the session instruction", async (displayName, expected) => {
+    const f = setup();
+    const user = scope.ownerId + 1;
+    f.config.config.users = [{ telegramUserId: user, allowedBotIds: [scope.botId], ...(displayName ? { displayName } : {}) }];
+    f.config.config.workspaces = [{ id: "notes", name: "Notes", access: "private", ownerUserId: user,
+      path: f.root, agentIds: ["synthetic-agent"] }];
+    f.config.config.workspacePath = join(f.root, "service");
+    f.session.scope = { ...scope, ownerId: user };
+    await f.open();
+    const content = (f.settings().systemMessage as { content: string }).content;
+    expect(content).toContain(expected);
+    expect(content).not.toContain("Oleh");
+  });
   it("completes a plain-text clarification and accepts the next ordinary message without a form", async () => {
     const f = setup(); await f.open(); await f.send();
     f.emit("assistant.message", { messageId: "question", content: "Which workspace should I use?", originatingMessageId: "send-1" });

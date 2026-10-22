@@ -1,5 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
-import { authorizeScope, defaultProactivityGuardrails, defaultQuietHours, discoverAgents } from "../config/index.js";
+import {
+  authorizedWorkspace, authorizeScope, defaultProactivityGuardrails, defaultQuietHours, discoverAllAgents, scopeOwnerId, workspacesFor,
+} from "../config/index.js";
 import type { LoadedConfig } from "../config/index.js";
 import type {
   Attachment, DeliveryPayload, IncomingCallback, IncomingMessage, LogicalInput, ModelInfo,
@@ -19,6 +21,7 @@ import type { DeletionIntent } from "./deletion.js";
 import { failureCode, failureMessage, mediaNotice } from "./messages.js";
 import { handleProactiveCommand } from "./proactive-commands.js";
 import { handleProactivityRequest } from "./proactive-tool.js";
+import { defaultSessionWorkspace, parseWorkspaceCommand, workspaceListText, workspaceRequiredText } from "./workspace-commands.js";
 import type { ProactivityGuardrails } from "./proactive-tool.js";
 
 export interface ApplicationMedia extends MediaPreparation {
@@ -38,8 +41,6 @@ export interface ApplicationOptions {
   stopTimeoutMs?: number;
   idleReleaseMs?: number;
   refreshAgents?: boolean;
-  /** @deprecated Delivery is always transport-owned; retained for bootstrap compatibility. */
-  deferDelivery?: true;
 }
 export interface Application extends IngressHandler {
   start(recovery?: Recovery): Promise<void>;
@@ -78,7 +79,7 @@ const runLabels: Record<string, string> = {
   preparing: "підготовка вкладень", running: "працює", waiting: "очікує відповіді",
   cancelling: "зупиняється", succeeded: "завершено", failed: "помилка", cancelled: "зупинено", interrupted: "перервано",
 };
-const help = "Команди: /start, /help, /status, /model, /new, /sessions, /stop.\n" +
+const help = "Команди: /start, /help, /status, /model, /new, /sessions, /workspace, /stop.\n" +
   "Введіть /, щоб побачити підказки команд. Для зупинки виконання надішліть /stop.\n" +
   "У цій розмові працює закріплений агент. Уточнення під час роботи передаються активному виконанню. " +
   "На запитання відповідайте кнопками або відповіддю на повідомлення форми. Дозволи — лише кнопками.\n" +
@@ -143,13 +144,17 @@ export function createApplication(options: ApplicationOptions): Application {
     if (existing) return existing;
     return createSession(scope);
   }
-  function createSession(scope: Scope): Session {
+  function workspaceAuthorized(scope: Scope, path: string): boolean {
+    return authorizedWorkspace(config.config, scope.ownerId, scope.botId, path) !== null;
+  }
+  function createSession(scope: Scope, workspace?: string): Session {
     const bot = config.config.bots.find((entry) => entry.id === scope.botId);
-    const agents = options.refreshAgents === false ? config.agents : discoverAgents(config.config);
+    const agents = options.refreshAgents === false ? config.agents : discoverAllAgents(config.config);
     if (options.refreshAgents !== false) config.agents = agents;
     const agent = agents.find((entry) => entry.id === bot?.agentId && entry.userInvocable);
     if (!agent) throw new RuntimeError("AGENT_CONFIGURATION_INVALID");
-    return store.sessions.create(scope, { agentId: agent.id, workspace: config.config.workspacePath, model: agent.defaultModel });
+    const path = workspace && workspaceAuthorized(scope, workspace) ? workspace : defaultSessionWorkspace(config.config, scope);
+    return store.sessions.create(scope, { agentId: agent.id, workspace: path, model: agent.defaultModel });
   }
   function text(session: Session, value: string, key = opaqueId(), runId?: string): void {
     store.outbox.enqueue({ scope: session.scope, sessionId: session.id, dedupKey: key,
@@ -188,6 +193,7 @@ export function createApplication(options: ApplicationOptions): Application {
     const work = (async () => {
       const session = sessionFor(identity);
       if (!session) throw new RuntimeError("EXPORT_STALE_RUN");
+      if (!workspaceAuthorized(session.scope, session.workspace)) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
       const source = isAbsolute(path) ? path : resolve(session.workspace, path);
       const attachment = await media.exportFile(identity, source, combined);
       if (!live(identity) || combined.aborted || attachment.sessionId !== identity.sessionId ||
@@ -202,6 +208,7 @@ export function createApplication(options: ApplicationOptions): Application {
   }
   async function open(session: Session, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
+    if (!workspaceAuthorized(session.scope, session.workspace)) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
     const control = barriers.get(scopeKey(session.scope));
     if (control) control.runtimeSessionId = session.id;
     const active = store.runs.active(session.scope);
@@ -765,7 +772,7 @@ export function createApplication(options: ApplicationOptions): Application {
     }
     const binding = config.config.bindings.find((entry) => entry.botId === intent.scope.botId &&
       entry.chatId === intent.scope.chatId && entry.topicId === intent.scope.topicId);
-    if (!binding || intent.scope.ownerId !== config.config.ownerId) throw new RuntimeError("DELETION_SCOPE_UNAVAILABLE");
+    if (!binding || intent.scope.ownerId !== scopeOwnerId(config.config, binding)) throw new RuntimeError("DELETION_SCOPE_UNAVAILABLE");
     if (intent.providerSessionId) await runtime.deleteSession(intent.scope, intent.sessionId, intent.providerSessionId);
     await media.removeArtifacts(intent.artifacts);
     await deletionJournal.remove(intent);
@@ -856,6 +863,33 @@ export function createApplication(options: ApplicationOptions): Application {
       }
     }
   }
+  function workspaceCommand(session: Session, args: string): void {
+    const parsed = parseWorkspaceCommand(args);
+    switch (parsed.kind) {
+      case "usage": text(session, "Використання: /workspace — перелік, /workspace <id> — вибір."); return;
+      case "list": text(session, workspaceListText(config.config, session)); return;
+      case "select": break;
+    }
+    const target = parsed.id === "default" && session.scope.ownerId === config.config.ownerId
+      ? config.config.workspacePath
+      : workspacesFor(config.config, session.scope.ownerId, session.scope.botId).find((entry) => entry.id === parsed.id)?.path;
+    if (!target) { text(session, "Цей workspace недоступний."); return; }
+    if (target === session.workspace) { text(session, "Цей workspace уже обрано."); return; }
+    launch((async () => {
+      await stopScope(session);
+      if (stopped || closing || store.runs.active(session.scope) || barriers.has(scopeKey(session.scope))) return;
+      barrier(session, async (signal) => {
+        await runtime.disconnect(session.scope, session.id);
+        signal.throwIfAborted();
+        for (const input of store.inbox.queued(session.scope)) store.inbox.cancelQueued(session.scope, input.sessionId);
+        held.delete(scopeKey(session.scope));
+        const fresh = createSession(session.scope, target);
+        await open(fresh, signal);
+        signal.throwIfAborted();
+        text(fresh, `Workspace змінено. Створено нову сесію без попередньої історії. Початкова модель: ${fresh.appliedModel}.`);
+      });
+    })());
+  }
   function command(session: Session, message: IncomingMessage): void {
     const name = message.command!.name.toLowerCase().replace(/^\//, "");
     if (name === "stop") { launch(stopScope(session)); return; }
@@ -865,6 +899,7 @@ export function createApplication(options: ApplicationOptions): Application {
       case "status": status(session); break;
       case "model": barrier(session, (signal) => models(session, 0, signal)); break;
       case "sessions": sessions(session, 0); break;
+      case "workspace": workspaceCommand(session, message.command!.arguments); break;
       case "proactive": text(session, handleProactiveCommand(store, config, session.scope, message.command!.arguments).text); break;
       case "new":
         launch((async () => {
@@ -875,7 +910,7 @@ export function createApplication(options: ApplicationOptions): Application {
             signal.throwIfAborted();
             for (const input of store.inbox.queued(session.scope)) store.inbox.cancelQueued(session.scope, input.sessionId);
             held.delete(scopeKey(session.scope));
-            const fresh = createSession(session.scope);
+            const fresh = createSession(session.scope, session.workspace);
             await open(fresh, signal);
             signal.throwIfAborted();
             text(fresh, `Нову сесію створено. Початкова модель: ${fresh.appliedModel}. Попередню історію збережено.`);
@@ -904,6 +939,10 @@ export function createApplication(options: ApplicationOptions): Application {
         return;
       }
       const session = current(ingress.scope);
+      if (!workspaceAuthorized(session.scope, session.workspace)) {
+        text(session, workspaceRequiredText(config.config, session), `workspace-required:${ingress.updateId}`);
+        return;
+      }
       if (ingress.replyToMessageId !== undefined) {
         const prompt = store.outbox.list(ingress.scope).find((entry) => entry.payload.kind === "request" &&
           entry.payload.requestId && entry.remoteMessageIds.includes(ingress.replyToMessageId!));
@@ -945,7 +984,7 @@ export function createApplication(options: ApplicationOptions): Application {
       controls.clear();
       requestFields.clear();
       for (const binding of config.config.bindings) {
-        const scope: Scope = { ownerId: config.config.ownerId, botId: binding.botId,
+        const scope: Scope = { ownerId: scopeOwnerId(config.config, binding), botId: binding.botId,
           chatId: binding.chatId, topicId: binding.topicId };
         for (const session of store.sessions.list(scope)) {
           if (session.pendingModel && store.sessions.clearPendingModel(scope, session.id, session.pendingModel)) {

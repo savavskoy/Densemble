@@ -4,6 +4,8 @@ CONFIG ?= config.local.json
 PLIST := $(HOME)/Library/LaunchAgents/dev.densemble.agent.plist
 DOMAIN := gui/$(shell id -u)
 SERVICE := $(DOMAIN)/dev.densemble.agent
+NBUV_SYNC_REPO := /Users/oleh/StudioProjects/nbuv-management
+NBUV_SYNC_MAKEFILE := $(NBUV_SYNC_REPO)/Makefile
 
 # The service requires Node 24 (see .nvmrc). The IDE/launchd may invoke make with a
 # PATH that resolves a different node (e.g. Homebrew), so pin the pinned nvm binary
@@ -47,6 +49,11 @@ doctor: build
 	$(NODE) dist/main.js doctor --config "$(CONFIG)"
 
 run: build
+	@set -eu; \
+	if [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
+		$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-start; \
+		trap '$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-stop >/dev/null 2>&1 || true' EXIT INT TERM; \
+	fi; \
 	$(NODE) dist/main.js start --config "$(CONFIG)"
 
 install: build
@@ -63,9 +70,16 @@ install: build
 start:
 	@test -f "$(PLIST)" || { printf '%s\n' 'LaunchAgent is not installed. Run make install first.' >&2; exit 1; }
 	launchctl bootstrap "$(DOMAIN)" "$(PLIST)"
+	@if [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
+		$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-start; \
+	fi
 
 stop:
-	launchctl bootout "$(SERVICE)"
+	@set -eu; \
+	launchctl bootout "$(SERVICE)"; \
+	if [ -f "$(NBUV_SYNC_MAKEFILE)" ]; then \
+		$(MAKE) -C "$(NBUV_SYNC_REPO)" sync-stop; \
+	fi
 
 restart:
 	$(MAKE) stop

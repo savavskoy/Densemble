@@ -31,6 +31,48 @@ explicitly if launched from elsewhere.
   may independently bind the same private chat.
 - `authorizeScope(config, candidate)` checks the numeric owner, bot sender flag,
   bot, chat, kind, and exact topic before any expensive or external operation.
+  Legacy configurations without `users` remain restricted to `ownerId`. A
+  configured `users` entry grants only its listed bots, and only a matching
+  explicitly bound private chat; group and forum bindings remain owner-only.
+- Optional `users` entries contain `telegramUserId`, optional `displayName`, and
+  a nonempty unique list of configured `allowedBotIds`. The owner is implicit
+  and must not also appear in `users`.
+- Optional `workspaces` entries contain a unique stable `id`, display `name`,
+  `access` (`private` or `shared`), `ownerUserId`, optional
+  `memberUserIds`, an existing local directory `path`, and permitted
+  user-invocable `agentIds`. Every member must be the owner or a configured
+  user. A private workspace contains only its owner. The workspace owner is
+  implicitly a member; it is not automatically added to other workspaces.
+  Workspace paths must be canonical, non-symlink, distinct and disjoint from
+  service code, instructions, credentials and runtime paths. A directory does
+  not need Git metadata and must not overlap another workspace entry.
+- Each private user chat gets its own conversation scope. A user with exactly
+  one available workspace starts there. With multiple available workspaces,
+  Densemble starts the conversation in an empty lobby that cannot be opened as
+  a Copilot session; the user must select a workspace first. `/workspace` lists
+  authorized IDs/names, while `/workspace <id>` selects one and creates a new
+  session without transferring prior conversation context. Unknown or
+  unauthorized IDs receive the same generic denial.
+- A session's stored workspace path is checked against the user's current
+  membership before opening it and before exporting a file. The service
+  workspace remains the owner's default, not a fallback for other users.
+  Non-owner Copilot sessions omit global MCP servers and service-wide skills
+  and receive a user instruction naming the person once per session from the
+  configured `displayName` (neutral "a user" if absent). Tool requests that visibly refer to
+  another configured workspace or use parent traversal, home-relative paths or
+  `.git` are denied. This lexical check cannot reliably stop arbitrary absolute
+  paths, shell indirection or every tool escape; it is not a security boundary
+  for mutually untrusted users. The Mac's service account/administrator can
+  access all local workspaces. Do not treat private workspace membership as
+  OS-level confidentiality.
+- A workspace path may equal the configured agent workspace exactly (explicit
+  co-location of knowledge and agent instructions); any ancestor/descendant
+  overlap with it, the code, runtime, config or secrets paths is rejected.
+  Members of a co-located shared workspace can read and modify agent
+  instructions.
+- Git integration is intentionally outside this feature: Densemble does not
+  initialize Git, configure remotes or credentials, create commits, push, or
+  synchronize workspace contents.
 - Optional `permissionMode` defaults to `"autopilot"` for all agents; `"manual"`
   explicitly enables per-action confirmation. Autopilot grants ordinary tool requests once without a Telegram
   approval prompt, including exports. Both modes require a matching live native

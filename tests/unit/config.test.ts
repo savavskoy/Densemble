@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
   loadConfig,
   secretResolver,
   type ServiceConfig,
+  workspacesFor,
 } from "../../src/config/index.js";
 
 let root: string;
@@ -231,6 +232,89 @@ describe("explicit private/group/forum bindings", () => {
     config.bindings.pop();
     config.bindings[0]!.botId = "unknown";
     expect(load).toThrow("BINDING_UNKNOWN_BOT");
+  });
+  it("authorizes configured users only in explicitly bound private chats and permitted bots", () => {
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.bindings.push({ botId: "bot-one", chatId: 202, topicId: null, kind: "private" });
+    const loaded = load().config;
+    expect(authorizeScope(loaded, {
+      ownerId: 202, botId: "bot-one", chatId: 202, topicId: null, chatKind: "private", isBot: false,
+    })).toEqual({ ownerId: 202, botId: "bot-one", chatId: 202, topicId: null });
+    for (const candidate of [
+      { ownerId: 202, botId: "bot-two", chatId: 202, topicId: null, chatKind: "private" as const, isBot: false },
+      { ownerId: 203, botId: "bot-one", chatId: 203, topicId: null, chatKind: "private" as const, isBot: false },
+      { ownerId: 202, botId: "bot-one", chatId: -201, topicId: null, chatKind: "group" as const, isBot: false },
+    ]) expect(authorizeScope(loaded, candidate)).toBeNull();
+  });
+  it("validates workspace membership, private ownership, permitted agents and safe paths", () => {
+    const shared = join(root, "knowledge-shared");
+    const personal = join(root, "knowledge-personal");
+    for (const path of [shared, personal]) mkdirSync(path);
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.workspaces = [
+      { id: "team", name: "Team", access: "shared", ownerUserId: 101, memberUserIds: [202],
+        path: shared, agentIds: ["helper-one"] },
+      { id: "sonya-private", name: "Sonya private", access: "private", ownerUserId: 202,
+        path: personal, agentIds: ["helper-one"] },
+    ];
+    const loaded = load();
+    expect(loaded.config.workspaces?.map(({ id, path }) => ({ id, path }))).toEqual([
+      { id: "team", path: shared }, { id: "sonya-private", path: personal },
+    ]);
+    expect(workspacesFor(loaded.config, 202, "bot-one").map((workspace) => workspace.id))
+      .toEqual(["team", "sonya-private"]);
+    expect(workspacesFor(loaded.config, 101, "bot-one").map((workspace) => workspace.id)).toEqual(["team"]);
+
+    config.workspaces![1] = { ...config.workspaces![1]!, memberUserIds: [101] };
+    expect(load).toThrow(ConfigError);
+    config.workspaces![1] = { ...config.workspaces![1]!, memberUserIds: undefined, path: source };
+    expect(load).toThrow(ConfigError);
+    config.workspaces![1] = { ...config.workspaces![1]!, path: personal, agentIds: ["worker"] };
+    expect(load).toThrow(ConfigError);
+  });
+  it("allows a workspace to share its exact root with agent sources but not an ancestor or descendant", () => {
+    const externalSecrets = join(root, "secrets.local.json");
+    copyFileSync(join(source, "secrets.local.json"), externalSecrets);
+    config.secretsPath = externalSecrets;
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.workspaces = [
+      { id: "team", name: "Team", access: "shared", ownerUserId: 101, memberUserIds: [202],
+        path: source, agentIds: ["helper-one"] },
+    ];
+    expect(load().config.workspaces?.map(({ id, path }) => ({ id, path }))).toEqual([{ id: "team", path: source }]);
+    config.workspaces[0]!.path = join(source, "agent");
+    expect(load).toThrow("UNSAFE_PATH_OVERLAP");
+    config.workspaces[0]!.path = root;
+    expect(load).toThrow("UNSAFE_PATH_OVERLAP");
+  });
+  it("discovers agents defined inside a workspace flagged agentSource without hiding global agents", () => {
+    const knowledge = join(root, "knowledge-agents");
+    write(join(knowledge, "AGENTS.md"), "# Local rules");
+    write(join(knowledge, "agent/agents/local-pm/AGENT.md"), "---\nname: local-pm\ndescription: Local\n---\n# Local PM");
+    write(join(knowledge, ".github/agents/local-pm.agent.md"),
+      "---\nname: local-pm\ndescription: Local\nmodel: synthetic-model\n---\nRead and follow `agent/agents/local-pm/AGENT.md`.");
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.workspaces = [{ id: "kb", name: "KB", access: "shared", ownerUserId: 101, memberUserIds: [202],
+      path: knowledge, agentIds: ["local-pm"], agentSource: true }];
+    const ids = load().agents.map((agent) => agent.id);
+    expect(ids).toContain("local-pm");
+    expect(ids).toContain("helper-one");
+    config.workspaces[0]!.agentSource = false;
+    expect(load).toThrow("WORKSPACE_AGENT_INVALID");
+    config.workspaces[0]!.agentSource = true;
+    write(join(knowledge, "agent/agents/helper-one/AGENT.md"), "# Clash");
+    write(join(knowledge, ".github/agents/helper-one.agent.md"),
+      "---\nname: helper-one\ndescription: Clash\nmodel: synthetic-model\n---\nRead and follow `agent/agents/helper-one/AGENT.md`.");
+    expect(load).toThrow("AGENT_DUPLICATE");
+  });
+  it("rejects duplicate configured users and unknown bot grants", () => {
+    config.users = [
+      { telegramUserId: 202, allowedBotIds: ["bot-one"] },
+      { telegramUserId: 202, allowedBotIds: ["bot-one"] },
+    ];
+    expect(load).toThrow("USER_DUPLICATE");
+    config.users = [{ telegramUserId: 202, allowedBotIds: ["unknown"] }];
+    expect(load).toThrow("USER_BOT_INVALID");
   });
 });
 

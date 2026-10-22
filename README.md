@@ -1,9 +1,11 @@
 # Densemble
 
-A local, single-owner Telegram interface to managed Copilot agent runtimes on
-Apple Silicon macOS. One bot per persona, one binding per group/topic, and
-separate conversation histories. TypeScript/Node, grammY, SQLite and the Copilot
-SDK form a modular monolith; there is no HTTP server or hosted control plane.
+A local Telegram interface to managed Copilot agent runtimes on Apple Silicon
+macOS. The service owner can configure additional users for private chats and
+grant them access to personal or shared knowledge workspaces. One bot per
+persona, one binding per group/topic, and separate conversation histories.
+TypeScript/Node, grammY, SQLite and the Copilot SDK form a modular monolith;
+there is no HTTP server or hosted control plane.
 
 **Deployment acceptance is pending:** the authenticated synthetic SDK gate
 passed, but real Telegram accounts/tokens and a provisioned whisper.cpp model
@@ -54,13 +56,18 @@ chmod 700 data runtime/copilot
 
 Configuration is strict; unknown fields, conflicting bindings, duplicate bot
 identities, non-invocable workers as bots, unsafe paths and unresolved secrets
-are errors. Detailed schema and lifecycle rules: [contracts](docs/contracts.md).
+are errors. Existing configurations without `users` and `workspaces` remain
+owner-only. Detailed schema and lifecycle rules: [contracts](docs/contracts.md).
 
 Keep actual configuration in an ignored `config.local.json`. Reference an
 existing external `secrets.local.json` using `secretsPath`; bot entries reference
 secret keys, never token values. Do not copy credentials, private agent
 instructions, knowledge files, or personal documents into this repository.
 The configured agent workspace must remain separate from this service's code.
+A knowledge workspace may use exactly the same directory as the agent workspace,
+so one root can hold both knowledge and agent instructions; every member of such
+a shared workspace can read and change those instructions. Ancestor/descendant
+overlaps with the agent workspace remain rejected.
 
 Local configuration, credentials, dependency caches, runtime data, attachments,
 database files, logs, and scratch files are ignored. Use `data/`, `runtime/`,
@@ -74,10 +81,15 @@ commit safeguard, not access control; review staged changes before committing.
 2. Create a bot for each desired persona through BotFather. Store its token only
    in the existing external canonical `secrets.local.json`; set `tokenRef` to
    that key. Never paste tokens into command-line arguments, commits or logs.
-3. Set your numeric Telegram `ownerId` and explicit `bindings`. For a private
-   chat, use your numeric user/chat ID and `topicId: null`. Send `/start` to the
-   bot yourself. Groups use a negative chat ID; forum bindings require the exact
-   topic ID. Other bots/topics/users are ignored before LLM or media processing.
+3. Set your numeric Telegram `ownerId` and explicit `bindings`. To add a person,
+   add their numeric Telegram ID to `users`, grant only the required bot IDs in
+   `allowedBotIds`, and add a private binding using that person's ID as `chatId`.
+   Send `/start` to the bot from each account. Groups use a negative chat ID;
+   forum bindings require the exact topic ID. Unconfigured users and unbound
+   chats are ignored before LLM or media processing.
+   Each configured workspace path must already be an existing local directory;
+   it need not be a Git repository. Densemble does not initialize Git, configure
+   remotes, create commits, push changes or synchronize workspace contents.
 4. For groups, disable BotFather privacy mode or grant the necessary bot rights,
    then verify reception with a real ordinary message without `@`. Membership
    alone does not establish the binding. Existing webhooks cause an explicit
@@ -97,8 +109,13 @@ messages, poll updates or invoke MCP tools. Exit 2 means prerequisites or actual
 MCP acceptance remain incomplete. Audio is optional for starting text service:
 missing ASR prerequisites produce an explicit voice error, never cloud fallback.
 
-Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`,
-`/proactive`. The bot registers its command menu at startup so Telegram suggests commands when
+Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`,
+`/workspace`, `/stop`, `/proactive`. `/workspace` lists only the current user's
+authorized knowledge workspaces; `/workspace <id>` switches to a new session
+without carrying prior conversation history across workspaces. When a user has
+multiple workspaces, a new conversation starts in an empty lobby until one is
+selected. Repository synchronization is not part of this feature. The bot
+registers its command menu at startup so Telegram suggests commands when
 you type `/`. New runs do not post an automatic Stop button; send `/stop` to stop.
 Clarifications are ordinary text messages: the agent asks one question at a time,
 ends its turn, and waits for your normal reply. No form, inline choices, or reply

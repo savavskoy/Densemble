@@ -22,7 +22,7 @@ export { runManagedProcess, type ProcessRunner, type ProcessOptions, type Proces
 
 export type MediaDownload = (botId: string, fileId: string, destination: string,
   signal: AbortSignal, maxBytes: number) => Promise<unknown>;
-export interface MediaPaths { runtimeDataPath: string; workspacePath: string }
+export interface MediaPaths { runtimeDataPath: string; workspacePath: string; workspaces?: { path: string }[] | undefined }
 export interface MediaPipelineOptions {
   config: LoadedConfig | MediaPaths;
   store: StateStore;
@@ -62,6 +62,7 @@ export function createMediaPipeline(options: MediaPipelineOptions): MediaPipelin
   const paths = "config" in options.config ? options.config.config : options.config;
   const runtime = lexicalPath(paths.runtimeDataPath);
   const workspace = lexicalPath(paths.workspacePath);
+  const workspaceRoots = [workspace, ...(paths.workspaces ?? []).map((entry) => lexicalPath(entry.path))];
   if (within(runtime, workspace) || within(workspace, runtime)) throw new MediaError("MEDIA_PATH_UNSAFE");
   const root = join(runtime, "media");
   const store = options.store;
@@ -313,9 +314,10 @@ export function createMediaPipeline(options: MediaPipelineOptions): MediaPipelin
         if (secretName(source)) throw new MediaError("MEDIA_PATH_UNSAFE");
         const path = lexicalPath(source);
         const session = store.sessions.get(identity.scope, identity.sessionId)!;
-        if (resolve(session.workspace) !== workspace) throw new MediaError("MEDIA_PATH_UNSAFE");
+        const sessionRoot = workspaceRoots.find((root) => root === resolve(session.workspace));
+        if (!sessionRoot) throw new MediaError("MEDIA_PATH_UNSAFE");
         const generated = join(runtime, "generated", identity.sessionId, identity.runId);
-        if (!within(workspace, path) && !within(generated, path)) throw new MediaError("MEDIA_PATH_UNSAFE");
+        if (!within(sessionRoot, path) && !within(generated, path)) throw new MediaError("MEDIA_PATH_UNSAFE");
         await checkedPath(path, "file");
         live(identity, signal);
         const sourceHandle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);

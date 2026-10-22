@@ -7,13 +7,14 @@ import type {
   CopilotClientOptions, CopilotSession, MCPServerConfig,
   ModelInfo as SdkModel, PermissionRequest, ResumeSessionConfig, SessionConfig, SessionEvent,
 } from "@github/copilot-sdk";
-import type { LoadedConfig } from "../config/index.js";
+import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, type LoadedConfig } from "../config/index.js";
 import type { ModelInfo, RequestAnswer, RequestPayload, RunIdentity, RuntimeCommand, Scope } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type { DiagnosticSink } from "../ports.js";
 import { opaqueId, sanitizeParameters } from "../permissions/index.js";
 import type { ControlledRuntime, ControlledSessionOptions, ProactivityRequest } from "./contracts.js";
 import { bounded, RuntimeError } from "./contracts.js";
+import { workspaceViolation } from "./workspace-guard.js";
 import { ProcessSupervisor, recoverOwnedProcesses } from "./supervisor.js";
 import type { ProcessFailure } from "./supervisor.js";
 
@@ -123,6 +124,12 @@ export function serviceClientOptions(config: LoadedConfig, cli: string): Copilot
     },
     useLoggedInUser: true, enableRemoteSessions: false, logLevel: "none",
   };
+}
+
+// The configured display name is only an addressing hint set by the service owner; identity is never inferred from chat text.
+function userLabel(displayName: string | undefined): string {
+  const name = displayName?.replace(/\s+/g, " ").trim();
+  return name ? `${name} (a configured user)` : "a user";
 }
 
 export function detachedAction(tool: string, args: unknown): boolean {
@@ -398,7 +405,17 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
   }
   async function sessionConfig(slot: Slot, supplied: ControlledSessionOptions): Promise<SessionConfig> {
     const session = supplied.session;
-    const agents = config.agents;
+    const user = session.scope.ownerId;
+    const owner = user === config.config.ownerId;
+    const match = authorizedWorkspace(config.config, user, session.scope.botId, session.workspace);
+    if (!match) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
+    // Non-owner sessions see only the agents their workspace permits.
+    const agents = match === DEFAULT_WORKSPACE_ID ? config.agents : config.agents.filter((agent) => match.agentIds.includes(agent.id));
+    const forbiddenRoots = owner ? [] : [
+      config.config.workspacePath, config.config.runtimeDataPath, config.config.runtimeHomePath, config.config.secretsPath,
+      config.config.interactiveHomePath ?? "", ...(config.config.workspaces ?? []).map((entry) => entry.path)
+        .filter((path) => path !== session.workspace),
+    ].filter((path) => Boolean(path) && path !== session.workspace);
     if (!agents.some((agent) => agent.id === session.agentId)) throw new RuntimeError("RUNTIME_AGENT_MISSING");
     const models = await (await slot.host).client.listModels();
     const allowed = models.filter((model) => model.policy?.state !== "disabled").map((model) => model.id);
@@ -417,8 +434,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       agent: session.agentId, customAgents, customAgentsLocalOnly: true,
       workingDirectory: session.workspace, configDirectory: config.config.runtimeHomePath,
       enableConfigDiscovery: false, skipCustomInstructions: false,
-      instructionDirectories: [session.workspace], skillDirectories: config.config.skillDirectories, enableSkills: true,
-      pluginDirectories: [], includedBuiltinSkills: [], mcpServers,
+      instructionDirectories: [session.workspace], skillDirectories: owner ? config.config.skillDirectories : [], enableSkills: owner,
+      pluginDirectories: [], includedBuiltinSkills: [], mcpServers: owner ? mcpServers : {},
       excludedBuiltinAgents: ["explore", "task", "general-purpose", "code-review", "research", "security-review"],
       enableFileHooks: false, enableHostGitOperations: false, enableOnDemandInstructionDiscovery: false,
       enableSessionStore: false, memory: { enabled: false }, skipEmbeddingRetrieval: true,
@@ -426,14 +443,19 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       remoteSession: "off", streaming: true, includeSubAgentStreamingEvents: true,
       availableTools: tools, excludedTools,
       // No user-input/elicitation handlers: do not advertise either SDK capability.
-      systemMessage: { mode: "append", content:
-        "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
-        "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply." },
+      systemMessage: { mode: "append", content: owner
+        ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
+          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
+        : `You are chatting with ${userLabel(config.config.users?.find((entry) => entry.telegramUserId === user)?.displayName)} in Telegram. ` +
+          "Do not use structured question forms. " +
+          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply. " +
+          "Work only inside the current workspace directory; never read, list or modify anything outside it, including repository metadata." },
       onEvent: (event) => eventFor(slot, event),
       onPermissionRequest: async (permission, invocation) => {
         const turn = slot.turn;
         const native = slot.native;
-        if (!native || !turn || !live(slot, turn) || invocation.sessionId !== native.sessionId || permissionDenied(permission)) return { kind: "reject" };
+        if (!native || !turn || !live(slot, turn) || invocation.sessionId !== native.sessionId || permissionDenied(permission) ||
+            (!owner && workspaceViolation(permission, forbiddenRoots))) return { kind: "reject" };
         if (config.config.permissionMode === "manual") {
           const answer = await request(slot, { kind: "permission", action: permissionNames[permission.kind] ?? "Зовнішня дія",
             parameters: sanitizeParameters(permission, secrets) });
@@ -454,6 +476,10 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         if (invocation.sessionId !== slot.native?.sessionId || !slot.turn || !live(slot, slot.turn)) {
           diagnostics.record("TOOL_STALE_RUN_REJECTED");
           return { permissionDecision: "deny", permissionDecisionReason: "Дія не належить живому керованому виконанню." };
+        }
+        if (!owner && workspaceViolation(input.toolArgs, forbiddenRoots)) {
+          diagnostics.record("TOOL_WORKSPACE_BOUNDARY_REJECTED");
+          return { permissionDecision: "deny", permissionDecisionReason: "Дія виходить за межі поточного workspace." };
         }
         if (detachedAction(input.toolName, input.toolArgs)) {
           diagnostics.record("TOOL_DETACHED_ACTION_REJECTED");

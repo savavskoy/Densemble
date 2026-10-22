@@ -9,6 +9,40 @@
     "/absolute/path/to/agent-workspace/agent/skills"
   ],
   "ownerId": 1,
+  "users": [
+    {
+      "telegramUserId": 2,
+      "displayName": "Example second user",
+      "allowedBotIds": [
+        "example-bot"
+      ]
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "shared-notes",
+      "name": "Shared notes",
+      "access": "shared",
+      "ownerUserId": 1,
+      "memberUserIds": [
+        2
+      ],
+      "path": "../knowledge/shared",
+      "agentIds": [
+        "example-agent"
+      ]
+    },
+    {
+      "id": "personal-notes",
+      "name": "Example second user's private notes",
+      "access": "private",
+      "ownerUserId": 2,
+      "path": "../knowledge/personal",
+      "agentIds": [
+        "example-agent"
+      ]
+    }
+  ],
   "permissionMode": "autopilot",
   "quietHours": {
     "start": "01:00",
@@ -30,6 +64,12 @@
     {
       "botId": "example-bot",
       "chatId": 1,
+      "kind": "private",
+      "topicId": null
+    },
+    {
+      "botId": "example-bot",
+      "chatId": 2,
       "kind": "private",
       "topicId": null
     }

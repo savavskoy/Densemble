@@ -1,6 +1,7 @@
 import { Api } from "grammy";
 import type { BotCommand, BotCommandScope, UserFromGetMe } from "grammy/types";
-import type { LoadedConfig } from "../config/index.js";
+import { defaultSessionWorkspace } from "../application/workspace-commands.js";
+import { scopeOwnerId, type LoadedConfig } from "../config/index.js";
 import { scopeKey, type RunIdentity } from "../domain.js";
 import type { DiagnosticSink, IngressHandler, StateStore } from "../ports.js";
 import { apiFailure, RateLimiter, sleep, TelegramError, type TelegramApi } from "./common.js";
@@ -56,6 +57,7 @@ const commands: BotCommand[] = [
   { command: "model", description: "Переглянути та змінити модель" },
   { command: "new", description: "Створити нову сесію зі збереженням попередньої" },
   { command: "sessions", description: "Переглянути та керувати сесіями цієї розмови" },
+  { command: "workspace", description: "Обрати workspace" },
   { command: "proactive", description: "Керування проактивними нагадуваннями агента" },
   { command: "stop", description: "Зупинити виконання в цій розмові" },
 ];
@@ -165,7 +167,7 @@ export function createTelegramAdapter(options: TelegramAdapterOptions): Telegram
             const botConfig = config.config.bots.find((entry) => entry.id === bot.id)!;
             const agent = config.agents.find((entry) => entry.id === botConfig.agentId)!;
             const session = store.sessions.current(normalized.scope) ?? store.sessions.create(normalized.scope, {
-              agentId: agent.id, workspace: config.config.workspacePath, model: agent.defaultModel,
+              agentId: agent.id, workspace: defaultSessionWorkspace(config.config, normalized.scope), model: agent.defaultModel,
             });
             // Enqueue before the receipt: a crash between the two operations safely repeats only this dedup key.
             store.outbox.enqueue({
@@ -272,7 +274,7 @@ export function createTelegramAdapter(options: TelegramAdapterOptions): Telegram
     const signal = AbortSignal.any([master.signal, bot.controller.signal]);
     const states = new Map<string, TypingState>();
     const scopes = config.config.bindings.filter((binding) => binding.botId === bot.id).map((binding) => ({
-      ownerId: config.config.ownerId, botId: bot.id, chatId: binding.chatId, topicId: binding.topicId,
+      ownerId: scopeOwnerId(config.config, binding), botId: bot.id, chatId: binding.chatId, topicId: binding.topicId,
     }));
     try {
       while (!signal.aborted) {
