@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { LoadedConfig } from "./config/index.js";
 import { defaultQuietHours } from "./config/index.js";
 import { createApplication, type Application } from "./application/index.js";
-import { createCopilotRuntime, type ControlledRuntime } from "./agents/index.js";
+import { createClaudeRuntime, createCopilotRuntime, createEngineRouter, type ControlledRuntime } from "./agents/index.js";
 import { bounded } from "./agents/contracts.js";
 import { createMediaPipeline } from "./media/index.js";
 import type { MediaPipeline } from "./media/index.js";
@@ -53,7 +53,16 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
     })();
   }
   try {
-    runtime = createCopilotRuntime({ config, diagnostics });
+    const copilot = createCopilotRuntime({ config, diagnostics });
+    runtime = createEngineRouter({
+      engines: {
+        copilot,
+        ...(config.config.claudeCode ? { "claude-code": createClaudeRuntime({ config, diagnostics }) } : {}),
+      },
+      sessionEngine: (scope, sessionId) => store?.sessions.get(scope, sessionId)?.engine,
+      // Process journals are engine-neutral; the Copilot runtime recovers all of them once.
+      recoverOwnedProcesses: () => copilot.recoverOwnedProcesses(),
+    });
     await runtime.recoverOwnedProcesses();
     store = openStore({ path: join(config.config.runtimeDataPath, "state.sqlite") });
     let media: MediaPipeline;

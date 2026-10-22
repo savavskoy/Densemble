@@ -6,13 +6,46 @@ import { pinnedRuntimePath, serviceClientOptions } from "../agents/copilot.js";
 import { checkAudioReadiness } from "../media/index.js";
 import { bounded } from "../agents/contracts.js";
 import { audioSettings } from "./audio-settings.js";
+import type { ClaudeHostFactory } from "../agents/claude.js";
+import { botEngine } from "../config/index.js";
 
 export interface DoctorReport {
   ready: boolean;
   checks: { component: string; ready: boolean; code: string; count?: number }[];
 }
 
-export async function doctor(config: LoadedConfig): Promise<DoctorReport> {
+/** Zero-inference Claude Code readiness: pinned version, service login and the configured models. */
+async function claudeChecks(config: LoadedConfig, factory?: ClaudeHostFactory): Promise<DoctorReport["checks"]> {
+  const checks: DoctorReport["checks"] = [];
+  const { CLAUDE_CODE_VERSION } = await import("../agents/claude-env.js");
+  const { catalogOptions, claudeModels, supervisedClaudeHost } = await import("../agents/claude.js");
+  let host: Awaited<ReturnType<ClaudeHostFactory>> | undefined;
+  try {
+    const options = catalogOptions(config);
+    await mkdir(options.cwd!, { recursive: true, mode: 0o700 });
+    host = await (factory ?? supervisedClaudeHost(config, { record: () => undefined }))(options);
+    const init = await bounded(host.start({ message: () => undefined, end: () => undefined }), 30_000, "DOCTOR_CLAUDE_TIMEOUT");
+    const versioned = init.version === CLAUDE_CODE_VERSION;
+    checks.push({ component: "claude-runtime", ready: versioned, code: versioned ? "RUNTIME_READY" : "RUNTIME_VERSION_MISMATCH" });
+    checks.push({ component: "claude-authentication", ready: init.authenticated,
+      code: init.authenticated ? "AUTHENTICATED" : "CLAUDE_LOGIN_REQUIRED" });
+    if (init.authenticated) {
+      const available = new Set(init.models.flatMap((model) => [model.value, model.resolvedModel ?? model.value]));
+      const wanted = config.config.bots.filter((bot) => botEngine(config.config, bot.id) === "claude-code")
+        .map((bot) => bot.model ?? config.config.claudeCode?.defaultModel ?? "");
+      const missing = wanted.filter((model) => !available.has(model));
+      checks.push({ component: "claude-models", ready: missing.length === 0,
+        code: missing.length ? "AGENT_MODEL_UNAVAILABLE" : "MODELS_READY", count: claudeModels(init).length });
+    }
+  } catch {
+    checks.push({ component: "claude-runtime", ready: false, code: "CLAUDE_DIAGNOSTIC_FAILED" });
+  } finally {
+    try { await host?.stop(); } catch { checks.push({ component: "claude-cleanup", ready: false, code: "DOCTOR_FORCED_STOP" }); }
+  }
+  return checks;
+}
+
+export async function doctor(config: LoadedConfig, options: { claudeHost?: ClaudeHostFactory } = {}): Promise<DoctorReport> {
   const checks: DoctorReport["checks"] = [];
   let client: CopilotClient | undefined;
   try {
@@ -49,6 +82,13 @@ export async function doctor(config: LoadedConfig): Promise<DoctorReport> {
         await bounded(client.forceStop(), 3_000, "DOCTOR_FORCE_STOP_FAILED");
       }
     }
+  }
+  for (const bot of config.config.bots) {
+    const engine = botEngine(config.config, bot.id);
+    checks.push({ component: `bot-engine:${bot.id}`, ready: true, code: engine === "copilot" ? "ENGINE_COPILOT" : "ENGINE_CLAUDE_CODE" });
+  }
+  if (config.config.bots.some((bot) => botEngine(config.config, bot.id) === "claude-code")) {
+    checks.push(...await claudeChecks(config, options.claudeHost));
   }
   for (const bot of config.config.bots) {
     try {

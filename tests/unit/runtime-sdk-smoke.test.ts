@@ -45,7 +45,7 @@ it.skipIf(process.env.DENSEMBLE_RUNTIME_SMOKE !== "1")(
       expect(models.length).toBeGreaterThan(0);
       const model = models[0]!.id;
       config.agents[0]!.defaultModel = model;
-      const session: Session = { id, conversationId: randomUUID(), scope, workspace, agentId: "synthetic-agent",
+      const session: Session = { id, conversationId: randomUUID(), scope, workspace, agentId: "synthetic-agent", engine: "copilot",
         providerSessionId: null, appliedModel: model, pendingModel: null, generation: 0, createdAt: Date.now(), updatedAt: Date.now() };
       stage = "open";
       const opened = await runtime.open({ session, onEvent: (event) => events.push(event) });

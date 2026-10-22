@@ -80,6 +80,12 @@ explicitly if launched from elsewhere.
   Managed-policy approval requirements, sandbox escalation, detached processes
   and excluded tools remain denied. Questions are not auto-answered. This
   service-wide owner setting takes effect on restart, never via agent input.
+- Optional `bots[].engine` is `"copilot"` (default) or `"claude-code"`; optional
+  `bots[].model` overrides the new-session model. A Claude Code bot requires
+  `claudeCode: { homePath, defaultModel }`. `homePath` is an existing private
+  service-owned `CLAUDE_CONFIG_DIR`, disjoint from the workspace(s), `~/.claude`,
+  the Copilot home, data, config and secrets. A persona may be bound once per engine.
+  `botEngine(config, botId)` resolves the effective engine.
 - `discoverAgents(sources)` parses launcher YAML, checks metadata/canonical files
   and local Markdown links, and returns **all** agents. `userInvocable` governs bot
   bindings only. `infer` is independent and absent unless explicitly declared.
@@ -226,6 +232,14 @@ and does not copy a live database/WAL with raw filesystem operations.
 
 `AgentRuntime` (`open`, `execute`, `setModel`, `models`, `disconnect`,
 `deleteSession`, `shutdown`) uses `RuntimeCommand`/`RuntimeEvent`, never SDK types.
+`Session.engine` (`copilot` | `claude-code`, SQLite migration 3, default
+`copilot`) is fixed at creation. The service composes an engine router that
+dispatches every call by that engine; each engine refuses foreign sessions with
+`SESSION_ENGINE_MISMATCH`. `deleteSession(..., engine)` receives the engine from
+the deletion journal (legacy entries are Copilot). Optional
+`supportsSteering(session) === false` (Claude Code) makes the application leave
+new input queued for the next turn instead of steering. Claude Code provider
+session IDs are the Densemble session UUID; Copilot's remain `densemble-<uuid>`.
 `MediaPreparation` (`prepare`, `transcribe`, `exportFile`, `cleanup`) handles IO,
 format/resource validation, subprocess cancellation and filesystem confinement.
 Its production `releaseRun`/`removeArtifacts` hooks release pins only after

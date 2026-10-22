@@ -71,11 +71,16 @@ export interface Conversation {
   createdAt: number;
 }
 
+/** The agent runtime that owns a session; fixed when the session is created. */
+export type EngineId = "copilot" | "claude-code";
+export const engineIds: readonly EngineId[] = ["copilot", "claude-code"];
+
 export interface Session {
   id: string;
   conversationId: string;
   scope: Scope;
   agentId: string;
+  engine: EngineId;
   workspace: string;
   providerSessionId: string | null;
   appliedModel: string;

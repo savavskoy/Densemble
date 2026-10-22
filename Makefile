@@ -19,7 +19,7 @@ NODE := $(firstword \
 	$(sort $(wildcard $(HOME)/.nvm/versions/node/v24.*/bin/node)) \
 	node)
 
-.PHONY: help build typecheck test doctor run install start stop restart status logs
+.PHONY: help build typecheck test doctor claude-login run install start stop restart status logs
 
 help:
 	@printf '%s\n' \
@@ -34,6 +34,7 @@ help:
 		'make typecheck  Check application and test types' \
 		'make test       Run offline tests' \
 		'make doctor     Check prerequisites (stop the service first)' \
+		'make claude-login  Log the service-owned Claude Code home in with your Claude subscription' \
 		'' \
 		'First background launch: make install && make start' \
 		'Stop any existing npm/foreground instance before starting via launchd.' \
@@ -50,6 +51,17 @@ test:
 
 doctor: build
 	$(NODE) dist/main.js doctor --config "$(CONFIG)"
+
+# One-time, interactive: logs the pinned Claude Code binary in under the service-owned CLAUDE_CONFIG_DIR
+# from claudeCode.homePath. It never touches the interactive ~/.claude or stores an API key.
+claude-login:
+	@set -eu; \
+	home="$$($(NODE) -e 'const p=require("path"),f=p.resolve(process.argv[1]),c=JSON.parse(require("fs").readFileSync(f,"utf8"));if(!c.claudeCode)process.exit(3);console.log(p.resolve(p.dirname(f),c.claudeCode.homePath))' "$(CONFIG)")" || \
+		{ echo "claudeCode.homePath is not configured in $(CONFIG)" >&2; exit 2; }; \
+	mkdir -p "$$home"; chmod 700 "$$home"; \
+	env -i HOME="$$HOME" USER="$$USER" LOGNAME="$$USER" PATH=/usr/bin:/bin LANG=en_US.UTF-8 \
+		CLAUDE_CONFIG_DIR="$$home" DISABLE_AUTOUPDATER=1 \
+		./node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude auth login
 
 run: build
 	@set -eu; \

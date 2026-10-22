@@ -64,3 +64,32 @@ describe("bounded read-only doctor", () => {
     expect(JSON.stringify(report)).not.toContain("synthetic-secret");
   });
 });
+describe("engine diagnostics", () => {
+  const claudeConfig: LoadedConfig = { ...config, config: { ...config.config,
+    claudeCode: { homePath: "/synthetic/claude", defaultModel: "claude-sonnet-5-5" },
+    runtimeDataPath: `${process.cwd()}/.cache/doctor-claude`,
+    bots: [...config.config.bots, { id: "claude-helper", agentId: "helper", tokenRef: "telegram.helper", engine: "claude-code" }] } };
+  const host = (init: Partial<import("../../src/agents/claude.js").ClaudeInit>) => async () => ({
+    start: async () => ({ version: "2.1.305", authenticated: true, commands: [],
+      models: [{ value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet" }], ...init }),
+    stop: async () => ({ forced: false }), onFailure: () => () => undefined, send: () => undefined,
+    interrupt: async () => undefined, setModel: async () => undefined,
+  });
+  it("lists each bot's engine and skips Claude checks when no bot uses it", async () => {
+    const report = await doctor(config);
+    expect(report.checks).toContainEqual({ component: "bot-engine:helper", ready: true, code: "ENGINE_COPILOT" });
+    expect(report.checks.some((check) => check.component.startsWith("claude-"))).toBe(false);
+  });
+  it("reports Claude Code version, login and models without inference", async () => {
+    const report = await doctor(claudeConfig, { claudeHost: host({}) });
+    expect(report.checks).toContainEqual({ component: "bot-engine:claude-helper", ready: true, code: "ENGINE_CLAUDE_CODE" });
+    expect(report.checks).toContainEqual({ component: "claude-runtime", ready: true, code: "RUNTIME_READY" });
+    expect(report.checks).toContainEqual({ component: "claude-authentication", ready: true, code: "AUTHENTICATED" });
+    expect(report.checks).toContainEqual({ component: "claude-models", ready: true, code: "MODELS_READY", count: 1 });
+  });
+  it("reports a missing service login", async () => {
+    const report = await doctor(claudeConfig, { claudeHost: host({ authenticated: false }) });
+    expect(report.checks).toContainEqual({ component: "claude-authentication", ready: false, code: "CLAUDE_LOGIN_REQUIRED" });
+    expect(report.checks.some((check) => check.component === "claude-models")).toBe(false);
+  });
+});

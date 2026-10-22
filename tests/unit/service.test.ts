@@ -30,7 +30,11 @@ vi.mock("../../src/storage/process-lock.js", () => ({
 vi.mock("../../src/storage/index.js", () => ({
   openStore: () => { harness.calls.push("store.open"); return harness.store; },
 }));
-vi.mock("../../src/agents/index.js", () => ({ createCopilotRuntime: () => harness.runtime }));
+vi.mock("../../src/agents/index.js", async () => ({
+  createCopilotRuntime: () => harness.runtime,
+  createClaudeRuntime: () => { throw new Error("UNEXPECTED_CLAUDE_RUNTIME"); },
+  createEngineRouter: (await vi.importActual<typeof import("../../src/agents/router.js")>("../../src/agents/router.js")).createEngineRouter,
+}));
 vi.mock("../../src/media/index.js", () => ({ createMediaPipeline: () => harness.media }));
 vi.mock("../../src/application/index.js", () => ({ createApplication: () => harness.application }));
 vi.mock("../../src/telegram/index.js", () => ({

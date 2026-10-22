@@ -180,6 +180,61 @@ cancel <id>` act on one item, or on the whole agent's proactivity when no id is
 given. Resuming a paused agent drops anything missed during the pause instead of
 firing a catch-up batch.
 
+## Claude Code engine (optional)
+
+Every bot runs on **Copilot** unless its entry says otherwise. A bot can instead
+run its persona through **Claude Code**, using your Claude subscription. Both
+engines run side by side in one service, and one persona may be served by a
+Copilot bot and a Claude Code bot at the same time. The engine is chosen only in
+`config.local.json` and takes effect on restart; it cannot be switched from Telegram.
+
+```json
+"claudeCode": { "homePath": "./runtime/claude", "defaultModel": "claude-sonnet-5-5" },
+"bots": [
+  { "id": "alfred-bot", "agentId": "alfred", "tokenRef": "telegram.alfred" },
+  { "id": "alfred-claude-bot", "agentId": "alfred", "tokenRef": "telegram.alfred_claude",
+    "engine": "claude-code", "model": "claude-opus-5-5" }
+]
+```
+
+`model` is optional and falls back to `claudeCode.defaultModel`. Launcher
+`model:` values remain Copilot models. `homePath` is the service-owned
+`CLAUDE_CONFIG_DIR`. It must be a private directory separate from
+`~/.claude`, the Copilot home, data, workspaces and secrets.
+
+One-time setup (pinned `@anthropic-ai/claude-agent-sdk@0.3.305`, which bundles
+Claude Code **2.1.305**; no global `claude` is used):
+
+```sh
+npm ci
+make claude-login        # browser login into claudeCode.homePath only
+make doctor              # claude-runtime / claude-authentication / claude-models
+```
+
+`make claude-login` runs the pinned binary with a clean environment and
+`CLAUDE_CONFIG_DIR` set to the service home. Your interactive Claude Code login,
+settings and history are not touched, and no API key or token is written to
+`secrets.local.json`. Subscription usage limits are shared with your
+interactive use.
+
+Claude Code sessions use the same persona (`AGENT.md`), workspace `AGENTS.md`,
+skills (owner only, exposed through a generated private plugin of symlinks),
+team personas, MCP allowlist, permission mode, `/stop`, `/model`, proactivity
+and file export as Copilot sessions. They load no user/project/local Claude
+settings, hooks, CLAUDE.md, memories, bundled skills or plugins of their own.
+Built-in subagents, `AskUserQuestion`, background Bash/agents, cron/wakeup tools
+and sandbox escalation are denied. Differences from Copilot:
+
+- Messages sent while a Claude Code answer is running stay queued and run next,
+  because mid-answer steering is not supported. The bot says so once per answer.
+- A session keeps the engine it was created with. After an engine change, `/new`
+  starts on the new engine; no context moves between engines.
+- If Claude Code is missing, logged out or rate-limited, that bot replies with
+  the cause and never falls back to Copilot; Copilot bots are unaffected.
+
+Claude Code history lives in `<homePath>/projects/`. Deleting a session removes
+only its own transcript. `backup` does not yet include Claude Code history.
+
 ## Local voice and media
 
 Documents: text PDF, DOCX, UTF-8 TXT/Markdown/CSV. Photos are PNG/JPEG/WebP;

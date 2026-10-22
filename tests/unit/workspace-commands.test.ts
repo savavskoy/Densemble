@@ -10,7 +10,7 @@ import { fixture } from "./session-runtime-fixtures.js";
 const ownerScope: Scope = { ownerId: 101, botId: "synthetic-bot", chatId: 101, topicId: null };
 const sonyaScope: Scope = { ownerId: 202, botId: "synthetic-bot", chatId: 202, topicId: null };
 const session = (scope: Scope, workspace: string): Session => ({
-  id: "session", conversationId: "conversation", scope, agentId: "synthetic-agent", workspace,
+  id: "session", conversationId: "conversation", scope, agentId: "synthetic-agent", engine: "copilot", workspace,
   providerSessionId: null, appliedModel: "model-one", pendingModel: null, generation: 0,
   createdAt: 1, updatedAt: 1,
 });

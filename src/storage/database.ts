@@ -128,6 +128,8 @@ CREATE TABLE proactivity_state (
  conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
  paused INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
 );
+`, `
+ALTER TABLE sessions ADD COLUMN engine TEXT NOT NULL DEFAULT 'copilot' CHECK(engine IN ('copilot','claude-code'));
 `];
 
 export class Connection {
@@ -184,7 +186,7 @@ export class Connection {
     const row = this.one("SELECT * FROM sessions WHERE id=? AND conversation_id=?", sessionId, this.conversationId(scope));
     return row ? {
       id: row.id as string, conversationId: row.conversation_id as string, scope,
-      agentId: row.agent_id as string, workspace: row.workspace as string,
+      agentId: row.agent_id as string, engine: row.engine as Session["engine"], workspace: row.workspace as string,
       providerSessionId: row.provider_session_id as string | null, appliedModel: row.applied_model as string,
       pendingModel: row.pending_model as string | null, generation: row.generation as number,
       createdAt: row.created_at as number, updatedAt: row.updated_at as number,

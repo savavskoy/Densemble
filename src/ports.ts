@@ -1,5 +1,5 @@
 import type {
-  Attachment, Conversation, DeliveryPayload, IncomingMessage, Json, LogicalInput, ModelInfo,
+  Attachment, Conversation, DeliveryPayload, EngineId, IncomingMessage, Json, LogicalInput, ModelInfo,
   NormalizedIngress, OutboxItem, PendingRequest, PreparedInput, ProactiveInitiator,
   ProactiveItem, ProactiveKind, ProactiveOccurrence, ProactiveOccurrenceOutcome, ProactiveSchedule,
   ProactiveStatus, RequestAnswer, RequestPayload, Run, RunIdentity, RuntimeCommand, RuntimeEvent,
@@ -8,7 +8,7 @@ import type {
 
 export interface SessionStore {
   conversation(scope: Scope): Conversation | null;
-  create(scope: Scope, options: { agentId: string; workspace: string; model: string; now?: number }): Session;
+  create(scope: Scope, options: { agentId: string; workspace: string; model: string; engine?: EngineId; now?: number }): Session;
   current(scope: Scope): Session | null;
   get(scope: Scope, sessionId: string): Session | null;
   list(scope: Scope): Session[];
@@ -160,8 +160,10 @@ export interface AgentRuntime {
   setModel(scope: Scope, sessionId: string, model: string): Promise<void>;
   models(scope: Scope, sessionId: string): Promise<ModelInfo[]>;
   disconnect(scope: Scope, sessionId: string): Promise<void>;
-  deleteSession(scope: Scope, sessionId: string, providerSessionId: string): Promise<void>;
+  deleteSession(scope: Scope, sessionId: string, providerSessionId: string, engine?: EngineId): Promise<void>;
   shutdown(): Promise<void>;
+  /** Whether new input may join an active turn; absent means supported. Unsupported input stays queued. */
+  supportsSteering?(session: Session): boolean;
 }
 export interface MediaPreparation {
   prepare(input: LogicalInput, identity: RunIdentity, signal: AbortSignal): Promise<PreparedInput>;

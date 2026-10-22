@@ -29,7 +29,7 @@ const permissionNames: Partial<Record<PermissionRequest["kind"], string>> = {
   shell: "Виконати команду", read: "Прочитати файл", write: "Змінити файл", mcp: "Викликати MCP-інструмент",
   url: "Відкрити мережевий ресурс", "custom-tool": "Викликати інструмент сервісу", hook: "Виконати обробник",
 };
-const proactivityRequestSchema = z.discriminatedUnion("action", [
+export const proactivityRequestSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("schedule"),
     kind: z.enum(["oneoff", "recurring", "silent"]),
@@ -616,6 +616,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
     recoverOwnedProcesses: () => recoverOwnedProcesses(config.config.runtimeDataPath),
     async open(supplied) {
       supplied.signal?.throwIfAborted();
+      if (supplied.session.engine !== "copilot") throw new RuntimeError("SESSION_ENGINE_MISMATCH");
       const slot = slotFor(supplied.session.scope, supplied.session.id);
       slot.options = supplied;
       if (slot.native) return { providerSessionId: slot.native.sessionId };

@@ -42,7 +42,7 @@ function setup(options: { requestTimeoutMs?: number } = {}) {
     resolveSecret: () => "known-secret", tokenForBot: () => "123456:synthetic",
   };
   const session: Session = {
-    id: randomUUID(), conversationId: randomUUID(), scope, agentId: "synthetic-agent", workspace: root,
+    id: randomUUID(), conversationId: randomUUID(), scope, agentId: "synthetic-agent", engine: "copilot", workspace: root,
     providerSessionId: null, appliedModel: "model-one", pendingModel: null, generation: 1, createdAt: Date.now(), updatedAt: Date.now(),
   };
   let selected = session.appliedModel;

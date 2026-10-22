@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   authorizeScope,
+  botEngine,
   ConfigError,
   defaultProactivityGuardrails,
   defaultQuietHours,
@@ -337,6 +338,43 @@ describe("proactivity configuration defaults and validation", () => {
   });
   it("rejects too-small proactive intervals", () => {
     config.proactivity = { minIntervalMs: 59_999 };
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+  });
+});
+describe("per-bot engine selection", () => {
+  it("keeps every bot on Copilot when no engine settings are present", () => {
+    const loaded = load();
+    expect(loaded.config.claudeCode).toBeUndefined();
+    expect(loaded.config.bots.map((bot) => botEngine(loaded.config, bot.id))).toEqual(["copilot", "copilot"]);
+  });
+  it("requires a claudeCode block for a Claude Code bot", () => {
+    config.bots[1] = { ...config.bots[1]!, engine: "claude-code" };
+    expect(load).toThrow("CLAUDE_CODE_CONFIG_REQUIRED");
+  });
+  it("accepts a separate service-owned Claude home and an optional bot model", () => {
+    mkdirSync(join(code, "runtime/claude"), { recursive: true });
+    config.claudeCode = { homePath: "./runtime/claude", defaultModel: "claude-sonnet-5-5" };
+    config.bots[1] = { ...config.bots[1]!, engine: "claude-code", model: "claude-opus-5-5" };
+    const loaded = load();
+    expect(loaded.config.claudeCode?.homePath).toBe(join(code, "runtime/claude"));
+    expect(botEngine(loaded.config, "bot-two")).toBe("claude-code");
+  });
+  it("rejects a Claude home overlapping Copilot, data, workspace or code paths", () => {
+    for (const homePath of ["./runtime/copilot", "./data", source, code]) {
+      config.claudeCode = { homePath, defaultModel: "claude-sonnet-5-5" };
+      expect(load, homePath).toThrow("UNSAFE_PATH_OVERLAP");
+    }
+  });
+  it("lets one persona serve two bots only on different engines", () => {
+    mkdirSync(join(code, "runtime/claude"), { recursive: true });
+    config.claudeCode = { homePath: "./runtime/claude", defaultModel: "claude-sonnet-5-5" };
+    config.bots[1] = { ...config.bots[1]!, agentId: "helper-one" };
+    expect(load).toThrow("DUPLICATE_BOT");
+    config.bots[1] = { ...config.bots[1]!, engine: "claude-code" };
+    expect(load().config.bots.map((bot) => bot.agentId)).toEqual(["helper-one", "helper-one"]);
+  });
+  it("rejects unknown engines", () => {
+    (config.bots[1] as { engine?: string }).engine = "gemini";
     expect(load).toThrow("CONFIG_SCHEMA_INVALID");
   });
 });

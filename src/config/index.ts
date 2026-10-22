@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { z } from "zod";
-import type { ChatKind, Scope } from "../domain.js";
+import { engineIds, type ChatKind, type EngineId, type Scope } from "../domain.js";
 import { discoverAllAgents, type AgentDefinition } from "./agents.js";
 import { assertDisjoint, checkedPath, ConfigError, isWithin, sourcePath } from "./paths.js";
 import { canUseBot, resolveWorkspaces, userSchema, validateUsers, workspaceSchema } from "./workspaces.js";
@@ -50,7 +50,11 @@ export const configSchema = z.object({
     minIntervalMs: z.number().int().min(60_000).optional(),
     maxActiveItemsPerAgent: z.number().int().min(1).optional(),
   }).strict().optional(),
-  bots: z.array(z.object({ id: name, agentId: name, tokenRef: secretRef }).strict()).min(1),
+  claudeCode: z.object({ homePath: nonempty, defaultModel: nonempty }).strict().optional(),
+  bots: z.array(z.object({
+    id: name, agentId: name, tokenRef: secretRef,
+    engine: z.enum(engineIds as [EngineId, ...EngineId[]]).optional(), model: nonempty.optional(),
+  }).strict()).min(1),
   bindings: z.array(z.object({
     botId: name, chatId: numericId, kind: z.enum(["private", "group", "forum"]),
     topicId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
@@ -161,6 +165,19 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
     }
   }
   assertDisjoint(config.runtimeDataPath, config.runtimeHomePath);
+  if (config.claudeCode) {
+    // A separate, service-owned CLAUDE_CONFIG_DIR: never the interactive ~/.claude, never shared with Copilot state.
+    const claudeHome = checkedPath(fromConfig(config.claudeCode.homePath), "directory");
+    for (const other of [config.workspacePath, interactive, resolve(homedir(), ".claude"), config.runtimeDataPath, config.runtimeHomePath]) {
+      assertDisjoint(claudeHome, other);
+    }
+    if (isWithin(claudeHome, code) || isWithin(claudeHome, file) || isWithin(claudeHome, config.secretsPath)) {
+      throw new ConfigError("UNSAFE_PATH_OVERLAP");
+    }
+    config.claudeCode.homePath = claudeHome;
+  } else if (config.bots.some((bot) => bot.engine === "claude-code")) {
+    throw new ConfigError("CLAUDE_CODE_CONFIG_REQUIRED");
+  }
   config.skillDirectories = config.skillDirectories.map((path) => sourcePath(config.workspacePath, fromConfig(path), "directory"));
   if (!config.skillDirectories.includes(resolve(config.workspacePath, "agent", "skills")) ||
       new Set(config.skillDirectories).size !== config.skillDirectories.length) throw new ConfigError("SKILL_DIRECTORIES_INVALID");
@@ -175,7 +192,9 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   const tokenIdentities = new Set<string>();
   const boundAgents = new Set<string>();
   for (const bot of config.bots) {
-    if (tokens.has(bot.id) || boundAgents.has(bot.agentId)) throw new ConfigError("DUPLICATE_BOT");
+    // One persona may be served once per engine, e.g. a Copilot bot and a Claude Code bot side by side.
+    const binding = `${bot.agentId}:${botEngine(config, bot.id)}`;
+    if (tokens.has(bot.id) || boundAgents.has(binding)) throw new ConfigError("DUPLICATE_BOT");
     const agent = agents.find((candidate) => candidate.id === bot.agentId);
     if (!agent || !agent.userInvocable) throw new ConfigError("BOT_AGENT_NOT_INVOCABLE");
     const token = resolveSecret(bot.tokenRef);
@@ -184,7 +203,7 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
     if (identity === "0" || tokenIdentities.has(identity)) throw new ConfigError("DUPLICATE_BOT_TOKEN");
     tokenIdentities.add(identity);
     tokens.set(bot.id, token);
-    boundAgents.add(bot.agentId);
+    boundAgents.add(binding);
   }
   const bindings = new Set<string>();
   const chatKinds = new Map<number, ChatKind>();
@@ -201,6 +220,9 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   }
   validateUsers(config);
   if (config.workspaces?.length) {
+    if (config.claudeCode) {
+      for (const workspace of config.workspaces) assertDisjoint(config.claudeCode.homePath, checkedPath(fromConfig(workspace.path), "directory"));
+    }
     config.workspaces = resolveWorkspaces(config, agents, {
       code, configFile: file, secretsPath: config.secretsPath, serviceWorkspace: config.workspacePath,
       runtimeDataPath: config.runtimeDataPath, runtimeHomePath: config.runtimeHomePath, interactiveHomePath: interactive,
@@ -228,6 +250,11 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
       return token;
     },
   };
+}
+
+/** The engine a bot runs; bots without an explicit engine stay on Copilot. */
+export function botEngine(config: Pick<ServiceConfig, "bots">, botId: string): EngineId {
+  return config.bots.find((bot) => bot.id === botId)?.engine ?? "copilot";
 }
 
 export function authorizeScope(config: ServiceConfig, candidate: {

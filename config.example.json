@@ -53,11 +53,22 @@
     "minIntervalMs": 1800000,
     "maxActiveItemsPerAgent": 20
   },
+  "claudeCode": {
+    "homePath": "./runtime/claude",
+    "defaultModel": "claude-sonnet-5-5"
+  },
   "bots": [
     {
       "id": "example-bot",
       "agentId": "example-agent",
       "tokenRef": "telegram.example_bot_token"
+    },
+    {
+      "id": "example-claude-bot",
+      "agentId": "example-agent",
+      "tokenRef": "telegram.example_claude_bot_token",
+      "engine": "claude-code",
+      "model": "claude-opus-5-5"
     }
   ],
   "bindings": [
@@ -70,6 +81,12 @@
     {
       "botId": "example-bot",
       "chatId": 2,
+      "kind": "private",
+      "topicId": null
+    },
+    {
+      "botId": "example-claude-bot",
+      "chatId": 1,
       "kind": "private",
       "topicId": null
     }

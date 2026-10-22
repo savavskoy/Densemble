@@ -1,6 +1,6 @@
 import { isAbsolute, resolve } from "node:path";
 import {
-  authorizedWorkspace, authorizeScope, defaultProactivityGuardrails, defaultQuietHours, discoverAllAgents, scopeOwnerId, workspacesFor,
+  authorizedWorkspace, authorizeScope, botEngine, defaultProactivityGuardrails, defaultQuietHours, discoverAllAgents, scopeOwnerId, workspacesFor,
 } from "../config/index.js";
 import type { LoadedConfig } from "../config/index.js";
 import type {
@@ -61,7 +61,7 @@ type Action =
   | { kind: "recovery"; resume: boolean }
   | { kind: "retry"; outboxId: string; confirmed: boolean };
 type Context = {
-  run: Run; controller: AbortController; jobs: Set<Promise<unknown>>; exports: Attachment[];
+  run: Run; controller: AbortController; jobs: Set<Promise<unknown>>; exports: Attachment[]; queuedNotice?: boolean;
   stopping?: Promise<void>; preparingSteer: boolean; failureCode?: string; requestIds: Set<string>; stopForced?: boolean;
   proactive?: ProactiveBatchEntry[];
 };
@@ -75,6 +75,7 @@ interface ProactiveBatchEntry {
   late: boolean;
 }
 
+const engineLabels: Record<Session["engine"], string> = { copilot: "Copilot", "claude-code": "Claude Code" };
 const runLabels: Record<string, string> = {
   preparing: "підготовка вкладень", running: "працює", waiting: "очікує відповіді",
   cancelling: "зупиняється", succeeded: "завершено", failed: "помилка", cancelled: "зупинено", interrupted: "перервано",
@@ -154,7 +155,12 @@ export function createApplication(options: ApplicationOptions): Application {
     const agent = agents.find((entry) => entry.id === bot?.agentId && entry.userInvocable);
     if (!agent) throw new RuntimeError("AGENT_CONFIGURATION_INVALID");
     const path = workspace && workspaceAuthorized(scope, workspace) ? workspace : defaultSessionWorkspace(config.config, scope);
-    return store.sessions.create(scope, { agentId: agent.id, workspace: path, model: agent.defaultModel });
+    // New sessions use the bot's current engine; existing sessions keep the engine they were created with.
+    const engine = botEngine(config.config, scope.botId);
+    const engineDefault = engine === "claude-code" ? config.config.claudeCode?.defaultModel : agent.defaultModel;
+    const model = bot?.model ?? engineDefault;
+    if (!model) throw new RuntimeError("CLAUDE_CODE_NOT_CONFIGURED");
+    return store.sessions.create(scope, { agentId: agent.id, workspace: path, model, engine });
   }
   function text(session: Session, value: string, key = opaqueId(), runId?: string): void {
     store.outbox.enqueue({ scope: session.scope, sessionId: session.id, dedupKey: key,
@@ -236,6 +242,15 @@ export function createApplication(options: ApplicationOptions): Application {
     if (active) {
       const context = contexts.get(active.runId);
       if (context && active.status !== "preparing" && active.status !== "cancelling" && !context.preparingSteer) {
+        if (runtime.supportsSteering?.(session) === false) {
+          // This engine cannot join input to a running turn: it stays queued and runs as the next turn.
+          if (!context.queuedNotice && store.inbox.queued(scope).some((entry) => entry.sessionId === session.id)) {
+            context.queuedNotice = true;
+            text(session, "Повідомлення в черзі: цей агент не приймає уточнень під час відповіді. Воно буде виконане одразу після поточної.",
+              `run:${active.runId}:queued`, active.runId);
+          }
+          return;
+        }
         launch(steer(context), context);
       }
       return;
@@ -639,7 +654,8 @@ export function createApplication(options: ApplicationOptions): Application {
       Number(right.id === session.id) - Number(left.id === session.id));
     const offset = Math.max(0, Math.min(page, Math.max(0, Math.ceil(all.length / 5) - 1)));
     const rows: { text: string; action: Action }[][] = all.slice(offset * 5, (offset + 1) * 5).map((entry) => [
-      { text: `${entry.id === session.id ? "✓ " : ""}${new Date(entry.createdAt).toLocaleString("uk-UA")} · ${entry.appliedModel}`,
+      { text: `${entry.id === session.id ? "✓ " : ""}${new Date(entry.createdAt).toLocaleString("uk-UA")} · ` +
+          `${entry.engine === "copilot" ? "" : `${engineLabels[entry.engine]} · `}${entry.appliedModel}`,
         action: { kind: "resume", sessionId: entry.id } },
       { text: "Видалити", action: { kind: "delete", sessionId: entry.id, confirmed: false } },
     ]);
@@ -754,7 +770,7 @@ export function createApplication(options: ApplicationOptions): Application {
     const run = store.runs.active(session.scope);
     const pending = store.requests.pending(session.scope).filter((entry) => entry.sessionId === session.id);
     const failures = store.outbox.list(session.scope).filter((entry) => ["uncertain", "failed"].includes(entry.status));
-    text(session, `Агент: ${session.agentId}\nСтан: ${run ? runLabels[run.status] : "очікує повідомлення"}\n` +
+    text(session, `Агент: ${session.agentId}\nРушій: ${engineLabels[session.engine]}\nСтан: ${run ? runLabels[run.status] : "очікує повідомлення"}\n` +
       `Модель: ${session.appliedModel}\nОчікувана модель: ${session.pendingModel ?? "немає"}\n` +
       `Активних запитів: ${pending.length}\nПроблема runtime: ${runtimeFaults.get(scopeKey(session.scope)) ?? "немає"}\n` +
       `Проблем доставки: ${failures.length}` +
@@ -773,7 +789,9 @@ export function createApplication(options: ApplicationOptions): Application {
     const binding = config.config.bindings.find((entry) => entry.botId === intent.scope.botId &&
       entry.chatId === intent.scope.chatId && entry.topicId === intent.scope.topicId);
     if (!binding || intent.scope.ownerId !== scopeOwnerId(config.config, binding)) throw new RuntimeError("DELETION_SCOPE_UNAVAILABLE");
-    if (intent.providerSessionId) await runtime.deleteSession(intent.scope, intent.sessionId, intent.providerSessionId);
+    if (intent.providerSessionId) {
+      await runtime.deleteSession(intent.scope, intent.sessionId, intent.providerSessionId, intent.engine ?? "copilot");
+    }
     await media.removeArtifacts(intent.artifacts);
     await deletionJournal.remove(intent);
     text(current(intent.scope), "Сесію та її службові артефакти видалено. Workspace не змінено.");
@@ -822,7 +840,7 @@ export function createApplication(options: ApplicationOptions): Application {
         barrier(session, async (signal) => {
           if (store.outbox.list(session.scope).some((item) => item.sessionId === target.id && item.status === "sending") ||
               [...contexts.values()].some((context) => context.run.sessionId === target.id)) throw new RuntimeError("SESSION_BUSY");
-          const intent: DeletionIntent = { scope: target.scope, sessionId: target.id,
+          const intent: DeletionIntent = { scope: target.scope, sessionId: target.id, engine: target.engine,
             providerSessionId: target.providerSessionId, artifacts: store.attachments.list(target.scope, target.id) };
           let saved = false;
           try {
