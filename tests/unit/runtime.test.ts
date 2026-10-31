@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CopilotClient } from "@github/copilot-sdk";
+import { CopilotClient, ToolSet } from "@github/copilot-sdk";
 import type { ModelInfo as SdkModel, PermissionRequest, SessionConfig, SessionEvent } from "@github/copilot-sdk";
 import type { LoadedConfig } from "../../src/config/index.js";
 import type { RuntimeEvent, RunIdentity, Session } from "../../src/domain.js";
-import { createCopilotRuntime, detachedAction, questionFields, serviceClientOptions } from "../../src/agents/copilot.js";
+import type { ProactivityResponse } from "../../src/agents/contracts.js";
+import { createCopilotRuntime, detachedAction, serviceClientOptions } from "../../src/agents/copilot.js";
 import type { CopilotHost } from "../../src/agents/copilot.js";
 import type { ProcessAccess, ProcessFailure, ProcessIdentity } from "../../src/agents/supervisor.js";
 import { descendants, parseProcesses, ProcessSupervisor, recoverOwnedProcesses, sameProcess, terminateOwned } from "../../src/agents/supervisor.js";
@@ -41,7 +42,7 @@ function setup(options: { requestTimeoutMs?: number } = {}) {
     resolveSecret: () => "known-secret", tokenForBot: () => "123456:synthetic",
   };
   const session: Session = {
-    id: randomUUID(), conversationId: randomUUID(), scope, agentId: "synthetic-agent", workspace: root,
+    id: randomUUID(), conversationId: randomUUID(), scope, agentId: "synthetic-agent", engine: "copilot", workspace: root,
     providerSessionId: null, appliedModel: "model-one", pendingModel: null, generation: 1, createdAt: Date.now(), updatedAt: Date.now(),
   };
   let selected = session.appliedModel;
@@ -100,6 +101,60 @@ describe("pinned Copilot runtime adapter", () => {
     expect(settings.agent).toBe("synthetic-agent");
     expect(f.native.send).not.toHaveBeenCalled();
   });
+  it.each([
+    ["create", "manual"], ["resume", "manual"], ["create", "autopilot"], ["resume", "autopilot"],
+  ] as const)("disables forms and appends Telegram clarification instructions on %s in %s mode", async (operation, mode) => {
+    const f = setup(); f.config.config.permissionMode = mode;
+    if (operation === "resume") f.session.providerSessionId = f.native.sessionId;
+    for (const agent of f.config.agents) agent.tools = ["ask_user", "view"];
+    await f.open();
+    const settings = f.settings();
+    expect(operation === "resume" ? f.host.client.resumeSession : f.host.client.createSession).toHaveBeenCalledOnce();
+    expect(settings).not.toHaveProperty("onUserInputRequest");
+    expect(settings).not.toHaveProperty("onElicitationRequest");
+    expect(settings).not.toHaveProperty("askUserVariant");
+    expect(settings.excludedTools).toContain("ask_user");
+    expect(settings.availableTools).toBeInstanceOf(ToolSet);
+    expect((settings.availableTools as ToolSet).toArray()).not.toContain("builtin:ask_user");
+    expect(settings.customAgents?.map((agent) => agent.tools)).toEqual([["view"], ["view"]]);
+    expect(settings.systemMessage).toEqual({ mode: "append", content:
+      "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
+      "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply." });
+    expect(settings.onPermissionRequest).toBeTypeOf("function");
+    await f.send();
+    expect(await settings.hooks!.onPreToolUse!({ sessionId: f.native.sessionId, timestamp: new Date(),
+      workingDirectory: f.root, toolName: "ask_user", toolArgs: {} }, { sessionId: f.native.sessionId }))
+      .toMatchObject({ permissionDecision: "deny" });
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
+  });
+  it.each([
+    ["Sonya", "You are chatting with Sonya (a configured user) in Telegram."],
+    ["  Sonya\n Savenko ", "You are chatting with Sonya Savenko (a configured user) in Telegram."],
+    [undefined, "You are chatting with a user in Telegram."],
+  ])("names a non-owner by configured displayName %j in the session instruction", async (displayName, expected) => {
+    const f = setup();
+    const user = scope.ownerId + 1;
+    f.config.config.users = [{ telegramUserId: user, allowedBotIds: [scope.botId], ...(displayName ? { displayName } : {}) }];
+    f.config.config.workspaces = [{ id: "notes", name: "Notes", access: "private", ownerUserId: user,
+      path: f.root, agentIds: ["synthetic-agent"] }];
+    f.config.config.workspacePath = join(f.root, "service");
+    f.session.scope = { ...scope, ownerId: user };
+    await f.open();
+    const content = (f.settings().systemMessage as { content: string }).content;
+    expect(content).toContain(expected);
+    expect(content).not.toContain("Oleh");
+  });
+  it("completes a plain-text clarification and accepts the next ordinary message without a form", async () => {
+    const f = setup(); await f.open(); await f.send();
+    f.emit("assistant.message", { messageId: "question", content: "Which workspace should I use?", originatingMessageId: "send-1" });
+    f.emit("session.idle", {});
+    expect(f.events.find((event) => event.kind === "completed")).toMatchObject({ text: "Which workspace should I use?" });
+    const identity = { ...f.identity, runId: randomUUID(), generation: 2 };
+    await f.runtime.execute({ kind: "send", identity,
+      input: { text: "Use Densemble.", images: [], notices: [], attachmentIds: [] } });
+    expect(f.native.send).toHaveBeenCalledTimes(2);
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
+  });
   it("fails an unavailable worker model rather than silently substituting", async () => {
     const f = setup(); f.config.agents[1]!.defaultModel = "unavailable";
     await expect(f.open()).rejects.toThrow("MODEL_UNAVAILABLE");
@@ -119,6 +174,20 @@ describe("pinned Copilot runtime adapter", () => {
     expect(JSON.stringify(f.events)).not.toContain("SECRET_CHILD");
     expect(f.events.find((event) => event.kind === "delta")).toMatchObject({ text: "Root" });
   });
+  it("delivers only the final root message and resets the preview between intermediate steps", async () => {
+    const f = setup(); await f.open(); await f.send();
+    f.emit("assistant.message_delta", { messageId: "step1", deltaContent: "Thinking attempt" });
+    f.emit("assistant.message", { messageId: "step1", content: "Intermediate attempt", originatingMessageId: "send-1" });
+    f.emit("assistant.message_delta", { messageId: "step2", deltaContent: "Final" });
+    f.emit("assistant.message", { messageId: "step2", content: "Final conclusion", originatingMessageId: "send-1" });
+    f.emit("session.idle", {});
+    expect(f.events.filter((event) => event.kind === "completed")).toEqual([{ ...f.identity, kind: "completed", text: "Final conclusion" }]);
+    expect(JSON.stringify(f.events.filter((event) => event.kind === "completed"))).not.toContain("Intermediate attempt");
+    const deltas = f.events.filter((event) => event.kind === "delta").map((event) => (event as { text: string }).text);
+    expect(deltas).toContain("Thinking attempt");
+    expect(deltas).toContain("Final");
+    expect(deltas.every((text) => !text.includes("Thinking attemptFinal"))).toBe(true);
+  });
   it("handles terminal events that precede send acknowledgement without losing correlation", async () => {
     const f = setup(); await f.open();
     const send = deferred<string>(); f.native.send.mockReturnValueOnce(send.promise);
@@ -137,6 +206,7 @@ describe("pinned Copilot runtime adapter", () => {
     const event = f.events.find((event) => event.kind === "request")!;
     expect(event.kind).toBe("request");
     if (event.kind !== "request") return;
+    expect(event.payload.kind).toBe("permission");
     expect(JSON.stringify(event.payload)).not.toContain("known-secret");
     await f.runtime.execute({ kind: "answer", identity: { ...f.identity, generation: 2 }, requestId: event.requestId,
       answer: { kind: "permission", approved: true } });
@@ -403,6 +473,43 @@ describe("pinned Copilot runtime adapter", () => {
     await expect(handler({ path: "synthetic.txt" }, invocation)).rejects.toThrow("EXPORT_NOT_AUTHORIZED");
     expect(exportFile).toHaveBeenCalledTimes(1);
   });
+  it.each(["manual", "autopilot"] as const)("executes proactivity without a permission prompt in %s mode", async (mode) => {
+    const f = setup(); f.config.config.permissionMode = mode;
+    const response: ProactivityResponse = {
+      ok: true,
+      action: "schedule",
+      item: {
+        id: "proactive-1",
+        kind: "recurring",
+        schedule: { type: "interval", everyMs: 3_600_000 },
+        purpose: "Weekly review",
+        initiator: "agent",
+        status: "active",
+        nextDueAt: 3_600_000,
+      },
+      message: "Scheduled proactive item proactive-1.",
+    };
+    const proactivity = vi.fn(async () => response);
+    await f.runtime.open({ session: f.session, proactivity, onEvent: (event) => f.events.push(event) });
+    await f.send();
+    const handler = f.settings().tools!.find((tool) => tool.name === "densemble_manage_proactivity")!.handler!;
+    const hook = f.settings().hooks!.onPreToolUse!;
+    const args = {
+      action: "schedule",
+      kind: "recurring",
+      schedule: { type: "interval", everyMs: 3_600_000 },
+      purpose: "Weekly review",
+    } as const;
+    const invocation = { sessionId: f.native.sessionId, toolCallId: "proactivity-call", toolName: "densemble_manage_proactivity", arguments: args };
+    expect(await hook({ sessionId: f.native.sessionId, timestamp: new Date(), workingDirectory: f.root,
+      toolName: "densemble_manage_proactivity", toolArgs: args }, invocation)).toEqual({
+      permissionDecision: "allow", permissionDecisionReason: expect.stringContaining("Densemble"),
+    });
+    await expect(handler(args, invocation)).resolves.toEqual(response);
+    expect(proactivity).toHaveBeenCalledWith(scope, f.session.agentId, args);
+    expect(proactivity).toHaveBeenCalledTimes(1);
+    expect(f.events.some((event) => event.kind === "request")).toBe(false);
+  });
   it("stops the owned host while SDK startup is still pending", async () => {
     const f = setup();
     const starting = deferred<void>();
@@ -434,7 +541,7 @@ describe("pinned Copilot runtime adapter", () => {
     const f = setup(); f.session.providerSessionId = f.native.sessionId;
     await f.open();
     expect(f.host.client.resumeSession).toHaveBeenCalledWith(f.native.sessionId, expect.objectContaining({
-      continuePendingWork: false, onPermissionRequest: expect.any(Function), onUserInputRequest: expect.any(Function),
+      continuePendingWork: false, onPermissionRequest: expect.any(Function),
       tools: expect.any(Array),
     }));
     expect(f.native.send).not.toHaveBeenCalled();
@@ -462,7 +569,11 @@ describe("pinned Copilot runtime adapter", () => {
       expect(resumed.continuePendingWork).toBe(false);
       expect(resumed).not.toHaveProperty("continuePendingMessages");
       expect(resumed.onPermissionRequest).toBeTypeOf("function");
-      expect(resumed.onUserInputRequest).toBeTypeOf("function");
+      expect(resumed).not.toHaveProperty("onUserInputRequest");
+      expect(resumed).not.toHaveProperty("onElicitationRequest");
+      expect(resumed).not.toHaveProperty("askUserVariant");
+      expect(resumed.excludedTools).toContain("ask_user");
+      expect(resumed.systemMessage).toMatchObject({ mode: "append", content: expect.stringContaining("Telegram") });
     },
   );
   it("recreates SDK-discarded empty sessions but never replaces a missing nonempty history", async () => {
@@ -525,13 +636,7 @@ describe("pinned Copilot runtime adapter", () => {
     expect(f.native.send).not.toHaveBeenCalled();
     expect(f.host.stop).toHaveBeenCalledTimes(1);
   });
-  it("normalizes multi-field elicitation and rejects detached native execution", () => {
-    expect(questionFields({ type: "object", properties: {
-      colors: { type: "array", items: { type: "string", enum: ["red", "blue"] } },
-      note: { type: "string" }, confirmed: { type: "boolean" },
-    } }, "Form")).toMatchObject({ kind: "question", fields: [
-      { id: "field_0", multiple: true }, { id: "field_1", allowFreeform: true }, { id: "field_2", choices: ["Так", "Ні"] },
-    ] });
+  it("rejects detached native execution", () => {
     expect(detachedAction("bash", { command: "node worker &" })).toBe(true);
     expect(detachedAction("bash", { command: "nohup node worker" })).toBe(true);
     expect(detachedAction("bash", { command: "git status && git diff" })).toBe(false);

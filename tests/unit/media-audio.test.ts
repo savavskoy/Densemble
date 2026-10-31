@@ -9,7 +9,7 @@ import type { IncomingAttachment, IncomingMessage, LogicalInput, Run, Scope } fr
 import type { StateStore } from "../../src/ports.js";
 import { openStore } from "../../src/storage/index.js";
 import { checkAudioReadiness, createMediaPipeline, MediaError, runManagedProcess,
-  type AudioSettings, type MediaPipeline, type ProcessRunner } from "../../src/media/index.js";
+  SpeechGate, type AudioSettings, type MediaPipeline, type ProcessRunner } from "../../src/media/index.js";
 
 const scope: Scope = { ownerId: 222, botId: "voice-bot", chatId: 222, topicId: null };
 let root: string;
@@ -145,12 +145,43 @@ describe("local-only voice preparation", () => {
     const english = Buffer.from(readFileSync(modelPath));
     english.writeInt32LE(51864, 4);
     writeFileSync(modelPath, english);
-    await expect(setup().transcribe(voice, scope, signal())).rejects.toMatchObject({ code: "MEDIA_AUDIO_MODEL_MISSING" });
+    await expect(setup().transcribe(voice, scope, signal())).rejects.toMatchObject({ code: "MEDIA_AUDIO_MODEL_ENGLISH_ONLY" });
     expect(audioFiles()).toEqual([]);
     await expect(checkAudioReadiness({ whisperPath: join(root, "missing-whisper") }))
       .resolves.toEqual({ ready: false, code: "MEDIA_AUDIO_TOOLS_MISSING" });
     await expect(checkAudioReadiness({ ffmpegPath: process.execPath, ffprobePath: process.execPath,
       whisperPath: process.execPath, modelPath: missing })).resolves.toEqual({ ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
+  });
+  it("accepts any multilingual model size, detects language automatically and passes vocabulary and VAD", async () => {
+    const turbo = Buffer.alloc(48);
+    [0x67676d6c, 51866, 1500, 1280, 20, 32, 448, 1280, 20, 4, 128, 1].forEach((value, index) => turbo.writeInt32LE(value, index * 4));
+    writeFileSync(modelPath, turbo);
+    const vad = join(root, "vad.bin");
+    writeFileSync(vad, Buffer.from([0x6c, 0x6d, 0x67, 0x67, 1, 2, 3, 4]));
+    const runner = vi.fn<ProcessRunner>(fakeRunner());
+    const gate = new SpeechGate();
+    const changes: boolean[] = [];
+    gate.subscribe((active) => changes.push(active));
+    pipeline = createMediaPipeline({ config: { runtimeDataPath: runtime, workspacePath: workspace }, store, diagnostics,
+      download: async (_bot, _id, path) => { writeFileSync(path, voiceBytes, { flag: "wx", mode: 0o600 }); },
+      audio: { modelPath, processRunner: runner, vocabulary: ["НБУВ", "архівна справа"], vadModelPath: vad }, speechGate: gate });
+    await expect(pipeline.transcribe(voice, scope, signal())).resolves.toBe("Синтетична транскрипція");
+    const whisper = runner.mock.calls.find((call) => call[0] === "whisper-cli")![1];
+    expect(whisper.slice(whisper.indexOf("-l"), whisper.indexOf("-l") + 2)).toEqual(["-l", "auto"]);
+    expect(whisper.slice(whisper.indexOf("--prompt"), whisper.indexOf("--prompt") + 2)).toEqual(["--prompt", "НБУВ, архівна справа"]);
+    expect(whisper).toEqual(expect.arrayContaining(["--vad", "-vm", vad]));
+    expect(changes).toEqual([true, false]);
+    await expect(checkAudioReadiness({ ffmpegPath: process.execPath, ffprobePath: process.execPath,
+      whisperPath: process.execPath, modelPath, vadModelPath: join(root, "missing-vad.bin") }))
+      .resolves.toEqual({ ready: false, code: "MEDIA_AUDIO_VAD_MODEL_INVALID" });
+  });
+  it("keeps the voice invocation unchanged without vocabulary or VAD", async () => {
+    const runner = vi.fn<ProcessRunner>(fakeRunner());
+    pipeline = setup({ processRunner: runner, language: "uk" });
+    await pipeline.transcribe(voice, scope, signal());
+    const whisper = runner.mock.calls.find((call) => call[0] === "whisper-cli")![1];
+    expect(whisper.slice(0, 2)).toEqual(["-m", modelPath]);
+    expect(whisper.slice(4)).toEqual(["-l", "uk", "-t", "4", "-otxt", "-of", expect.stringMatching(/transcript$/), "-np", "-nt"]);
   });
   it.each([
     ["", "MEDIA_EMPTY"],

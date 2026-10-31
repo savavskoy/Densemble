@@ -46,7 +46,7 @@ describe("real SQLite migrations and scope isolation", () => {
     store.close();
     const raw = new Database(path);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(raw.pragma("user_version", { simple: true })).toBe(1);
+    expect(raw.pragma("user_version", { simple: true })).toBe(3);
     expect(raw.pragma("foreign_key_check")).toEqual([]);
     raw.close();
     store = openStore({ path });
@@ -486,5 +486,28 @@ describe("outbox persistence, pinning and recovery", () => {
     const item = store.outbox.enqueue({ scope, sessionId: current.id, dedupKey: "result", payload: { kind: "text", text: "Result" } });
     store.outbox.claim();
     expect(() => store.outbox.settle(item.id, 1, { status: "failed", errorCode: "secret text and arguments" })).toThrow("INVALID_ERROR_CODE");
+  });
+});
+describe("session engines", () => {
+  it("records the engine at creation and defaults to Copilot", () => {
+    expect(session().engine).toBe("copilot");
+    const claude = store.sessions.create(scope, { agentId: "synthetic-agent", workspace: join(root, "workspace"),
+      model: "claude-sonnet-5-5", engine: "claude-code" });
+    expect(store.sessions.get(scope, claude.id)?.engine).toBe("claude-code");
+    expect(() => store.sessions.create(scope, { agentId: "synthetic-agent", workspace: join(root, "workspace"),
+      model: "m", engine: "other" as "copilot" })).toThrow("INVALID_SESSION");
+  });
+  it("migrates sessions created before engines existed to Copilot", () => {
+    const legacyPath = join(root, "legacy.sqlite");
+    const legacy = openStore({ path: legacyPath });
+    const created = legacy.sessions.create(scope, { agentId: "synthetic-agent", workspace: join(root, "workspace"), model: "model-one" });
+    legacy.close();
+    const raw = new Database(legacyPath);
+    raw.exec("ALTER TABLE sessions DROP COLUMN engine");
+    raw.pragma("user_version = 2");
+    raw.close();
+    const migrated = openStore({ path: legacyPath });
+    try { expect(migrated.sessions.get(scope, created.id)?.engine).toBe("copilot"); }
+    finally { migrated.close(); }
   });
 });

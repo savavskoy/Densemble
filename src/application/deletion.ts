@@ -1,8 +1,8 @@
 import { mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { z } from "zod";
-import type { Attachment, Scope } from "../domain.js";
-import { assertScope } from "../domain.js";
+import type { Attachment, EngineId, Scope } from "../domain.js";
+import { assertScope, engineIds } from "../domain.js";
 import { RuntimeError } from "../agents/contracts.js";
 
 const uuid = z.string().uuid();
@@ -18,12 +18,15 @@ const artifactSchema = z.object({
 }).strict();
 const schema = z.object({
   sessionId: uuid, scope: scopeSchema, providerSessionId: z.string().nullable(), artifacts: z.array(artifactSchema),
+  // Absent in journals written before engines existed: those sessions are Copilot sessions.
+  engine: z.enum(engineIds as [EngineId, ...EngineId[]]).optional(),
 }).strict();
 export interface DeletionIntent {
   scope: Scope;
   sessionId: string;
   providerSessionId: string | null;
   artifacts: Attachment[];
+  engine?: EngineId | undefined;
 }
 export class DeletionJournal {
   private readonly directory: string;
@@ -37,7 +40,8 @@ export class DeletionJournal {
     if (!parsed.success) throw new RuntimeError("DELETION_JOURNAL_INVALID");
     const intent = parsed.data;
     assertScope(intent.scope);
-    if (intent.providerSessionId && intent.providerSessionId !== `densemble-${intent.sessionId}`) {
+    const ownedProvider = intent.engine === "claude-code" ? intent.sessionId : `densemble-${intent.sessionId}`;
+    if (intent.providerSessionId && intent.providerSessionId !== ownedProvider) {
       throw new RuntimeError("DELETION_JOURNAL_INVALID");
     }
     for (const artifact of intent.artifacts) {

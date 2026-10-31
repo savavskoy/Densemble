@@ -1,21 +1,30 @@
 import { isAbsolute, resolve } from "node:path";
-import { authorizeScope, discoverAgents } from "../config/index.js";
+import {
+  authorizedWorkspace, authorizeScope, botEngine, defaultProactivityGuardrails, defaultQuietHours, discoverAllAgents, scopeOwnerId, workspacesFor,
+} from "../config/index.js";
 import type { LoadedConfig } from "../config/index.js";
 import type {
   Attachment, DeliveryPayload, IncomingCallback, IncomingMessage, LogicalInput, ModelInfo,
-  PendingRequest, RequestAnswer, Run, RunIdentity, RuntimeEvent, Scope, Session,
+  PendingRequest, ProactiveItem, ProactiveKind, RequestAnswer, Run, RunIdentity, RuntimeEvent, Scope, Session,
 } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type {
   AgentRuntime, DeliveryTransport, DiagnosticSink, IngressHandler, MediaPreparation, Recovery, StateStore,
 } from "../ports.js";
-import type { ControlledSessionOptions } from "../agents/contracts.js";
+import type { ControlledSessionOptions, ProactivityRequest, ProactivityResponse } from "../agents/contracts.js";
 import { bounded, RuntimeError } from "../agents/contracts.js";
 import { Controls, currentField, opaqueId, questionAnswer, sanitizeParameters } from "../permissions/index.js";
+import { nextOccurrence } from "../scheduling/rrule.js";
 import type { MenuPayload } from "./menu.js";
 import { DeletionJournal } from "./deletion.js";
 import type { DeletionIntent } from "./deletion.js";
 import { failureCode, failureMessage, mediaNotice } from "./messages.js";
+import { handleProactiveCommand } from "./proactive-commands.js";
+import { handleProactivityRequest } from "./proactive-tool.js";
+import { defaultSessionWorkspace, parseWorkspaceCommand, workspaceListText, workspaceRequiredText } from "./workspace-commands.js";
+import type { ProactivityGuardrails } from "./proactive-tool.js";
+import type { ModuleStateReport } from "../modules/contract.js";
+import { formatModulesSection } from "../modules/state.js";
 
 export interface ApplicationMedia extends MediaPreparation {
   releaseRun(identity: RunIdentity): void;
@@ -34,12 +43,19 @@ export interface ApplicationOptions {
   stopTimeoutMs?: number;
   idleReleaseMs?: number;
   refreshAgents?: boolean;
-  /** @deprecated Delivery is always transport-owned; retained for bootstrap compatibility. */
-  deferDelivery?: true;
+  /** Module rows for the owner's `/status` «Модулі» section. */
+  modules?: { report(): ModuleStateReport[] };
 }
 export interface Application extends IngressHandler {
   start(recovery?: Recovery): Promise<void>;
   recover(recovery: Recovery): void;
+  triggerProactive(item: ProactiveItem): Promise<boolean>;
+  /**
+   * Plain text to the owner's private chat with a bot serving `coordinatorAgentId` (a Copilot bot preferred),
+   * in that chat's current session. A `dedupKey` already in that chat's outbox is a no-op. False when no
+   * coordinator chat exists or the application is stopping.
+   */
+  notifyCoordinator(text: string, dedupKey: string): boolean;
   shutdown(): Promise<void>;
   /** Wait for admitted work; useful for shutdown/tests, never the polling loop. */
   drain(): Promise<void>;
@@ -55,26 +71,63 @@ type Action =
   | { kind: "recovery"; resume: boolean }
   | { kind: "retry"; outboxId: string; confirmed: boolean };
 type Context = {
-  run: Run; controller: AbortController; jobs: Set<Promise<unknown>>; exports: Attachment[];
+  run: Run; controller: AbortController; jobs: Set<Promise<unknown>>; exports: Attachment[]; queuedNotice?: boolean;
   stopping?: Promise<void>; preparingSteer: boolean; failureCode?: string; requestIds: Set<string>; stopForced?: boolean;
+  proactive?: ProactiveBatchEntry[];
 };
 type Barrier = { controller: AbortController; promise: Promise<void>; runtimeSessionId: string };
+interface ProactiveBatchEntry {
+  occurrenceId: string;
+  itemId: string;
+  agentId: string;
+  kind: ProactiveKind;
+  purpose: string;
+  late: boolean;
+}
 
+const engineLabels: Record<Session["engine"], string> = { copilot: "Copilot", "claude-code": "Claude Code" };
 const runLabels: Record<string, string> = {
   preparing: "підготовка вкладень", running: "працює", waiting: "очікує відповіді",
   cancelling: "зупиняється", succeeded: "завершено", failed: "помилка", cancelled: "зупинено", interrupted: "перервано",
 };
-const help = "Команди: /start, /help, /status, /model, /new, /sessions, /stop.\n" +
+const help = "Команди: /start, /help, /status, /model, /new, /sessions, /workspace, /stop.\n" +
   "Введіть /, щоб побачити підказки команд. Для зупинки виконання надішліть /stop.\n" +
   "У цій розмові працює закріплений агент. Уточнення під час роботи передаються активному виконанню. " +
   "На запитання відповідайте кнопками або відповіддю на повідомлення форми. Дозволи — лише кнопками.\n" +
   "/stop не відкочує зовнішні дії.";
+const proactiveKindLabels: Record<ProactiveKind, string> = {
+  oneoff: "одноразове нагадування",
+  recurring: "періодична перевірка",
+  silent: "тиха перевірка — повідомляй лише якщо дійсно є що сказати",
+};
+
+function buildProactiveTriggerText(entries: ProactiveBatchEntry[], sentinelEligible: boolean): string {
+  const lines = [
+    "Системний проактивний тригер для цієї розмови.",
+    entries.length > 1
+      ? "Нижче кілька одночасних причин написати Олегу. Дайте одне природне повідомлення, об'єднавши теми без службових пояснень."
+      : "Сформуйте одне доречне повідомлення для Олега без згадки внутрішнього службового тригера.",
+    "",
+    "Пункти:",
+  ];
+  entries.forEach((entry, index) => {
+    lines.push(`${index + 1}. ${proactiveKindLabels[entry.kind]}: ${entry.purpose}`);
+    if (entry.late) {
+      lines.push("   Це спрацювання мало відбутися раніше через тихі години або простій сервісу. Можете просто виконати його зараз.");
+    }
+  });
+  if (sentinelEligible) {
+    lines.push("", "Якщо зараз справді немає нічого вартого окремого повідомлення, відповідайте рівно текстом NO_PROACTIVE_MESSAGE і більше нічого не додавайте: без крапок, без лапок, без додаткових слів.");
+  }
+  return lines.join("\n");
+}
 
 export function createApplication(options: ApplicationOptions): Application {
   const { config, store, runtime, media, delivery, diagnostics } = options;
   const controls = new Controls<Action>();
   const contexts = new Map<string, Context>();
   const barriers = new Map<string, Barrier>();
+  const pendingProactiveBatches = new Map<string, ProactiveBatchEntry[]>();
   const held = new Set<string>();
   const jobs = new Set<Promise<unknown>>();
   const timers = new Map<string, NodeJS.Timeout>();
@@ -102,13 +155,22 @@ export function createApplication(options: ApplicationOptions): Application {
     if (existing) return existing;
     return createSession(scope);
   }
-  function createSession(scope: Scope): Session {
+  function workspaceAuthorized(scope: Scope, path: string): boolean {
+    return authorizedWorkspace(config.config, scope.ownerId, scope.botId, path) !== null;
+  }
+  function createSession(scope: Scope, workspace?: string): Session {
     const bot = config.config.bots.find((entry) => entry.id === scope.botId);
-    const agents = options.refreshAgents === false ? config.agents : discoverAgents(config.config);
+    const agents = options.refreshAgents === false ? config.agents : discoverAllAgents(config.config);
     if (options.refreshAgents !== false) config.agents = agents;
     const agent = agents.find((entry) => entry.id === bot?.agentId && entry.userInvocable);
     if (!agent) throw new RuntimeError("AGENT_CONFIGURATION_INVALID");
-    return store.sessions.create(scope, { agentId: agent.id, workspace: config.config.workspacePath, model: agent.defaultModel });
+    const path = workspace && workspaceAuthorized(scope, workspace) ? workspace : defaultSessionWorkspace(config.config, scope);
+    // New sessions use the bot's current engine; existing sessions keep the engine they were created with.
+    const engine = botEngine(config.config, scope.botId);
+    const engineDefault = engine === "claude-code" ? config.config.claudeCode?.defaultModel : agent.defaultModel;
+    const model = bot?.model ?? engineDefault;
+    if (!model) throw new RuntimeError("CLAUDE_CODE_NOT_CONFIGURED");
+    return store.sessions.create(scope, { agentId: agent.id, workspace: path, model, engine });
   }
   function text(session: Session, value: string, key = opaqueId(), runId?: string): void {
     store.outbox.enqueue({ scope: session.scope, sessionId: session.id, dedupKey: key,
@@ -129,6 +191,17 @@ export function createApplication(options: ApplicationOptions): Application {
     text(session, failureMessage(code), runId ? `run:${runId}:error` : opaqueId(), runId);
   }
   function sessionFor(identity: RunIdentity): Session | null { return store.sessions.get(identity.scope, identity.sessionId); }
+  function proactivityGuardrails(): ProactivityGuardrails {
+    const configured = config.config.proactivity;
+    return {
+      maxActiveItemsPerAgent: configured?.maxActiveItemsPerAgent ?? defaultProactivityGuardrails.maxActiveItemsPerAgent,
+      minIntervalMs: configured?.minIntervalMs ?? defaultProactivityGuardrails.minIntervalMs,
+      timezone: config.config.quietHours?.timezone ?? defaultQuietHours.timezone,
+    };
+  }
+  async function proactivity(scope: Scope, agentId: string, request: ProactivityRequest): Promise<ProactivityResponse> {
+    return handleProactivityRequest(store, proactivityGuardrails(), scope, agentId, request);
+  }
   async function exportFile(identity: RunIdentity, path: string, signal: AbortSignal): Promise<Attachment> {
     const context = contexts.get(identity.runId);
     if (!context || !live(identity)) throw new RuntimeError("EXPORT_STALE_RUN");
@@ -136,6 +209,7 @@ export function createApplication(options: ApplicationOptions): Application {
     const work = (async () => {
       const session = sessionFor(identity);
       if (!session) throw new RuntimeError("EXPORT_STALE_RUN");
+      if (!workspaceAuthorized(session.scope, session.workspace)) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
       const source = isAbsolute(path) ? path : resolve(session.workspace, path);
       const attachment = await media.exportFile(identity, source, combined);
       if (!live(identity) || combined.aborted || attachment.sessionId !== identity.sessionId ||
@@ -150,12 +224,13 @@ export function createApplication(options: ApplicationOptions): Application {
   }
   async function open(session: Session, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
+    if (!workspaceAuthorized(session.scope, session.workspace)) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
     const control = barriers.get(scopeKey(session.scope));
     if (control) control.runtimeSessionId = session.id;
     const active = store.runs.active(session.scope);
     const emptyHistory = session.generation === 0 || (session.generation === 1 &&
       active?.sessionId === session.id && active.generation === 1 && active.status === "preparing");
-    const supplied: ControlledSessionOptions = { session, signal, emptyHistory, onEvent, exportFile };
+    const supplied: ControlledSessionOptions = { session, signal, emptyHistory, onEvent, exportFile, proactivity };
     const result = await runtime.open(supplied);
     signal.throwIfAborted();
     if (!store.sessions.setProviderSessionId(session.scope, session.id, result.providerSessionId)) {
@@ -177,6 +252,15 @@ export function createApplication(options: ApplicationOptions): Application {
     if (active) {
       const context = contexts.get(active.runId);
       if (context && active.status !== "preparing" && active.status !== "cancelling" && !context.preparingSteer) {
+        if (runtime.supportsSteering?.(session) === false) {
+          // This engine cannot join input to a running turn: it stays queued and runs as the next turn.
+          if (!context.queuedNotice && store.inbox.queued(scope).some((entry) => entry.sessionId === session.id)) {
+            context.queuedNotice = true;
+            text(session, "Повідомлення в черзі: цей агент не приймає уточнень під час відповіді. Воно буде виконане одразу після поточної.",
+              `run:${active.runId}:queued`, active.runId);
+          }
+          return;
+        }
         launch(steer(context), context);
       }
       return;
@@ -197,6 +281,11 @@ export function createApplication(options: ApplicationOptions): Application {
     contexts.set(run.runId, context);
     const reserved = store.inbox.get(scope, input.id);
     if (!reserved) { launch(failRun(context, "INPUT_MISSING")); return; }
+    const batch = pendingProactiveBatches.get(reserved.id);
+    if (batch) {
+      context.proactive = batch;
+      pendingProactiveBatches.delete(reserved.id);
+    }
     launch(executeInput(context, reserved), context);
   }
   async function executeInput(context: Context, input: LogicalInput): Promise<void> {
@@ -268,6 +357,17 @@ export function createApplication(options: ApplicationOptions): Application {
     if (!session) return;
     // Do not release the live slot while an errored send may still be executing.
     context.failureCode = code;
+    if (context.proactive) {
+      try {
+        for (const entry of context.proactive) {
+          store.proactivity.settleOccurrence(entry.occurrenceId, "failed");
+          if (entry.kind !== "oneoff") continue;
+          text(session,
+            `⏰ Нагадування не вдалося виконати через агента (одноразове): ${entry.purpose}`,
+            `proactive-fallback:${entry.occurrenceId}`, context.run.runId);
+        }
+      } catch { diagnostics.record("PROACTIVE_FAILURE_HANDLING_FAILED"); }
+    }
     try { reportFailure(session, code, context.run.runId); } catch { diagnostics.record("FAILURE_DELIVERY_PERSIST_FAILED"); }
     await stopRun(context.run);
   }
@@ -319,7 +419,11 @@ export function createApplication(options: ApplicationOptions): Application {
         break;
       }
       case "completed": {
-        const deliveries = [{ dedupKey: `run:${event.runId}:result`, payload: { kind: "text" as const, text: event.text },
+        const sentinelMatched = Boolean(context.proactive?.length === 1 &&
+          context.proactive[0]!.kind === "silent" &&
+          !context.proactive[0]!.late &&
+          event.text.trim().toUpperCase() === "NO_PROACTIVE_MESSAGE");
+        let deliveries = [{ dedupKey: `run:${event.runId}:result`, payload: { kind: "text" as const, text: event.text },
           replyToMessageId: store.inbox.get(event.scope, context.run.inputId)?.messages[0]?.messageId },
         ...context.exports.map((attachment) => ({
           dedupKey: `run:${event.runId}:file:${attachment.id}`,
@@ -330,7 +434,13 @@ export function createApplication(options: ApplicationOptions): Application {
           }
           return item;
         });
+        if (sentinelMatched) deliveries = [];
         if (store.runs.complete(event, deliveries)) {
+          if (context.proactive) {
+            for (const entry of context.proactive) {
+              store.proactivity.settleOccurrence(entry.occurrenceId, sentinelMatched ? "nothing" : (entry.late ? "late" : "sent"));
+            }
+          }
           runtimeFaults.delete(scopeKey(event.scope));
           finishContext(context);
         }
@@ -338,6 +448,70 @@ export function createApplication(options: ApplicationOptions): Application {
       }
       case "failed": launch(failRun(context, event.code)); break;
     }
+  }
+  async function triggerProactive(item: ProactiveItem): Promise<boolean> {
+    if (stopped || closing) return false;
+    const key = scopeKey(item.scope);
+    if (barriers.has(key) || held.has(key)) return false;
+    if (store.runs.active(item.scope)) return false;
+    if (store.proactivity.isAgentPaused(item.scope)) return false;
+
+    const now = Date.now();
+    const quietHours = config.config.quietHours ?? defaultQuietHours;
+    const lateThresholdMs = 90_000;
+    const session = current(item.scope);
+    const binding = config.config.bindings.find((entry) =>
+      entry.botId === item.scope.botId && entry.chatId === item.scope.chatId);
+    const chatKind = binding?.kind ?? (item.scope.topicId === null ? "private" : "forum");
+
+    // Record/advance the whole batch and admit the synthetic message as one durable transaction,
+    // so a crash or thrown error mid-batch never leaves a sibling advanced without being delivered
+    // (or an occurrence recorded without the triggering item being advanced).
+    const { entries, admitted } = store.atomic(() => {
+      const siblings = store.proactivity.listDue(now).filter((candidate) => scopeKey(candidate.scope) === key);
+      const batchItems = siblings.some((candidate) => candidate.id === item.id) ? siblings : [...siblings, item];
+
+      const entries: ProactiveBatchEntry[] = [];
+      for (const batchItem of batchItems) {
+        const late = batchItem.nextDueAt !== null && (now - batchItem.nextDueAt) > lateThresholdMs;
+        const occurrence = store.proactivity.recordOccurrence(batchItem.id, batchItem.nextDueAt ?? now, late, now);
+        entries.push({
+          occurrenceId: occurrence.id,
+          itemId: batchItem.id,
+          agentId: batchItem.agentId,
+          kind: batchItem.kind,
+          purpose: batchItem.purpose,
+          late,
+        });
+        if (batchItem.id === item.id) continue;
+        if (batchItem.schedule.type === "once") {
+          store.proactivity.setStatus(batchItem.scope, batchItem.id, "done", now);
+          continue;
+        }
+        const next = nextOccurrence(batchItem.schedule, now, quietHours.timezone);
+        if (next === null) store.proactivity.setStatus(batchItem.scope, batchItem.id, "done", now);
+        else store.proactivity.reschedule(batchItem.scope, batchItem.id, next, now);
+      }
+
+      const primaryOccurrenceId = entries[0]!.occurrenceId;
+      const syntheticId = store.proactivity.syntheticId(primaryOccurrenceId);
+      const sentinelEligible = entries.length === 1 && entries[0]!.kind === "silent" && !entries[0]!.late;
+      const message: IncomingMessage = {
+        kind: "message",
+        scope: item.scope,
+        chatKind,
+        updateId: syntheticId,
+        messageId: syntheticId,
+        receivedAt: now,
+        text: buildProactiveTriggerText(entries, sentinelEligible),
+        attachments: [],
+      };
+      return { entries, admitted: store.inbox.admit(message, { sessionId: session.id, reserveRun: false, now }) };
+    });
+    if (!admitted.accepted || !admitted.input) return false;
+    pendingProactiveBatches.set(admitted.input.id, entries);
+    pump(item.scope);
+    return true;
   }
   function stopRun(identity: RunIdentity): Promise<void> {
     const context = contexts.get(identity.runId);
@@ -490,7 +664,8 @@ export function createApplication(options: ApplicationOptions): Application {
       Number(right.id === session.id) - Number(left.id === session.id));
     const offset = Math.max(0, Math.min(page, Math.max(0, Math.ceil(all.length / 5) - 1)));
     const rows: { text: string; action: Action }[][] = all.slice(offset * 5, (offset + 1) * 5).map((entry) => [
-      { text: `${entry.id === session.id ? "✓ " : ""}${new Date(entry.createdAt).toLocaleString("uk-UA")} · ${entry.appliedModel}`,
+      { text: `${entry.id === session.id ? "✓ " : ""}${new Date(entry.createdAt).toLocaleString("uk-UA")} · ` +
+          `${entry.engine === "copilot" ? "" : `${engineLabels[entry.engine]} · `}${entry.appliedModel}`,
         action: { kind: "resume", sessionId: entry.id } },
       { text: "Видалити", action: { kind: "delete", sessionId: entry.id, confirmed: false } },
     ]);
@@ -605,14 +780,46 @@ export function createApplication(options: ApplicationOptions): Application {
     const run = store.runs.active(session.scope);
     const pending = store.requests.pending(session.scope).filter((entry) => entry.sessionId === session.id);
     const failures = store.outbox.list(session.scope).filter((entry) => ["uncertain", "failed"].includes(entry.status));
-    text(session, `Агент: ${session.agentId}\nСтан: ${run ? runLabels[run.status] : "очікує повідомлення"}\n` +
+    text(session, `Агент: ${session.agentId}\nРушій: ${engineLabels[session.engine]}\nСтан: ${run ? runLabels[run.status] : "очікує повідомлення"}\n` +
       `Модель: ${session.appliedModel}\nОчікувана модель: ${session.pendingModel ?? "немає"}\n` +
       `Активних запитів: ${pending.length}\nПроблема runtime: ${runtimeFaults.get(scopeKey(session.scope)) ?? "немає"}\n` +
       `Проблем доставки: ${failures.length}` +
-      (held.has(scopeKey(session.scope)) ? "\nЗбережена черга утримується після перезапуску." : ""));
+      (held.has(scopeKey(session.scope)) ? "\nЗбережена черга утримується після перезапуску." : "") +
+      modulesSection(session));
     for (const item of failures.slice(-5)) {
       menu(session, `Доставка ${item.status === "uncertain" ? "не підтверджена" : "невдала"}. Повтор не запускає агента.`,
         [[{ text: "Повторити доставку", action: { kind: "retry", outboxId: item.id, confirmed: false } }]]);
+    }
+  }
+  function modulesSection(session: Session): string {
+    if (!options.modules || session.scope.ownerId !== config.config.ownerId) return "";
+    let section: string;
+    try { section = formatModulesSection(options.modules.report()); } catch { return ""; }
+    return section ? `\n\n${section}` : "";
+  }
+  function coordinatorScope(): Scope | undefined {
+    const agentId = config.config.coordinatorAgentId;
+    if (agentId === undefined) return undefined;
+    const ownerId = config.config.ownerId;
+    const chats = config.config.bots.filter((bot) => bot.agentId === agentId).flatMap((bot) =>
+      config.config.bindings.filter((binding) => binding.botId === bot.id && binding.kind === "private" && binding.chatId === ownerId)
+        .map((binding) => ({ binding, copilot: botEngine(config.config, bot.id) === "copilot" })));
+    const chosen = chats.find((chat) => chat.copilot) ?? chats[0];
+    if (!chosen) return undefined;
+    const { binding } = chosen;
+    return { ownerId: scopeOwnerId(config.config, binding), botId: binding.botId, chatId: binding.chatId, topicId: binding.topicId };
+  }
+  function notifyCoordinator(value: string, dedupKey: string): boolean {
+    if (stopped || closing || !value.trim() || !dedupKey.trim()) return false;
+    const scope = coordinatorScope();
+    if (!scope) return false;
+    try {
+      if (store.outbox.list(scope).some((item) => item.dedupKey === dedupKey)) return true;
+      text(current(scope), value, dedupKey);
+      return true;
+    } catch {
+      diagnostics.record("MODULE_NOTICE_UNDELIVERED");
+      return false;
     }
   }
   async function finishDeletion(intent: DeletionIntent): Promise<void> {
@@ -623,8 +830,10 @@ export function createApplication(options: ApplicationOptions): Application {
     }
     const binding = config.config.bindings.find((entry) => entry.botId === intent.scope.botId &&
       entry.chatId === intent.scope.chatId && entry.topicId === intent.scope.topicId);
-    if (!binding || intent.scope.ownerId !== config.config.ownerId) throw new RuntimeError("DELETION_SCOPE_UNAVAILABLE");
-    if (intent.providerSessionId) await runtime.deleteSession(intent.scope, intent.sessionId, intent.providerSessionId);
+    if (!binding || intent.scope.ownerId !== scopeOwnerId(config.config, binding)) throw new RuntimeError("DELETION_SCOPE_UNAVAILABLE");
+    if (intent.providerSessionId) {
+      await runtime.deleteSession(intent.scope, intent.sessionId, intent.providerSessionId, intent.engine ?? "copilot");
+    }
     await media.removeArtifacts(intent.artifacts);
     await deletionJournal.remove(intent);
     text(current(intent.scope), "Сесію та її службові артефакти видалено. Workspace не змінено.");
@@ -673,7 +882,7 @@ export function createApplication(options: ApplicationOptions): Application {
         barrier(session, async (signal) => {
           if (store.outbox.list(session.scope).some((item) => item.sessionId === target.id && item.status === "sending") ||
               [...contexts.values()].some((context) => context.run.sessionId === target.id)) throw new RuntimeError("SESSION_BUSY");
-          const intent: DeletionIntent = { scope: target.scope, sessionId: target.id,
+          const intent: DeletionIntent = { scope: target.scope, sessionId: target.id, engine: target.engine,
             providerSessionId: target.providerSessionId, artifacts: store.attachments.list(target.scope, target.id) };
           let saved = false;
           try {
@@ -714,6 +923,33 @@ export function createApplication(options: ApplicationOptions): Application {
       }
     }
   }
+  function workspaceCommand(session: Session, args: string): void {
+    const parsed = parseWorkspaceCommand(args);
+    switch (parsed.kind) {
+      case "usage": text(session, "Використання: /workspace — перелік, /workspace <id> — вибір."); return;
+      case "list": text(session, workspaceListText(config.config, session)); return;
+      case "select": break;
+    }
+    const target = parsed.id === "default" && session.scope.ownerId === config.config.ownerId
+      ? config.config.workspacePath
+      : workspacesFor(config.config, session.scope.ownerId, session.scope.botId).find((entry) => entry.id === parsed.id)?.path;
+    if (!target) { text(session, "Цей workspace недоступний."); return; }
+    if (target === session.workspace) { text(session, "Цей workspace уже обрано."); return; }
+    launch((async () => {
+      await stopScope(session);
+      if (stopped || closing || store.runs.active(session.scope) || barriers.has(scopeKey(session.scope))) return;
+      barrier(session, async (signal) => {
+        await runtime.disconnect(session.scope, session.id);
+        signal.throwIfAborted();
+        for (const input of store.inbox.queued(session.scope)) store.inbox.cancelQueued(session.scope, input.sessionId);
+        held.delete(scopeKey(session.scope));
+        const fresh = createSession(session.scope, target);
+        await open(fresh, signal);
+        signal.throwIfAborted();
+        text(fresh, `Workspace змінено. Створено нову сесію без попередньої історії. Початкова модель: ${fresh.appliedModel}.`);
+      });
+    })());
+  }
   function command(session: Session, message: IncomingMessage): void {
     const name = message.command!.name.toLowerCase().replace(/^\//, "");
     if (name === "stop") { launch(stopScope(session)); return; }
@@ -723,6 +959,8 @@ export function createApplication(options: ApplicationOptions): Application {
       case "status": status(session); break;
       case "model": barrier(session, (signal) => models(session, 0, signal)); break;
       case "sessions": sessions(session, 0); break;
+      case "workspace": workspaceCommand(session, message.command!.arguments); break;
+      case "proactive": text(session, handleProactiveCommand(store, config, session.scope, message.command!.arguments).text); break;
       case "new":
         launch((async () => {
           await stopScope(session);
@@ -732,7 +970,7 @@ export function createApplication(options: ApplicationOptions): Application {
             signal.throwIfAborted();
             for (const input of store.inbox.queued(session.scope)) store.inbox.cancelQueued(session.scope, input.sessionId);
             held.delete(scopeKey(session.scope));
-            const fresh = createSession(session.scope);
+            const fresh = createSession(session.scope, session.workspace);
             await open(fresh, signal);
             signal.throwIfAborted();
             text(fresh, `Нову сесію створено. Початкова модель: ${fresh.appliedModel}. Попередню історію збережено.`);
@@ -761,6 +999,10 @@ export function createApplication(options: ApplicationOptions): Application {
         return;
       }
       const session = current(ingress.scope);
+      if (!workspaceAuthorized(session.scope, session.workspace)) {
+        text(session, workspaceRequiredText(config.config, session), `workspace-required:${ingress.updateId}`);
+        return;
+      }
       if (ingress.replyToMessageId !== undefined) {
         const prompt = store.outbox.list(ingress.scope).find((entry) => entry.payload.kind === "request" &&
           entry.payload.requestId && entry.remoteMessageIds.includes(ingress.replyToMessageId!));
@@ -802,7 +1044,7 @@ export function createApplication(options: ApplicationOptions): Application {
       controls.clear();
       requestFields.clear();
       for (const binding of config.config.bindings) {
-        const scope: Scope = { ownerId: config.config.ownerId, botId: binding.botId,
+        const scope: Scope = { ownerId: scopeOwnerId(config.config, binding), botId: binding.botId,
           chatId: binding.chatId, topicId: binding.topicId };
         for (const session of store.sessions.list(scope)) {
           if (session.pendingModel && store.sessions.clearPendingModel(scope, session.id, session.pendingModel)) {
@@ -827,6 +1069,8 @@ export function createApplication(options: ApplicationOptions): Application {
     async drain() {
       while (jobs.size) await Promise.allSettled([...jobs]);
     },
+    triggerProactive,
+    notifyCoordinator,
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       closing = true;

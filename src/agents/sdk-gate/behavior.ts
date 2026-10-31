@@ -218,6 +218,8 @@ export async function runBehavior(
     return "REAL_ROOT_DELTA; ROOT_MESSAGE_CORRELATED_TO_SEND; TERMINAL_ROOT_IDLE";
   });
 
+  // Isolated SDK capability probes, not Telegram session policy. Production
+  // sessions exclude ask_user and register neither user-input nor elicitation handlers.
   await check("user-question", async () => {
     let requests = 0;
     let scoped = false;

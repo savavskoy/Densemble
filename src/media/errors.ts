@@ -21,7 +21,10 @@ export const mediaMessages = {
   MEDIA_AUDIO_TOO_LONG: "Voice messages must be at most 10 minutes long.",
   MEDIA_AUDIO_INVALID: "The voice message is damaged or its actual duration cannot be verified.",
   MEDIA_AUDIO_TOOLS_MISSING: "Local voice recognition is not configured. Explicitly install/configure ffmpeg, ffprobe and whisper.cpp first.",
-  MEDIA_AUDIO_MODEL_MISSING: "Provision and configure the multilingual Whisper small model explicitly. No model is downloaded automatically.",
+  MEDIA_AUDIO_MODEL_MISSING: "Provision and configure a multilingual whisper.cpp model explicitly. No model is downloaded automatically.",
+  MEDIA_AUDIO_MODEL_ENGLISH_ONLY: "The configured Whisper model is English-only (.en). Configure a multilingual Whisper model.",
+  MEDIA_AUDIO_MODEL_UNSUPPORTED: "The configured file is not a supported multilingual whisper.cpp model, or it is damaged.",
+  MEDIA_AUDIO_VAD_MODEL_INVALID: "The configured voice-activity (VAD) model is missing or invalid.",
   MEDIA_AUDIO_FAILED: "Local voice recognition failed. Please send text instead.",
 } as const;
 

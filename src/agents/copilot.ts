@@ -2,30 +2,64 @@ import { lstat, mkdir, readFile, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CopilotClient, defineTool, RuntimeConnection, ToolSet } from "@github/copilot-sdk";
+import { z } from "zod";
 import type {
-  CopilotClientOptions, CopilotSession, ElicitationFieldValue, ElicitationSchema, MCPServerConfig,
+  CopilotClientOptions, CopilotSession, MCPServerConfig,
   ModelInfo as SdkModel, PermissionRequest, ResumeSessionConfig, SessionConfig, SessionEvent,
 } from "@github/copilot-sdk";
-import type { LoadedConfig } from "../config/index.js";
+import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, type LoadedConfig } from "../config/index.js";
 import type { ModelInfo, RequestAnswer, RequestPayload, RunIdentity, RuntimeCommand, Scope } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type { DiagnosticSink } from "../ports.js";
 import { opaqueId, sanitizeParameters } from "../permissions/index.js";
-import type { ControlledRuntime, ControlledSessionOptions } from "./contracts.js";
+import type { ControlledRuntime, ControlledSessionOptions, ProactivityRequest } from "./contracts.js";
 import { bounded, RuntimeError } from "./contracts.js";
+import { workspaceViolation } from "./workspace-guard.js";
+import { copilotModuleTool, type ModuleToolGuard } from "./module-tools.js";
+import type { ModuleHost } from "../modules/host.js";
+import { buildSessionModules } from "../modules/instructions.js";
+import { DENSEMBLE_STATE } from "../modules/state.js";
 import { ProcessSupervisor, recoverOwnedProcesses } from "./supervisor.js";
 import type { ProcessFailure } from "./supervisor.js";
 
 const builtinTools = [
   "bash", "read_bash", "stop_bash", "list_bash", "view", "glob", "grep", "rg", "edit", "create",
-  "apply_patch", "skill", "task", "read_agent", "write_agent", "list_agents", "ask_user", "report_intent", "web_fetch",
+  "apply_patch", "skill", "task", "read_agent", "write_agent", "list_agents", "report_intent", "web_fetch",
 ];
-const excludedTools = ["store_memory", "session_store", "session_store_sql", "session_history", "search_sessions"];
+// Telegram clarification is a normal completed turn, never an SDK form.
+const excludedTools = ["ask_user", "store_memory", "session_store", "session_store_sql", "session_history", "search_sessions"];
 const ownedSessionPattern = /^densemble-[a-f0-9-]{36}$/;
 const permissionNames: Partial<Record<PermissionRequest["kind"], string>> = {
   shell: "Виконати команду", read: "Прочитати файл", write: "Змінити файл", mcp: "Викликати MCP-інструмент",
   url: "Відкрити мережевий ресурс", "custom-tool": "Викликати інструмент сервісу", hook: "Виконати обробник",
 };
+export const proactivityRequestSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("schedule"),
+    kind: z.enum(["oneoff", "recurring", "silent"]),
+    schedule: z.discriminatedUnion("type", [
+      z.object({ type: z.literal("once"), at: z.number().int().nonnegative() }).strict(),
+      z.object({ type: z.literal("interval"), everyMs: z.number().int().positive() }).strict(),
+      z.object({
+        type: z.literal("weekly"),
+        daysOfWeek: z.array(z.number().int().min(0).max(6)).min(1),
+        hour: z.number().int().min(0).max(23),
+        minute: z.number().int().min(0).max(59),
+      }).strict(),
+      z.object({
+        type: z.literal("monthly"),
+        daysOfMonth: z.array(z.number().int().min(1).max(31)).min(1),
+        hour: z.number().int().min(0).max(23),
+        minute: z.number().int().min(0).max(59),
+      }).strict(),
+    ]),
+    purpose: z.string().trim().min(1),
+  }).strict(),
+  z.object({ action: z.literal("list") }).strict(),
+  z.object({ action: z.literal("cancel"), id: z.string().trim().min(1) }).strict(),
+  z.object({ action: z.literal("pause") }).strict(),
+  z.object({ action: z.literal("resume") }).strict(),
+]);
 type NativeSession = Pick<CopilotSession, "sessionId" | "send" | "abort" | "disconnect" | "setModel"> & {
   rpc: { model: Pick<CopilotSession["rpc"]["model"], "getCurrent"> };
 };
@@ -48,6 +82,8 @@ export interface CopilotRuntimeOptions {
   abortGraceMs?: number;
   requestTimeoutMs?: number;
   previewIntervalMs?: number;
+  /** Resolved module host: its declared abilities join the fixed tool set; sessions get their allowed ones. */
+  modules?: ModuleHost;
 }
 type Waiting = { identity: RunIdentity; payload: RequestPayload; resolve: (answer: RequestAnswer | null) => void };
 type Turn = {
@@ -94,6 +130,12 @@ export function serviceClientOptions(config: LoadedConfig, cli: string): Copilot
     },
     useLoggedInUser: true, enableRemoteSessions: false, logLevel: "none",
   };
+}
+
+// The configured display name is only an addressing hint set by the service owner; identity is never inferred from chat text.
+function userLabel(displayName: string | undefined): string {
+  const name = displayName?.replace(/\s+/g, " ").trim();
+  return name ? `${name} (a configured user)` : "a user";
 }
 
 export function detachedAction(tool: string, args: unknown): boolean {
@@ -167,56 +209,17 @@ async function sessionHistoryExists(home: string, sessionId: string): Promise<bo
   }
 }
 
-export function questionFields(schema: ElicitationSchema, message: string): RequestPayload {
-  const fields = Object.entries(schema.properties).map(([sourceId, field], index) => {
-    const id = `field_${index}`;
-    if (field.type === "array") {
-      const choices = "enum" in field.items ? field.items.enum : field.items.anyOf.map((entry) => entry.const);
-      return { id, prompt: field.title ?? field.description ?? sourceId, choices, multiple: true, allowFreeform: false };
-    }
-    const choices = field.type === "boolean" ? ["Так", "Ні"] :
-      "enum" in field ? field.enum : "oneOf" in field ? field.oneOf.map((entry) => entry.const) : [];
-    return { id, prompt: field.title ?? field.description ?? sourceId, choices, multiple: false, allowFreeform: choices.length === 0 };
-  });
-  if (!fields.length || fields.length > 20) throw new RuntimeError("QUESTION_SCHEMA_UNSUPPORTED");
-  fields[0]!.prompt = `${message}\n${fields[0]!.prompt}`;
-  return { kind: "question", fields };
-}
-function elicitationContent(schema: ElicitationSchema, answer: RequestAnswer | null): Record<string, ElicitationFieldValue> | null {
-  if (answer?.kind !== "question") return null;
-  const content: Record<string, ElicitationFieldValue> = Object.create(null) as Record<string, ElicitationFieldValue>;
-  for (const [index, [key, field]] of Object.entries(schema.properties).entries()) {
-    const values = answer.answers[`field_${index}`];
-    if (!values?.length) return null;
-    const value = values[0]!;
-    if (field.type === "number" || field.type === "integer") {
-      const number = Number(value);
-      if (!Number.isFinite(number) || (field.type === "integer" && !Number.isInteger(number)) ||
-          (field.minimum !== undefined && number < field.minimum) || (field.maximum !== undefined && number > field.maximum)) return null;
-      content[key] = number;
-    } else if (field.type === "boolean") {
-      if (!["Так", "Ні"].includes(value)) return null;
-      content[key] = value === "Так";
-    } else if (field.type === "array") {
-      if ((field.minItems !== undefined && values.length < field.minItems) ||
-          (field.maxItems !== undefined && values.length > field.maxItems)) return null;
-      content[key] = values;
-    } else {
-      if (("minLength" in field && field.minLength !== undefined && value.length < field.minLength) ||
-          ("maxLength" in field && field.maxLength !== undefined && value.length > field.maxLength)) return null;
-      content[key] = value;
-    }
-  }
-  return content;
-}
-
 export function createCopilotRuntime(options: CopilotRuntimeOptions): ControlledRuntime {
   const { config, diagnostics } = options;
   const slots = new Map<string, Slot>();
   let shuttingDown = false;
   const secrets: string[] = [];
   const mcpServers: Record<string, MCPServerConfig> = {};
-  const tools = new ToolSet().addBuiltIn(builtinTools).addCustom("densemble_export_file");
+  const tools = new ToolSet().addBuiltIn(builtinTools).addCustom("densemble_export_file").addCustom("densemble_manage_proactivity");
+  if (options.modules) {
+    // `availableTools` is fixed here, so the host must be resolved before the runtime is created.
+    for (const name of [DENSEMBLE_STATE, ...options.modules.declaredAbilityNames()]) tools.addCustom(name);
+  }
   if (config.config.mcp.mode === "allowlist") {
     for (const declaration of config.config.mcp.servers) {
       const secret = (reference: string): string => {
@@ -267,7 +270,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       return existing;
     }
     const host = hostFactory();
-    const slot: Slot = { scope, sessionId, host, ready: Promise.resolve(), requests: new Map(), exportGrants: new Map(),
+    const slot: Slot = { scope, sessionId, host, ready: Promise.resolve(), requests: new Map(),
+      exportGrants: new Map(),
       closing: false, switching: false, forcedClose: false };
     slots.set(key, slot);
     slot.ready = host.then(async (owner) => {
@@ -350,8 +354,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
     if (!live(slot, turn) || !turn.idle || turn.sending > 0) return;
     turn.terminal = true;
     revoke(slot);
-    const text = [...turn.messages.values()].filter((message) => message.origin && turn.sendIds.has(message.origin))
-      .map((message) => message.text).join("\n\n");
+    const roots = [...turn.messages.values()].filter((message) => message.origin && turn.sendIds.has(message.origin));
+    const text = roots.length ? roots[roots.length - 1]!.text : "";
     if (turn.errored || turn.aborted || !text) emit(slot, { ...turn.identity, kind: "failed", code: "RUNTIME_TURN_FAILED" });
     else emit(slot, { ...turn.identity, kind: "completed", text });
   }
@@ -373,6 +377,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         }
         break;
       case "assistant.message":
+        turn.preview = "";
+        turn.lastPreview = 0;
         turn.messages.set(event.data.messageId, { text: event.data.content,
           ...(event.data.originatingMessageId ? { origin: event.data.originatingMessageId } : {}) });
         break;
@@ -409,8 +415,32 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
   }
   async function sessionConfig(slot: Slot, supplied: ControlledSessionOptions): Promise<SessionConfig> {
     const session = supplied.session;
-    const agents = config.agents;
+    const user = session.scope.ownerId;
+    const owner = user === config.config.ownerId;
+    const match = authorizedWorkspace(config.config, user, session.scope.botId, session.workspace);
+    if (!match) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
+    // Non-owner sessions see only the agents their workspace permits.
+    const agents = match === DEFAULT_WORKSPACE_ID ? config.agents : config.agents.filter((agent) => match.agentIds.includes(agent.id));
+    const forbiddenRoots = owner ? [] : [
+      config.config.workspacePath, config.config.runtimeDataPath, config.config.runtimeHomePath, config.config.secretsPath,
+      config.config.interactiveHomePath ?? "", ...(config.config.workspaces ?? []).map((entry) => entry.path)
+        .filter((path) => path !== session.workspace),
+    ].filter((path) => Boolean(path) && path !== session.workspace);
     if (!agents.some((agent) => agent.id === session.agentId)) throw new RuntimeError("RUNTIME_AGENT_MISSING");
+    const sessionModules = options.modules
+      ? await buildSessionModules(options.modules, { agentId: session.agentId, owner })
+      : { instructions: "", abilities: [] };
+    const moduleNames = sessionModules.abilities.map((ability) => ability.spec.name);
+    const readOnlyModuleTools = new Set(sessionModules.abilities.filter((ability) => ability.spec.readOnly).map((ability) => ability.spec.name));
+    const moduleGuard: ModuleToolGuard | undefined = options.modules && {
+      host: options.modules, diagnostics,
+      call: (invocation) => {
+        const turn = slot.turn;
+        if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId) return undefined;
+        return { scope: slot.scope, agentId: session.agentId, userId: user, owner, workspace: session.workspace,
+          signal: invocation.signal ? AbortSignal.any([turn.controller.signal, invocation.signal]) : turn.controller.signal };
+      },
+    };
     const models = await (await slot.host).client.listModels();
     const allowed = models.filter((model) => model.policy?.state !== "disabled").map((model) => model.id);
     for (const model of [session.appliedModel, ...agents.filter((agent) => agent.id !== session.agentId).map((agent) => agent.defaultModel)]) {
@@ -420,7 +450,10 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       name: agent.id, description: agent.description,
       model: agent.id === session.agentId ? session.appliedModel : agent.defaultModel,
       prompt: `Source: ${relative(session.workspace, agent.canonicalPath)}\n${await readFile(agent.canonicalPath, "utf8")}`,
-      ...(agent.tools ? { tools: agent.tools.filter((name) => !excludedTools.includes(name)) } : {}),
+      // Module access is decided by `modules.<id>.agents`, not by a launcher allowlist: the session agent's allowed
+      // module tools are appended to its allowlist so Copilot does not hide them.
+      ...(agent.tools ? { tools: [...agent.tools.filter((name) => !excludedTools.includes(name)),
+        ...(agent.id === session.agentId ? moduleNames.filter((name) => !agent.tools!.includes(name)) : [])] } : {}),
       ...(agent.infer === undefined ? {} : { infer: agent.infer }),
     })));
     return {
@@ -428,19 +461,29 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       agent: session.agentId, customAgents, customAgentsLocalOnly: true,
       workingDirectory: session.workspace, configDirectory: config.config.runtimeHomePath,
       enableConfigDiscovery: false, skipCustomInstructions: false,
-      instructionDirectories: [session.workspace], skillDirectories: config.config.skillDirectories, enableSkills: true,
-      pluginDirectories: [], includedBuiltinSkills: [], mcpServers,
+      instructionDirectories: [session.workspace], skillDirectories: owner ? config.config.skillDirectories : [], enableSkills: owner,
+      pluginDirectories: [], includedBuiltinSkills: [], mcpServers: owner ? mcpServers : {},
       excludedBuiltinAgents: ["explore", "task", "general-purpose", "code-review", "research", "security-review"],
       enableFileHooks: false, enableHostGitOperations: false, enableOnDemandInstructionDiscovery: false,
       enableSessionStore: false, memory: { enabled: false }, skipEmbeddingRetrieval: true,
       embeddingCacheStorage: "in-memory", enableSessionTelemetry: false, manageScheduleEnabled: false,
       remoteSession: "off", streaming: true, includeSubAgentStreamingEvents: true,
       availableTools: tools, excludedTools,
+      // No user-input/elicitation handlers: do not advertise either SDK capability.
+      systemMessage: { mode: "append", content: (owner
+        ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
+          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
+        : `You are chatting with ${userLabel(config.config.users?.find((entry) => entry.telegramUserId === user)?.displayName)} in Telegram. ` +
+          "Do not use structured question forms. " +
+          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply. " +
+          "Work only inside the current workspace directory; never read, list or modify anything outside it, including repository metadata.") +
+        (sessionModules.instructions ? `\n\n${sessionModules.instructions}` : "") },
       onEvent: (event) => eventFor(slot, event),
       onPermissionRequest: async (permission, invocation) => {
         const turn = slot.turn;
         const native = slot.native;
-        if (!native || !turn || !live(slot, turn) || invocation.sessionId !== native.sessionId || permissionDenied(permission)) return { kind: "reject" };
+        if (!native || !turn || !live(slot, turn) || invocation.sessionId !== native.sessionId || permissionDenied(permission) ||
+            (!owner && workspaceViolation(permission, forbiddenRoots))) return { kind: "reject" };
         if (config.config.permissionMode === "manual") {
           const answer = await request(slot, { kind: "permission", action: permissionNames[permission.kind] ?? "Зовнішня дія",
             parameters: sanitizeParameters(permission, secrets) });
@@ -457,35 +500,14 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         }
         return { kind: "approve-once" };
       },
-      onUserInputRequest: async (question, invocation) => {
-        const turn = slot.turn;
-        if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId) throw new RuntimeError("QUESTION_SESSION_MISMATCH");
-        const choices = question.choices ?? [];
-        const answer = await request(slot, { kind: "question", fields: [{
-          id: "answer", prompt: question.question, choices, multiple: false, allowFreeform: question.allowFreeform ?? true,
-        }] });
-        if (!live(slot, turn) || answer?.kind !== "question" || !answer.answers.answer?.[0]) throw new RuntimeError("QUESTION_CANCELLED");
-        return { answer: answer.answers.answer[0], wasFreeform: !choices.includes(answer.answers.answer[0]) };
-      },
-      askUserVariant: "elicitation",
-      onElicitationRequest: async (context) => {
-        const turn = slot.turn;
-        if (!turn || !live(slot, turn) || context.sessionId !== slot.native?.sessionId ||
-            context.mode === "url" || !context.requestedSchema) return { action: "cancel" };
-        const schema = context.requestedSchema;
-        for (;;) {
-          const answer = await request(slot, questionFields(schema, context.message));
-          if (!answer || !live(slot, turn)) return { action: "cancel" };
-          const content = elicitationContent(schema, answer);
-          if (content) return { action: "accept", content };
-          if (!slot.turn || !live(slot, slot.turn)) return { action: "cancel" };
-          emit(slot, { ...slot.turn.identity, kind: "status", status: "Відповідь не відповідає формі. Спробуйте ще раз." });
-        }
-      },
       hooks: { onPreToolUse: (input, invocation) => {
         if (invocation.sessionId !== slot.native?.sessionId || !slot.turn || !live(slot, slot.turn)) {
           diagnostics.record("TOOL_STALE_RUN_REJECTED");
           return { permissionDecision: "deny", permissionDecisionReason: "Дія не належить живому керованому виконанню." };
+        }
+        if (!owner && workspaceViolation(input.toolArgs, forbiddenRoots)) {
+          diagnostics.record("TOOL_WORKSPACE_BOUNDARY_REJECTED");
+          return { permissionDecision: "deny", permissionDecisionReason: "Дія виходить за межі поточного workspace." };
         }
         if (detachedAction(input.toolName, input.toolArgs)) {
           diagnostics.record("TOOL_DETACHED_ACTION_REJECTED");
@@ -495,25 +517,92 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
           diagnostics.record("TOOL_EXCLUDED_REJECTED");
           return { permissionDecision: "deny", permissionDecisionReason: "Цей інструмент вимкнений у керованому сервісі." };
         }
+        if (input.toolName === "densemble_manage_proactivity") {
+          return { permissionDecision: "allow", permissionDecisionReason: "Дозволений інструмент управління нагадуваннями Densemble." };
+        }
+        if (readOnlyModuleTools.has(input.toolName)) {
+          return { permissionDecision: "allow", permissionDecisionReason: "Дозволений інструмент Densemble лише для читання." };
+        }
         return { permissionDecision: "ask" };
       } },
-      tools: [defineTool("densemble_export_file", {
-        description: "Return a generated workspace file to this conversation under the configured permission policy. A path mentioned in text is not an export.",
-        parameters: { type: "object", properties: { path: { type: "string", minLength: 1,
-          description: "Absolute path or a path relative to the configured workspace." } }, required: ["path"], additionalProperties: false },
-        handler: async (args: { path: string }, invocation) => {
-          const turn = slot.turn;
-          if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId || !supplied.exportFile) {
-            throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
-          }
-          if (slot.exportGrants.get(invocation.toolCallId) !== args.path) throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
-          slot.exportGrants.delete(invocation.toolCallId);
-          const signal = invocation.signal ? AbortSignal.any([turn.controller.signal, invocation.signal]) : turn.controller.signal;
-          const attachment = await supplied.exportFile(turn.identity, args.path, signal);
-          if (!live(slot, turn)) throw new RuntimeError("EXPORT_CANCELLED");
-          return { status: "prepared_for_delivery", fileName: attachment.fileName };
-        },
-      })],
+      tools: [
+        defineTool("densemble_export_file", {
+          description: "Return a generated workspace file to this conversation under the configured permission policy. A path mentioned in text is not an export.",
+          parameters: { type: "object", properties: { path: { type: "string", minLength: 1,
+            description: "Absolute path or a path relative to the configured workspace." } }, required: ["path"], additionalProperties: false },
+          handler: async (args: { path: string }, invocation) => {
+            const turn = slot.turn;
+            if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId || !supplied.exportFile) {
+              throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
+            }
+            if (slot.exportGrants.get(invocation.toolCallId) !== args.path) throw new RuntimeError("EXPORT_NOT_AUTHORIZED");
+            slot.exportGrants.delete(invocation.toolCallId);
+            const signal = invocation.signal ? AbortSignal.any([turn.controller.signal, invocation.signal]) : turn.controller.signal;
+            const attachment = await supplied.exportFile(turn.identity, args.path, signal);
+            if (!live(slot, turn)) throw new RuntimeError("EXPORT_CANCELLED");
+            return { status: "prepared_for_delivery", fileName: attachment.fileName };
+          },
+        }),
+        defineTool("densemble_manage_proactivity", {
+          description: "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to Oleh.",
+          skipPermission: true,
+          parameters: {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["schedule", "list", "cancel", "pause", "resume"] },
+              kind: { type: "string", enum: ["oneoff", "recurring", "silent"] },
+              schedule: {
+                oneOf: [
+                  { type: "object", properties: { type: { const: "once" }, at: { type: "integer", minimum: 0 } },
+                    required: ["type", "at"], additionalProperties: false },
+                  { type: "object", properties: { type: { const: "interval" }, everyMs: { type: "integer", minimum: 1 } },
+                    required: ["type", "everyMs"], additionalProperties: false },
+                  { type: "object", properties: {
+                    type: { const: "weekly" },
+                    daysOfWeek: { type: "array", minItems: 1, items: { type: "integer", minimum: 0, maximum: 6 } },
+                    hour: { type: "integer", minimum: 0, maximum: 23 },
+                    minute: { type: "integer", minimum: 0, maximum: 59 },
+                  }, required: ["type", "daysOfWeek", "hour", "minute"], additionalProperties: false },
+                  { type: "object", properties: {
+                    type: { const: "monthly" },
+                    daysOfMonth: { type: "array", minItems: 1, items: { type: "integer", minimum: 1, maximum: 31 } },
+                    hour: { type: "integer", minimum: 0, maximum: 23 },
+                    minute: { type: "integer", minimum: 0, maximum: 59 },
+                  }, required: ["type", "daysOfMonth", "hour", "minute"], additionalProperties: false },
+                ],
+              },
+              purpose: { type: "string", minLength: 1 },
+              id: { type: "string", minLength: 1 },
+            },
+            required: ["action"],
+            additionalProperties: false,
+          },
+          handler: async (args: ProactivityRequest, invocation) => {
+            const turn = slot.turn;
+            const parsed = proactivityRequestSchema.safeParse(args);
+            const action = parsed.success ? parsed.data.action : (typeof args?.action === "string" ? (args.action as ProactivityRequest["action"]) : "schedule");
+            if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId) {
+              diagnostics.record("PROACTIVITY_TOOL_REJECTED", { reason: "stale_or_not_live" });
+              return { ok: false, action, code: "RUNTIME_NOT_LIVE", message: "Кероване виконання неактивне або запит не належить поточній сесії." };
+            }
+            if (!supplied.proactivity) {
+              diagnostics.record("PROACTIVITY_TOOL_REJECTED", { reason: "not_configured" });
+              return { ok: false, action, code: "NOT_CONFIGURED", message: "Проактивність не підключена до цього агента." };
+            }
+            if (!parsed.success) {
+              diagnostics.record("PROACTIVITY_TOOL_INVALID_REQUEST");
+              return { ok: false, action, code: "INVALID_REQUEST", message: `Невірний запит до proactivity: ${parsed.error.message}` };
+            }
+            const result = await supplied.proactivity(slot.scope, supplied.session.agentId, parsed.data);
+            if (!live(slot, turn)) {
+              diagnostics.record("PROACTIVITY_TOOL_CANCELLED");
+              return { ok: false, action: parsed.data.action, code: "CANCELLED", message: "Виконання було зупинено до завершення запиту." };
+            }
+            return result;
+          },
+        }),
+        ...(moduleGuard ? sessionModules.abilities.map((ability) => copilotModuleTool(ability, moduleGuard)) : []),
+      ],
     };
   }
   function close(slot: Slot): Promise<void> {
@@ -559,6 +648,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
     recoverOwnedProcesses: () => recoverOwnedProcesses(config.config.runtimeDataPath),
     async open(supplied) {
       supplied.signal?.throwIfAborted();
+      if (supplied.session.engine !== "copilot") throw new RuntimeError("SESSION_ENGINE_MISMATCH");
       const slot = slotFor(supplied.session.scope, supplied.session.id);
       slot.options = supplied;
       if (slot.native) return { providerSessionId: slot.native.sessionId };

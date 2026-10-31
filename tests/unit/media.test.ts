@@ -11,6 +11,7 @@ import { openStore } from "../../src/storage/index.js";
 import { createMediaPipeline, MEDIA_LIMITS, MediaError, mediaMessages, type MediaPipeline, type MediaPipelineOptions } from "../../src/media/index.js";
 import { extractFile } from "../../src/media/extraction.js";
 import * as mediaPaths from "../../src/media/paths.js";
+import { runManagedProcess, type ProcessControl } from "../../src/media/process.js";
 
 const scope: Scope = { ownerId: 111, botId: "synthetic", chatId: 111, topicId: null };
 let root: string;
@@ -551,5 +552,89 @@ describe("ownership, export policy and lifecycle", () => {
     expect(existsSync(orphan)).toBe(false);
     expect(readFileSync(join(foreign, "keep.txt"), "utf8")).toBe("foreign");
     expect(readFileSync(join(workspace, "keep.txt"), "utf8")).toBe("workspace");
+  });
+});
+
+describe("streamed, pausable owned processes", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const ticker = "let i=0;setInterval(()=>process.stderr.write(`tick ${i++}\\n`),20)";
+  it("streams stderr lines without accumulating or bounding them, and can discard stdout", async () => {
+    const lines: string[] = [];
+    const source = "process.stderr.write('a\\r\\nb\\rc\\n\\n'+'x'.repeat(5000)+'\\n');process.stdout.write('y'.repeat(5000));" +
+      "process.stderr.write('ü tail')";
+    const result = await runManagedProcess(process.execPath, ["-e", source], { signal: signal(), timeoutMs: 2000,
+      maxOutputBytes: 100, discardStdout: true, onStderrLine: (line) => { lines.push(line); throw new Error("ignored"); } });
+    expect(result).toEqual({ stdout: "", stderr: "" });
+    expect(lines).toEqual(["a", "b", "c", "x".repeat(5000), "ü tail"]);
+    const long: string[] = [];
+    await runManagedProcess(process.execPath, ["-e", "process.stderr.write('z'.repeat(20000))"],
+      { signal: signal(), timeoutMs: 2000, onStderrLine: (line) => long.push(line) });
+    expect(long.join("")).toBe("z".repeat(20000));
+    expect(Math.max(...long.map((line) => line.length))).toBeLessThanOrEqual(8192);
+    await expect(runManagedProcess(process.execPath, ["-e", "process.stdout.write('y'.repeat(5000))"],
+      { signal: signal(), timeoutMs: 2000, maxOutputBytes: 100, onStderrLine: () => undefined }))
+      .rejects.toMatchObject({ code: "MEDIA_AUDIO_FAILED" });
+  });
+  it("pauses and resumes real progress without spending the timeout while paused", async () => {
+    const lines: string[] = [];
+    let control!: ProcessControl;
+    const abort = new AbortController();
+    const pending = runManagedProcess(process.execPath, ["-e", ticker], { signal: abort.signal, timeoutMs: 1000,
+      onStderrLine: (line) => lines.push(line), onSpawn: (value) => { control = value; } });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "MEDIA_ABORTED" });
+    try {
+      for (let i = 0; i < 100 && lines.length < 3; i++) await sleep(10);
+      expect(lines.length).toBeGreaterThanOrEqual(3);
+      control.pause();
+      control.pause();
+      expect(control.paused).toBe(true);
+      await sleep(100);
+      const frozen = lines.length;
+      await sleep(1200);
+      expect(lines.length).toBe(frozen);
+      control.resume();
+      control.resume();
+      expect(control.paused).toBe(false);
+      for (let i = 0; i < 100 && lines.length < frozen + 3; i++) await sleep(10);
+      expect(lines.length).toBeGreaterThanOrEqual(frozen + 3);
+      abort.abort();
+      await rejected;
+      expect(control.paused).toBe(false);
+    } finally {
+      abort.abort();
+      await Promise.allSettled([pending]);
+    }
+  }, 5000);
+  it("still times out once its own running time exceeds the budget after resume", async () => {
+    let control!: ProcessControl;
+    const pending = runManagedProcess(process.execPath, ["-e", "setInterval(()=>{},1000)"],
+      { signal: signal(), timeoutMs: 300, onSpawn: (value) => { control = value; } });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "MEDIA_TIMEOUT" });
+    control.pause();
+    await sleep(600);
+    control.resume();
+    const resumedAt = Date.now();
+    await rejected;
+    expect(Date.now() - resumedAt).toBeGreaterThan(100);
+  });
+  it("aborts a paused process promptly and leaves no stopped process behind", async () => {
+    let control!: ProcessControl;
+    const abort = new AbortController();
+    const lines: string[] = [];
+    const pending = runManagedProcess(process.execPath, ["-e", "process.stderr.write(`pid ${process.pid}\\n`);" + ticker],
+      { signal: abort.signal, timeoutMs: 5000, onStderrLine: (line) => lines.push(line), onSpawn: (value) => { control = value; } });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "MEDIA_ABORTED" });
+    for (let i = 0; i < 100 && lines.length < 2; i++) await sleep(10);
+    const pid = Number(lines[0]?.split(" ")[1]);
+    expect(pid).toBeGreaterThan(0);
+    control.pause();
+    await sleep(50);
+    const started = Date.now();
+    abort.abort();
+    await rejected;
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(() => process.kill(pid, 0)).toThrow();
+    control.pause();
+    expect(control.paused).toBe(false);
   });
 });

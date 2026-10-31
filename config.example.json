@@ -9,12 +9,66 @@
     "/absolute/path/to/agent-workspace/agent/skills"
   ],
   "ownerId": 1,
+  "users": [
+    {
+      "telegramUserId": 2,
+      "displayName": "Example second user",
+      "allowedBotIds": [
+        "example-bot"
+      ]
+    }
+  ],
+  "workspaces": [
+    {
+      "id": "shared-notes",
+      "name": "Shared notes",
+      "access": "shared",
+      "ownerUserId": 1,
+      "memberUserIds": [
+        2
+      ],
+      "path": "../knowledge/shared",
+      "agentIds": [
+        "example-agent"
+      ]
+    },
+    {
+      "id": "personal-notes",
+      "name": "Example second user's private notes",
+      "access": "private",
+      "ownerUserId": 2,
+      "path": "../knowledge/personal",
+      "agentIds": [
+        "example-agent"
+      ]
+    }
+  ],
   "permissionMode": "autopilot",
+  "quietHours": {
+    "start": "01:00",
+    "end": "09:30",
+    "timezone": "Europe/Kyiv"
+  },
+  "proactivity": {
+    "minIntervalMs": 1800000,
+    "maxActiveItemsPerAgent": 20
+  },
+  "claudeCode": {
+    "homePath": "./runtime/claude",
+    "defaultModel": "claude-sonnet-5-5"
+  },
   "bots": [
     {
       "id": "example-bot",
       "agentId": "example-agent",
       "tokenRef": "telegram.example_bot_token"
+    },
+    {
+      "id": "example-claude-bot",
+      "agentId": "example-agent",
+      "tokenRef": "telegram.example_claude_bot_token",
+      "engine": "claude-code",
+      "model": "claude-opus-5-5"
     }
   ],
   "bindings": [
@@ -23,9 +77,67 @@
       "chatId": 1,
       "kind": "private",
       "topicId": null
+    },
+    {
+      "botId": "example-bot",
+      "chatId": 2,
+      "kind": "private",
+      "topicId": null
+    },
+    {
+      "botId": "example-claude-bot",
+      "chatId": 1,
+      "kind": "private",
+      "topicId": null
     }
   ],
   "mcp": {
     "mode": "none"
+  },
+  "audio": {
+    "ffmpegPath": "/opt/homebrew/bin/ffmpeg",
+    "ffprobePath": "/opt/homebrew/bin/ffprobe",
+    "whisperPath": "/opt/homebrew/bin/whisper-cli",
+    "modelPath": "./models/ggml-small.bin",
+    "language": "auto",
+    "threads": 4,
+    "vocabulary": [
+      "Example Term",
+      "Lecturer Name"
+    ]
+  },
+  "coordinatorAgentId": "example-agent",
+  "modules": {
+    "recordings": {
+      "enabled": true,
+      "agents": [
+        "example-agent"
+      ],
+      "settings": {
+        "path": "/absolute/path/to/workspace/raw/recordings",
+        "modelPath": "./models/ggml-large-v3-turbo.bin",
+        "vadModelPath": "./models/ggml-silero-v5.1.2.bin",
+        "language": "auto",
+        "threads": 4,
+        "quietMinutes": 2,
+        "pollIntervalMs": 60000,
+        "vad": {
+          "threshold": 0.35,
+          "minSpeechMs": 250,
+          "minSilenceMs": 500,
+          "padMs": 200
+        },
+        "suppressNonSpeech": false,
+        "maxContext": 0,
+        "retry": {
+          "modelPath": "./models/ggml-large-v3.bin"
+        },
+        "silence": {
+          "thresholdDb": -80,
+          "minSeconds": 60
+        },
+        "notifications": true
+      }
+    }
   }
 }

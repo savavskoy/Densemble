@@ -1,6 +1,9 @@
 import type { DiagnosticSink } from "../ports.js";
 
-const scalarFields = new Set(["attempt", "count", "forced", "retryAfter", "externalOutcomeUnknown"]);
+const scalarFields = new Set(["attempt", "count", "forced", "retryAfter", "externalOutcomeUnknown", "reason"]);
+/** Module ids and health states only: fixed lowercase names, never paths or content. */
+const nameFields = new Set(["module", "state"]);
+const safeName = /^[a-z][a-z0-9-]{0,31}$/;
 
 export function createDiagnostics(options: {
   botIds?: string[];
@@ -15,6 +18,7 @@ export function createDiagnostics(options: {
         if (key === "botId" && typeof value === "string" && botIds.has(value)) safe[key] = value;
         else if (scalarFields.has(key) && (value === null || typeof value === "boolean" ||
           (typeof value === "number" && Number.isFinite(value)))) safe[key] = value;
+        else if (nameFields.has(key) && typeof value === "string" && safeName.test(value)) safe[key] = value;
       }
       write(`${JSON.stringify({
         time: new Date().toISOString(),

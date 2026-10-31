@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig } from "./config/index.js";
+import { loadConfig, moduleEntries } from "./config/index.js";
 import { checkedPath, isWithin } from "./config/paths.js";
 import { parseArguments } from "./operations/arguments.js";
 import { createDiagnostics } from "./operations/diagnostics.js";
@@ -31,6 +31,30 @@ async function main(): Promise<void> {
     process.stdout.write(launchdTemplate({
       node: process.execPath, codeRoot, config: resolve(args.config), logs,
     }));
+    return;
+  }
+  if (args.command === "recordings-status") {
+    // Read-only and lock-free: it only reads the snapshot the running service writes.
+    const { formatStatus, readStatus } = await import("./modules/recordings/api.js");
+    const configured = moduleEntries(config.config).some((entry) => entry.id === "recordings" && entry.enabled);
+    // The module's data directory, then the spec 004 location (renamed at the module's first start).
+    const data = config.config.runtimeDataPath;
+    const status = configured ? await readStatus(join(data, "modules", "recordings", "status.json")) ??
+      await readStatus(join(data, "recordings", "status.json")) : undefined;
+    process.stdout.write(args.json
+      ? `${JSON.stringify({ configured, status: status ?? null }, null, 2)}\n`
+      : formatStatus({ configured, status, now: Date.now() }));
+    return;
+  }
+  if (args.command === "modules-status") {
+    // Read-only and lock-free: it only reads the snapshot the running service writes.
+    const { formatModulesStatus, isModulesStateStale, modulesStatePath, readModulesState } = await import("./modules/state.js");
+    const state = await readModulesState(modulesStatePath(config.config.runtimeDataPath));
+    const now = Date.now();
+    const agentId = config.config.coordinatorAgentId;
+    process.stdout.write(args.json
+      ? `${JSON.stringify({ running: Boolean(state && !isModulesStateStale(state, now)), state: state ?? null }, null, 2)}\n`
+      : formatModulesStatus({ state, now, ...(agentId ? { agentId } : {}) }));
     return;
   }
   if (args.command === "start") {

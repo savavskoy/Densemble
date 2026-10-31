@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { open, truncate } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Api, GrammyError, InputFile } from "grammy";
@@ -130,7 +130,7 @@ afterEach(async () => {
   }
 });
 
-describe("normalization and owner/topic boundary", () => {
+describe("normalization and sender/topic authorization boundary", () => {
   it.each([
     { from: { id: 102, is_bot: false, first_name: "Synthetic" } },
     { from: { id: 101, is_bot: true, first_name: "Synthetic" } },
@@ -148,6 +148,16 @@ describe("normalization and owner/topic boundary", () => {
     const input = update(1, { chat: { id: -202, type: "supergroup", is_forum: true }, message_thread_id: 4 });
     expect(normalizeUpdate(config.config, "bot-one", identity, input).kind).toBe("ingress");
     expect(normalizeUpdate(config.config, "bot-other", identity, input).kind).toBe("ignored");
+  });
+  it("routes a configured user to their own private conversation and rejects an unbound sender", () => {
+    config.config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.config.bindings.push({ botId: "bot-one", chatId: 202, topicId: null, kind: "private" });
+    expect(normalizeUpdate(config.config, "bot-one", identity, update(20, {
+      chat: { id: 202, type: "private" }, from: { id: 202, is_bot: false, first_name: "Sonya" },
+    }))).toMatchObject({ kind: "ingress", ingress: { scope: { ownerId: 202, chatId: 202 } } });
+    expect(normalizeUpdate(config.config, "bot-one", identity, update(21, {
+      chat: { id: 203, type: "private" }, from: { id: 203, is_bot: false, first_name: "Unknown" },
+    })).kind).toBe("ignored");
   });
   it("uses offset-zero UTF16 entities, actual username and ignores commands to another bot", () => {
     const text = "/STOP@SyntheticBot 😀 argument";
@@ -230,6 +240,8 @@ describe("durable ordered polling with actual grammY API", () => {
       { command: "model", description: "Переглянути та змінити модель" },
       { command: "new", description: "Створити нову сесію зі збереженням попередньої" },
       { command: "sessions", description: "Переглянути та керувати сесіями цієї розмови" },
+      { command: "workspace", description: "Обрати workspace" },
+      { command: "proactive", description: "Керування проактивними нагадуваннями агента" },
       { command: "stop", description: "Зупинити виконання в цій розмові" },
     ];
     expect(registrations().map((call) => call.payload)).toEqual([
@@ -1197,6 +1209,7 @@ describe("scoped bounded download/upload IO", () => {
   it("rejects pre-created shared/nonprivate destinations and leaves media-owned cleanup to media", async () => {
     const options = downloadOptions();
     writeFileSync(options.destination, "", { flag: "wx", mode: 0o644 });
+    chmodSync(options.destination, 0o644); // Exercise nonprivate mode even under umask 0077.
     await expect(downloadTelegramFile(options)).rejects.toThrow("TG_DESTINATION_REJECTED");
     expect(options.fetch).not.toHaveBeenCalled();
     unlinkSync(options.destination);

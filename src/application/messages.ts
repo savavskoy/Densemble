@@ -3,6 +3,7 @@ import { RuntimeError } from "../agents/contracts.js";
 const failures: Record<string, string> = {
   MODEL_UNAVAILABLE: "Налаштована модель недоступна. Оберіть доступну через /model; модель субагента змінюється в його launcher.",
   MODEL_IMAGES_UNSUPPORTED: "Поточна модель не підтримує зображення. Оберіть іншу через /model і надішліть фото знову.",
+  WORKSPACE_ACCESS_DENIED: "Доступ до цього workspace відсутній. Оберіть доступний через /workspace.",
   MEDIA_ABORTED: "Обробку вкладення скасовано.",
   MEDIA_STALE_RUN: "Виконання вже завершене. Надішліть вкладення в поточну розмову знову.",
   MEDIA_SCOPE_INVALID: "Вкладення не належить цій розмові.",
@@ -27,6 +28,18 @@ const failures: Record<string, string> = {
   MEDIA_AUDIO_TOOLS_MISSING: "Локальне розпізнавання не налаштоване. Потрібні FFmpeg, FFprobe і whisper.cpp.",
   MEDIA_AUDIO_MODEL_MISSING: "Потрібно явно встановити й налаштувати багатомовну модель Whisper. Автоматичного завантаження немає.",
   MEDIA_AUDIO_FAILED: "Локальне розпізнавання не вдалося. Надішліть текст.",
+  CLAUDE_LOGIN_REQUIRED: "Claude Code сервісу не авторизований або вхід застарів. Виконайте `make claude-login` на Mac і перезапустіть сервіс. Copilot-боти працюють як звичайно.",
+  CLAUDE_USAGE_LIMIT: "Вичерпано ліміт підписки Claude. Спробуйте пізніше; на Copilot автоматичного перемикання немає.",
+  CLAUDE_OVERLOADED: "Claude зараз перевантажений. Спробуйте ще раз трохи згодом.",
+  CLAUDE_SERVICE_ERROR: "Сервіс Claude повернув помилку. Спробуйте ще раз; дії автоматично не повторюються.",
+  CLAUDE_ACCOUNT_UNAVAILABLE: "Обліковий запис Claude недоступний. Перевірте підписку в Claude.",
+  CLAUDE_ENGINE_UNAVAILABLE: "Claude Code для сервісу не встановлений або не запускається. Виконайте `npm ci` і `make doctor`.",
+  CLAUDE_CODE_NOT_CONFIGURED: "Рушій Claude Code не налаштований у config.local.json (блок claudeCode).",
+  CLAUDE_SKILLS_UNAVAILABLE: "Claude Code не завантажив навички сервісу. Перевірте skillDirectories і `make doctor`.",
+  RUNTIME_VERSION_MISMATCH: "Версія рушія не збігається із закріпленою. Виконайте `npm ci` і перезапустіть сервіс.",
+  SESSION_HISTORY_MISSING: "Історію цієї сесії не знайдено. Почніть нову через /new.",
+  SESSION_ENGINE_MISMATCH: "Сесію створено іншим рушієм; вона відкривається лише ним.",
+  AGENT_TOOL_UNSUPPORTED: "Агент оголошує інструмент, якого немає в Claude Code. Виправте tools у launcher.",
 };
 
 export function failureCode(error: unknown): string {

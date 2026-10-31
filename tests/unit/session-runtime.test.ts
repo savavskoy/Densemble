@@ -28,6 +28,19 @@ describe("durable admission and priority cancellation", () => {
     expect(f.delivery.deliver).toHaveBeenCalledTimes(1);
     expect(f.store.outbox.list(scope)[0]?.status).toBe("sent");
   });
+  it("routes /proactive list through the command switch and enqueues a text reply", async () => {
+    const f = setup({ autoDelivery: false });
+    await f.app.start(f.store.recover());
+    await f.app.handle(f.message("/proactive list", scope, {
+      command: { name: "proactive", arguments: "list" },
+    }));
+    await f.app.drain();
+    expect(f.store.outbox.list(scope)).toEqual([
+      expect.objectContaining({
+        payload: { kind: "text", text: "Проактивність агента: активна.\nПроактивних елементів немає." },
+      }),
+    ]);
+  });
   it("never claims or remaps an SDK request prompt before or after external transport delivery", async () => {
     const f = setup({ autoDelivery: false });
     const claim = vi.spyOn(f.store.outbox, "claim");
@@ -407,5 +420,30 @@ describe("FIFO media, steering, and conversation controls", () => {
     const sends = f.commands.filter((entry): entry is Extract<RuntimeCommand, { kind: "send" }> => entry.kind === "send");
     expect(sends.map((entry) => entry.input.text)).toEqual(["Interrupted", "Held"]);
     await recovered.shutdown();
+  });
+});
+
+describe("agent self-service proactivity tool wiring", () => {
+  it("wires a real proactivity callback into the opened runtime session so schedule/list/cancel actually persist", async () => {
+    const f = setup();
+    await f.app.handle(f.message()); await f.app.drain();
+    const run = f.store.runs.active(scope)!;
+    const hook = f.hooks.get(run.sessionId)!;
+    expect(hook.proactivity).toBeTypeOf("function");
+
+    const scheduled = await hook.proactivity!(scope, "synthetic-agent", {
+      action: "schedule", kind: "oneoff", schedule: { type: "once", at: Date.now() + 3_600_000 }, purpose: "ping Oleh",
+    });
+    expect(scheduled).toMatchObject({ ok: true, action: "schedule" });
+    expect(scheduled.ok && scheduled.action === "schedule" ? scheduled.item.purpose : null).toBe("ping Oleh");
+    expect(f.store.proactivity.listForScope(scope)).toHaveLength(1);
+
+    const listed = await hook.proactivity!(scope, "synthetic-agent", { action: "list" });
+    expect(listed).toMatchObject({ ok: true, action: "list", items: [{ purpose: "ping Oleh" }] });
+
+    const id = f.store.proactivity.listForScope(scope)[0]!.id;
+    const cancelled = await hook.proactivity!(scope, "synthetic-agent", { action: "cancel", id });
+    expect(cancelled).toEqual({ ok: true, action: "cancel", id, status: "cancelled", message: `Cancelled proactive item ${id}.` });
+    expect(f.store.proactivity.get(scope, id)?.status).toBe("cancelled");
   });
 });

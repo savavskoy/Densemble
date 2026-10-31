@@ -1,12 +1,14 @@
 import type {
-  Attachment, Conversation, DeliveryPayload, IncomingMessage, Json, LogicalInput, ModelInfo,
-  NormalizedIngress, OutboxItem, PendingRequest, PreparedInput, RequestAnswer, RequestPayload,
-  Run, RunIdentity, RuntimeCommand, RuntimeEvent, Scope, Session, TerminalRunStatus,
+  Attachment, Conversation, DeliveryPayload, EngineId, IncomingMessage, Json, LogicalInput, ModelInfo,
+  NormalizedIngress, OutboxItem, PendingRequest, PreparedInput, ProactiveInitiator,
+  ProactiveItem, ProactiveKind, ProactiveOccurrence, ProactiveOccurrenceOutcome, ProactiveSchedule,
+  ProactiveStatus, RequestAnswer, RequestPayload, Run, RunIdentity, RuntimeCommand, RuntimeEvent,
+  Scope, Session, TerminalRunStatus,
 } from "./domain.js";
 
 export interface SessionStore {
   conversation(scope: Scope): Conversation | null;
-  create(scope: Scope, options: { agentId: string; workspace: string; model: string; now?: number }): Session;
+  create(scope: Scope, options: { agentId: string; workspace: string; model: string; engine?: EngineId; now?: number }): Session;
   current(scope: Scope): Session | null;
   get(scope: Scope, sessionId: string): Session | null;
   list(scope: Scope): Session[];
@@ -104,6 +106,28 @@ export interface AttachmentStore {
   expired(now?: number): Attachment[];
   removeExpired(id: string, now?: number): Attachment | null;
 }
+export interface ProactivityStore {
+  create(scope: Scope, options: {
+    agentId: string;
+    kind: ProactiveKind;
+    schedule: ProactiveSchedule;
+    purpose: string;
+    initiator: ProactiveInitiator;
+    nextDueAt: number | null;
+    now?: number;
+  }): ProactiveItem;
+  get(scope: Scope, id: string): ProactiveItem | null;
+  listForScope(scope: Scope): ProactiveItem[];
+  listDue(now: number): ProactiveItem[];
+  countActive(scope: Scope): number;
+  setStatus(scope: Scope, id: string, status: ProactiveStatus, now?: number): boolean;
+  reschedule(scope: Scope, id: string, nextDueAt: number | null, now?: number): boolean;
+  isAgentPaused(scope: Scope): boolean;
+  setAgentPaused(scope: Scope, paused: boolean, now?: number): boolean;
+  recordOccurrence(itemId: string, dueAt: number, late: boolean, now?: number): ProactiveOccurrence;
+  settleOccurrence(id: string, outcome: ProactiveOccurrenceOutcome, now?: number): boolean;
+  syntheticId(occurrenceId: string): number;
+}
 export interface Recovery {
   interruptedRuns: Run[];
   invalidatedRequests: number;
@@ -117,10 +141,13 @@ export interface StateStore {
   requests: RequestStore;
   outbox: OutboxStore;
   attachments: AttachmentStore;
+  proactivity: ProactivityStore;
   recover(now?: number): Recovery;
   cleanup(options: { before: number; now?: number }): { inputs: number; requests: number; outbox: number };
   backup(destination: string): Promise<void>;
   close(): void;
+  /** Runs `fn` inside a single durable transaction spanning any of the sub-stores above. */
+  atomic<T>(fn: () => T): T;
 }
 
 export interface RuntimeSessionOptions {
@@ -133,8 +160,10 @@ export interface AgentRuntime {
   setModel(scope: Scope, sessionId: string, model: string): Promise<void>;
   models(scope: Scope, sessionId: string): Promise<ModelInfo[]>;
   disconnect(scope: Scope, sessionId: string): Promise<void>;
-  deleteSession(scope: Scope, sessionId: string, providerSessionId: string): Promise<void>;
+  deleteSession(scope: Scope, sessionId: string, providerSessionId: string, engine?: EngineId): Promise<void>;
   shutdown(): Promise<void>;
+  /** Whether new input may join an active turn; absent means supported. Unsupported input stays queued. */
+  supportsSteering?(session: Session): boolean;
 }
 export interface MediaPreparation {
   prepare(input: LogicalInput, identity: RunIdentity, signal: AbortSignal): Promise<PreparedInput>;

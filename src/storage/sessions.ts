@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { engineIds } from "../domain.js";
 import type { SessionStore } from "../ports.js";
 import { activeStates, Connection, StateError } from "./database.js";
 import { attachmentRow } from "./rows.js";
@@ -13,7 +14,10 @@ export function sessionStore(db: Connection): SessionStore {
       return { id, scope, currentSessionId: row.current_session_id as string | null, createdAt: row.created_at as number };
     },
     create(scope, options) {
-      if (!options.agentId.trim() || !options.model.trim() || !isAbsolute(options.workspace)) throw new StateError("INVALID_SESSION");
+      const engine = options.engine ?? "copilot";
+      if (!options.agentId.trim() || !options.model.trim() || !isAbsolute(options.workspace) || !engineIds.includes(engine)) {
+        throw new StateError("INVALID_SESSION");
+      }
       return db.atomic(() => {
         const now = options.now ?? Date.now();
         const conversationId = db.ensureConversation(scope, now);
@@ -21,8 +25,8 @@ export function sessionStore(db: Connection): SessionStore {
           throw new StateError("ACTIVE_RUN");
         }
         const id = randomUUID();
-        db.exec(`INSERT INTO sessions(id,conversation_id,agent_id,workspace,applied_model,created_at,updated_at)
-          VALUES(?,?,?,?,?,?,?)`, id, conversationId, options.agentId, options.workspace, options.model, now, now);
+        db.exec(`INSERT INTO sessions(id,conversation_id,agent_id,engine,workspace,applied_model,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?)`, id, conversationId, options.agentId, engine, options.workspace, options.model, now, now);
         db.exec("UPDATE conversations SET current_session_id=? WHERE id=?", id, conversationId);
         return db.session(scope, id)!;
       });

@@ -1,8 +1,26 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { authorizeScope, ConfigError, loadConfig, secretResolver, type ServiceConfig } from "../../src/config/index.js";
+import {
+  authorizeScope,
+  botEngine,
+  ConfigError,
+  defaultProactivityGuardrails,
+  defaultQuietHours,
+  loadConfig,
+  moduleEntries,
+  secretResolver,
+  type LoadedConfig,
+  type ServiceConfig,
+  workspacesFor,
+} from "../../src/config/index.js";
+import { SpeechGate } from "../../src/media/speech-gate.js";
+import type { PrepareResult } from "../../src/modules/contract.js";
+import { createModuleHost } from "../../src/modules/host.js";
+import { createCoreOffer } from "../../src/modules/offer.js";
+import { module } from "../../src/modules/recordings/index.js";
+import { recordingSettings, type RecordingSettings, type RecordingsConfig } from "../../src/modules/recordings/settings.js";
 
 let root: string;
 let source: string;
@@ -58,6 +76,22 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+/** Resolves the real recordings module without starting it; `settings` are the prepared module settings. */
+async function recordingsModule(loaded: LoadedConfig): Promise<{
+  state: string; code: string; settings?: RecordingsConfig; recordingSettings?: RecordingSettings;
+}> {
+  const core = createCoreOffer(loaded, new SpeechGate());
+  const entries = moduleEntries(loaded.config);
+  const host = createModuleHost({ entries, core, runtimeDataPath: loaded.config.runtimeDataPath, diagnostics: { record: () => undefined } });
+  await host.resolve();
+  const health = host.health("recordings")!;
+  if (health.state !== "starting") return { state: health.state, code: health.code };
+  const prepared = module.prepare!(module.settings.parse(entries[0]!.settings), core) as PrepareResult<RecordingsConfig>;
+  if (!prepared.ok) throw new Error("unexpected");
+  return { state: health.state, code: health.code, settings: prepared.settings,
+    recordingSettings: recordingSettings(prepared.settings, core.audio) };
+}
+
 describe("private configuration and discovery", () => {
   it("defaults to autopilot and accepts explicit manual/autopilot permissions", () => {
     expect(load().config.permissionMode).toBe("autopilot");
@@ -77,6 +111,107 @@ describe("private configuration and discovery", () => {
     });
     config.audio.threads = 9;
     expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+  });
+  it("bounds vocabulary hints and resolves the optional voice VAD model", () => {
+    config.audio = { vocabulary: ["НБУВ", "бібліотекознавство"], vadModelPath: "./models/vad.bin" };
+    expect(load().config.audio).toMatchObject({ vocabulary: ["НБУВ", "бібліотекознавство"], vadModelPath: join(code, "models/vad.bin") });
+    for (const vocabulary of [[""], ["x".repeat(61)], ["bad\u0007term"], Array.from({ length: 101 }, () => "a"),
+      Array.from({ length: 20 }, () => "y".repeat(45))]) {
+      config.audio = { vocabulary };
+      expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+    }
+  });
+  it("accepts a recordings folder inside an owner workspace with strict, bounded settings", async () => {
+    mkdirSync(join(source, "raw/recordings"), { recursive: true });
+    const recordings = { path: join(source, "raw/recordings"), modelPath: "./models/large.bin", vadModelPath: "./models/vad.bin",
+      vocabulary: ["НБУВ"], quietMinutes: 2, pollIntervalMs: 60_000, vad: { threshold: 0.5, minSpeechMs: 250 },
+      suppressNonSpeech: false, maxContext: 0, silence: { thresholdDb: -80, minSeconds: 60 },
+      retry: { modelPath: "./models/large-v3.bin", vadThreshold: 0.6, suppressNonSpeech: true, maxContext: 0 }, notifications: false };
+    config.recordings = recordings;
+    expect(await recordingsModule(load())).toMatchObject({ state: "starting", settings: {
+      path: join(source, "raw/recordings"), modelPath: join(code, "models/large.bin"), vadModelPath: join(code, "models/vad.bin"),
+      retry: { modelPath: join(code, "models/large-v3.bin") },
+    } });
+    for (const invalid of [{ pollIntervalMs: 1_000 }, { quietMinutes: 0 }, { vad: { threshold: 1 } },
+      { retry: { maxContext: 300 } }, { retry: { modelPath: "" } }, { maxContext: 300 }, { suppressNonSpeech: "yes" },
+      { silence: { thresholdDb: -10 } }, { silence: { minSeconds: 1 } }, { silence: { extra: 1 } },
+      { unknown: true }, { language: "Ukrainian" }]) {
+      // Invalid module settings no longer stop the service: only the module is unavailable.
+      config.recordings = { ...recordings, ...invalid };
+      expect(await recordingsModule(load())).toEqual({ state: "unavailable", code: "MODULE_SETTINGS_INVALID" });
+    }
+    const { modelPath: _model, ...withoutModel } = recordings;
+    config.recordings = withoutModel;
+    expect(await recordingsModule(load())).toEqual({ state: "unavailable", code: "MODULE_SETTINGS_INVALID" });
+  });
+  it("makes recordings unavailable, not the service, for folders outside owner workspaces, missing, symlinked or overlapping protected paths", async () => {
+    const recordings = (path: string) => ({ path, modelPath: "./m.bin", vadModelPath: "./v.bin" });
+    mkdirSync(join(root, "elsewhere"), { recursive: true });
+    const unavailable = async (path: string) => {
+      config.recordings = recordings(path);
+      return (await recordingsModule(load())).code;
+    };
+    expect(await unavailable(join(root, "elsewhere"))).toBe("RECORDINGS_PATH_OUTSIDE_WORKSPACE");
+    expect(await unavailable(join(source, "missing"))).toBe("PATH_MISSING_OR_UNREADABLE");
+    symlinkSync(join(root, "elsewhere"), join(source, "linked"));
+    expect(await unavailable(join(source, "linked"))).toBe("SYMLINK_PATH_REJECTED");
+    // The workspace root holds the secrets file, so recordings must live in a subfolder.
+    expect(await unavailable(source)).toBe("UNSAFE_PATH_OVERLAP");
+  });
+  it("keeps recordings off when the section is absent", () => {
+    expect(load().config.recordings).toBeUndefined();
+    expect(moduleEntries(load().config)).toEqual([]);
+  });
+  it("maps the legacy top-level recordings to modules.recordings with identical recording settings", async () => {
+    mkdirSync(join(source, "raw/recordings"), { recursive: true });
+    const recordings = { path: "../workspace/raw/recordings", modelPath: "./models/turbo.bin", vadModelPath: "./models/vad.bin",
+      retry: { modelPath: "./models/large.bin", vadThreshold: 0.6 }, vad: { padMs: 300 } };
+    config.audio = { vocabulary: ["НБУВ"], ffmpegPath: "/opt/ffmpeg" };
+    config.recordings = recordings;
+    const legacy = load();
+    expect(moduleEntries(legacy.config)).toEqual([{ id: "recordings", enabled: true, agents: [], settings: recordings,
+      movedSettings: { from: "recordings", to: "modules.recordings.settings" } }]);
+    const fromLegacy = await recordingsModule(legacy);
+    delete config.recordings;
+    config.modules = { recordings: { agents: ["helper-one"], settings: recordings } };
+    const modern = load();
+    expect(moduleEntries(modern.config)).toEqual([{ id: "recordings", enabled: true, agents: ["helper-one"], settings: recordings }]);
+    const fromModules = await recordingsModule(modern);
+    expect(fromModules.state).toBe("starting");
+    expect(fromModules.recordingSettings).toEqual(fromLegacy.recordingSettings);
+    expect(fromModules.recordingSettings).toMatchObject({ path: join(source, "raw/recordings"), ffmpegPath: "/opt/ffmpeg",
+      vocabulary: ["НБУВ"], modelPath: join(code, "models/turbo.bin"), retry: { modelPath: join(code, "models/large.bin") } });
+    config.recordings = recordings;
+    expect(load).toThrow("MODULE_SETTINGS_DUPLICATED");
+  });
+  it("validates module entries strictly with defaults and known personas", () => {
+    config.modules = { "voice-notes": {}, recordings: { enabled: false, settings: { anything: true } } };
+    expect(moduleEntries(load().config)).toEqual([
+      { id: "voice-notes", enabled: true, agents: [], settings: undefined },
+      { id: "recordings", enabled: false, agents: [], settings: { anything: true } },
+    ]);
+    for (const id of ["Recordings", "1st", "a".repeat(33), "with_underscore"]) {
+      config.modules = { [id]: {} };
+      expect(load).toThrow("MODULE_ID_INVALID");
+    }
+    config.modules = { recordings: { enabled: true, extra: 1 } } as unknown as ServiceConfig["modules"];
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+    config.modules = { recordings: { agents: ["helper-one", "missing"] } };
+    expect(load).toThrow("MODULE_AGENT_UNKNOWN");
+    // Workers have no chat of their own, so they cannot use module abilities.
+    config.modules = { recordings: { agents: ["worker"] } };
+    expect(load).toThrow("MODULE_AGENT_UNKNOWN");
+  });
+  it("requires the coordinator to be a persona with an owner private binding", () => {
+    config.coordinatorAgentId = "helper-one";
+    expect(load().config.coordinatorAgentId).toBe("helper-one");
+    for (const agentId of ["helper-three", "missing", "worker"]) {
+      config.coordinatorAgentId = agentId;
+      expect(load).toThrow("COORDINATOR_BINDING_MISSING");
+    }
+    config.coordinatorAgentId = "helper-one";
+    config.bindings = config.bindings.filter((binding) => !(binding.botId === "bot-one" && binding.kind === "private"));
+    expect(load).toThrow("COORDINATOR_BINDING_MISSING");
   });
   it("discovers all personas and workers with references, launcher-only models and explicit skills", () => {
     const result = load();
@@ -223,5 +358,148 @@ describe("explicit private/group/forum bindings", () => {
     config.bindings.pop();
     config.bindings[0]!.botId = "unknown";
     expect(load).toThrow("BINDING_UNKNOWN_BOT");
+  });
+  it("authorizes configured users only in explicitly bound private chats and permitted bots", () => {
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.bindings.push({ botId: "bot-one", chatId: 202, topicId: null, kind: "private" });
+    const loaded = load().config;
+    expect(authorizeScope(loaded, {
+      ownerId: 202, botId: "bot-one", chatId: 202, topicId: null, chatKind: "private", isBot: false,
+    })).toEqual({ ownerId: 202, botId: "bot-one", chatId: 202, topicId: null });
+    for (const candidate of [
+      { ownerId: 202, botId: "bot-two", chatId: 202, topicId: null, chatKind: "private" as const, isBot: false },
+      { ownerId: 203, botId: "bot-one", chatId: 203, topicId: null, chatKind: "private" as const, isBot: false },
+      { ownerId: 202, botId: "bot-one", chatId: -201, topicId: null, chatKind: "group" as const, isBot: false },
+    ]) expect(authorizeScope(loaded, candidate)).toBeNull();
+  });
+  it("validates workspace membership, private ownership, permitted agents and safe paths", () => {
+    const shared = join(root, "knowledge-shared");
+    const personal = join(root, "knowledge-personal");
+    for (const path of [shared, personal]) mkdirSync(path);
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.workspaces = [
+      { id: "team", name: "Team", access: "shared", ownerUserId: 101, memberUserIds: [202],
+        path: shared, agentIds: ["helper-one"] },
+      { id: "sonya-private", name: "Sonya private", access: "private", ownerUserId: 202,
+        path: personal, agentIds: ["helper-one"] },
+    ];
+    const loaded = load();
+    expect(loaded.config.workspaces?.map(({ id, path }) => ({ id, path }))).toEqual([
+      { id: "team", path: shared }, { id: "sonya-private", path: personal },
+    ]);
+    expect(workspacesFor(loaded.config, 202, "bot-one").map((workspace) => workspace.id))
+      .toEqual(["team", "sonya-private"]);
+    expect(workspacesFor(loaded.config, 101, "bot-one").map((workspace) => workspace.id)).toEqual(["team"]);
+
+    config.workspaces![1] = { ...config.workspaces![1]!, memberUserIds: [101] };
+    expect(load).toThrow(ConfigError);
+    config.workspaces![1] = { ...config.workspaces![1]!, memberUserIds: undefined, path: source };
+    expect(load).toThrow(ConfigError);
+    config.workspaces![1] = { ...config.workspaces![1]!, path: personal, agentIds: ["worker"] };
+    expect(load).toThrow(ConfigError);
+  });
+  it("allows a workspace to share its exact root with agent sources but not an ancestor or descendant", () => {
+    const externalSecrets = join(root, "secrets.local.json");
+    copyFileSync(join(source, "secrets.local.json"), externalSecrets);
+    config.secretsPath = externalSecrets;
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.workspaces = [
+      { id: "team", name: "Team", access: "shared", ownerUserId: 101, memberUserIds: [202],
+        path: source, agentIds: ["helper-one"] },
+    ];
+    expect(load().config.workspaces?.map(({ id, path }) => ({ id, path }))).toEqual([{ id: "team", path: source }]);
+    config.workspaces[0]!.path = join(source, "agent");
+    expect(load).toThrow("UNSAFE_PATH_OVERLAP");
+    config.workspaces[0]!.path = root;
+    expect(load).toThrow("UNSAFE_PATH_OVERLAP");
+  });
+  it("discovers agents defined inside a workspace flagged agentSource without hiding global agents", () => {
+    const knowledge = join(root, "knowledge-agents");
+    write(join(knowledge, "AGENTS.md"), "# Local rules");
+    write(join(knowledge, "agent/agents/local-pm/AGENT.md"), "---\nname: local-pm\ndescription: Local\n---\n# Local PM");
+    write(join(knowledge, ".github/agents/local-pm.agent.md"),
+      "---\nname: local-pm\ndescription: Local\nmodel: synthetic-model\n---\nRead and follow `agent/agents/local-pm/AGENT.md`.");
+    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.workspaces = [{ id: "kb", name: "KB", access: "shared", ownerUserId: 101, memberUserIds: [202],
+      path: knowledge, agentIds: ["local-pm"], agentSource: true }];
+    const ids = load().agents.map((agent) => agent.id);
+    expect(ids).toContain("local-pm");
+    expect(ids).toContain("helper-one");
+    config.workspaces[0]!.agentSource = false;
+    expect(load).toThrow("WORKSPACE_AGENT_INVALID");
+    config.workspaces[0]!.agentSource = true;
+    write(join(knowledge, "agent/agents/helper-one/AGENT.md"), "# Clash");
+    write(join(knowledge, ".github/agents/helper-one.agent.md"),
+      "---\nname: helper-one\ndescription: Clash\nmodel: synthetic-model\n---\nRead and follow `agent/agents/helper-one/AGENT.md`.");
+    expect(load).toThrow("AGENT_DUPLICATE");
+  });
+  it("rejects duplicate configured users and unknown bot grants", () => {
+    config.users = [
+      { telegramUserId: 202, allowedBotIds: ["bot-one"] },
+      { telegramUserId: 202, allowedBotIds: ["bot-one"] },
+    ];
+    expect(load).toThrow("USER_DUPLICATE");
+    config.users = [{ telegramUserId: 202, allowedBotIds: ["unknown"] }];
+    expect(load).toThrow("USER_BOT_INVALID");
+  });
+});
+
+describe("proactivity configuration defaults and validation", () => {
+  it("applies quiet-hours and proactivity defaults when absent or partial", () => {
+    expect(load().config.quietHours).toEqual(defaultQuietHours);
+    expect(load().config.proactivity).toEqual(defaultProactivityGuardrails);
+    config.proactivity = { maxActiveItemsPerAgent: 7 };
+    expect(load().config.proactivity).toEqual({
+      minIntervalMs: defaultProactivityGuardrails.minIntervalMs,
+      maxActiveItemsPerAgent: 7,
+    });
+  });
+  it.each([
+    { start: "9:30", end: "10:00", timezone: "Europe/Kyiv" },
+    { start: "09:30", end: "24:00", timezone: "Europe/Kyiv" },
+  ])("rejects malformed quiet-hours values", (quietHours) => {
+    config.quietHours = quietHours;
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+  });
+  it("rejects too-small proactive intervals", () => {
+    config.proactivity = { minIntervalMs: 59_999 };
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+  });
+});
+describe("per-bot engine selection", () => {
+  it("keeps every bot on Copilot when no engine settings are present", () => {
+    const loaded = load();
+    expect(loaded.config.claudeCode).toBeUndefined();
+    expect(loaded.config.bots.map((bot) => botEngine(loaded.config, bot.id))).toEqual(["copilot", "copilot"]);
+  });
+  it("requires a claudeCode block for a Claude Code bot", () => {
+    config.bots[1] = { ...config.bots[1]!, engine: "claude-code" };
+    expect(load).toThrow("CLAUDE_CODE_CONFIG_REQUIRED");
+  });
+  it("accepts a separate service-owned Claude home and an optional bot model", () => {
+    mkdirSync(join(code, "runtime/claude"), { recursive: true });
+    config.claudeCode = { homePath: "./runtime/claude", defaultModel: "claude-sonnet-5-5" };
+    config.bots[1] = { ...config.bots[1]!, engine: "claude-code", model: "claude-opus-5-5" };
+    const loaded = load();
+    expect(loaded.config.claudeCode?.homePath).toBe(join(code, "runtime/claude"));
+    expect(botEngine(loaded.config, "bot-two")).toBe("claude-code");
+  });
+  it("rejects a Claude home overlapping Copilot, data, workspace or code paths", () => {
+    for (const homePath of ["./runtime/copilot", "./data", source, code]) {
+      config.claudeCode = { homePath, defaultModel: "claude-sonnet-5-5" };
+      expect(load, homePath).toThrow("UNSAFE_PATH_OVERLAP");
+    }
+  });
+  it("lets one persona serve two bots only on different engines", () => {
+    mkdirSync(join(code, "runtime/claude"), { recursive: true });
+    config.claudeCode = { homePath: "./runtime/claude", defaultModel: "claude-sonnet-5-5" };
+    config.bots[1] = { ...config.bots[1]!, agentId: "helper-one" };
+    expect(load).toThrow("DUPLICATE_BOT");
+    config.bots[1] = { ...config.bots[1]!, engine: "claude-code" };
+    expect(load().config.bots.map((bot) => bot.agentId)).toEqual(["helper-one", "helper-one"]);
+  });
+  it("rejects unknown engines", () => {
+    (config.bots[1] as { engine?: string }).engine = "gemini";
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
   });
 });

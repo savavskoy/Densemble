@@ -5,7 +5,7 @@ import { activeStates, Connection, StateError } from "./database.js";
 import { inputRow, runRow } from "./rows.js";
 
 function validateId(id: number): void {
-  if (!Number.isSafeInteger(id) || id < 0 || id === Number.MAX_SAFE_INTEGER) throw new StateError("INVALID_TELEGRAM_ID");
+  if (!Number.isSafeInteger(id) || id === Number.MAX_SAFE_INTEGER) throw new StateError("INVALID_TELEGRAM_ID");
 }
 
 export function inboxStore(db: Connection): InboxStore {

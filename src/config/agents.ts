@@ -62,6 +62,26 @@ function validateLinks(workspace: string, file: string, text: string): void {
   }
 }
 
+/** Global agents plus agents defined inside workspaces explicitly flagged `agentSource`. */
+export function discoverAllAgents(
+  config: AgentSources & { workspaces?: { path: string; agentSource?: boolean | undefined }[] | undefined },
+): AgentDefinition[] {
+  const result = discoverAgents(config);
+  for (const workspace of config.workspaces ?? []) {
+    if (!workspace.agentSource || workspace.path === config.workspacePath) continue;
+    const local = discoverAgents({
+      workspacePath: workspace.path,
+      agentDefinitionsPath: resolve(workspace.path, "agent", "agents"),
+      agentLaunchersPath: resolve(workspace.path, ".github", "agents"),
+    });
+    for (const agent of local) {
+      if (result.some((existing) => existing.id === agent.id)) throw new ConfigError("AGENT_DUPLICATE");
+      result.push(agent);
+    }
+  }
+  return result;
+}
+
 export function discoverAgents(sources: AgentSources): AgentDefinition[] {
   const workspace = sources.workspacePath;
   const launchers = sourcePath(workspace, sources.agentLaunchersPath, "directory");

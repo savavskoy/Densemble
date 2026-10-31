@@ -1,3 +1,6 @@
+import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LoadedConfig } from "../../src/config/index.js";
 
@@ -5,7 +8,7 @@ const harness = vi.hoisted(() => {
   const calls: string[] = [];
   const record = (name: string) => () => { calls.push(name); };
   return {
-    calls, record, telegramFails: false, shutdownFails: false, drainHangs: false,
+    calls, record, telegramFails: false, startError: undefined as Error | undefined, shutdownFails: false, drainHangs: false,
     runtime: { shutdown: vi.fn(async () => { calls.push("runtime.stop"); }),
       recoverOwnedProcesses: vi.fn(async () => { calls.push("runtime.recover"); }) },
     store: { recover: vi.fn(() => { calls.push("store.recover"); return { queuedInputs: [] }; }),
@@ -30,8 +33,23 @@ vi.mock("../../src/storage/process-lock.js", () => ({
 vi.mock("../../src/storage/index.js", () => ({
   openStore: () => { harness.calls.push("store.open"); return harness.store; },
 }));
-vi.mock("../../src/agents/index.js", () => ({ createCopilotRuntime: () => harness.runtime }));
+vi.mock("../../src/agents/index.js", async () => ({
+  createCopilotRuntime: () => harness.runtime,
+  createClaudeRuntime: () => { throw new Error("UNEXPECTED_CLAUDE_RUNTIME"); },
+  createEngineRouter: (await vi.importActual<typeof import("../../src/agents/router.js")>("../../src/agents/router.js")).createEngineRouter,
+}));
 vi.mock("../../src/media/index.js", () => ({ createMediaPipeline: () => harness.media }));
+vi.mock("../../src/modules/loader.js", () => ({
+  // A stand-in recordings module; `startError` makes its start fail like a missing model does.
+  loadModule: async (id: string) => id !== "recordings" ? undefined : {
+    id, version: "1.0.0", settings: { safeParse: (value: unknown) => ({ success: true, data: value }) }, reasons: {},
+    start: async () => {
+      if (harness.startError) throw harness.startError;
+      harness.calls.push("recordings.start");
+      return { stop: async () => { harness.calls.push("recordings.stop"); } };
+    },
+  },
+}));
 vi.mock("../../src/application/index.js", () => ({ createApplication: () => harness.application }));
 vi.mock("../../src/telegram/index.js", () => ({
   createTelegramAdapter: () => ({
@@ -54,9 +72,15 @@ const config: LoadedConfig = {
   agents: [], tokenForBot: () => { throw new Error("NO_TOKEN_EXPECTED"); },
   resolveSecret: () => { throw new Error("NO_SECRET_EXPECTED"); },
 };
+const data = () => {
+  const path = join(process.cwd(), ".cache", `service-unit-${randomUUID()}`);
+  mkdirSync(path, { recursive: true });
+  return path;
+};
 beforeEach(() => {
   harness.calls.length = 0;
   harness.telegramFails = false;
+  harness.startError = undefined;
   harness.shutdownFails = false;
   harness.drainHangs = false;
 });
@@ -69,6 +93,29 @@ describe("service composition lifecycle", () => {
     await service.stop();
     await service.stop();
     expect(harness.calls.slice(7)).toEqual(["telegram.stop", "app.stop", "runtime.stop", "app.drain", "store.close", "lock.release"]);
+  });
+  it("starts the recordings worker after media recovery and stops it before the store closes", async () => {
+    const service = await startService({ ...config, config: { ...config.config, runtimeDataPath: data(), recordings: {
+      path: "/synthetic/workspace/raw/recordings", modelPath: "/m.bin", vadModelPath: "/v.bin" } } });
+    expect(harness.calls.indexOf("recordings.start")).toBe(harness.calls.indexOf("media.cleanup") + 1);
+    await service.stop();
+    expect(harness.calls.indexOf("recordings.stop")).toBeLessThan(harness.calls.indexOf("store.close"));
+    expect(harness.calls.indexOf("recordings.stop")).toBeLessThan(harness.calls.indexOf("telegram.stop"));
+  });
+  it("starts without a disabled module and with an unavailable one (SC-002)", async () => {
+    const disabled = await startService({ ...config, config: { ...config.config, runtimeDataPath: data(),
+      modules: { recordings: { enabled: false, settings: { modelPath: "/missing.bin" } } } } });
+    expect(harness.calls).not.toContain("recordings.start");
+    expect(harness.calls).toContain("telegram.start");
+    await disabled.stop();
+    harness.calls.length = 0;
+    const { ModuleError } = await import("../../src/modules/contract.js");
+    harness.startError = new ModuleError("RECORDING_MODEL_MISSING", { unavailable: true });
+    const unavailable = await startService({ ...config, config: { ...config.config, runtimeDataPath: data(),
+      modules: { recordings: { settings: {} } } } });
+    expect(harness.calls).toContain("telegram.start");
+    await unavailable.stop();
+    expect(harness.calls).toContain("lock.release");
   });
   it("unwinds partial startup while still closing runtime before releasing the process lock", async () => {
     harness.telegramFails = true;

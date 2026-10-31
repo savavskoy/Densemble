@@ -1,9 +1,11 @@
 # Densemble
 
-A local, single-owner Telegram interface to managed Copilot agent runtimes on
-Apple Silicon macOS. One bot per persona, one binding per group/topic, and
-separate conversation histories. TypeScript/Node, grammY, SQLite and the Copilot
-SDK form a modular monolith; there is no HTTP server or hosted control plane.
+A local Telegram interface to managed Copilot agent runtimes on Apple Silicon
+macOS. The service owner can configure additional users for private chats and
+grant them access to personal or shared knowledge workspaces. One bot per
+persona, one binding per group/topic, and separate conversation histories.
+TypeScript/Node, grammY, SQLite and the Copilot SDK form a modular monolith;
+there is no HTTP server or hosted control plane.
 
 **Deployment acceptance is pending:** the authenticated synthetic SDK gate
 passed, but real Telegram accounts/tokens and a provisioned whisper.cpp model
@@ -54,13 +56,18 @@ chmod 700 data runtime/copilot
 
 Configuration is strict; unknown fields, conflicting bindings, duplicate bot
 identities, non-invocable workers as bots, unsafe paths and unresolved secrets
-are errors. Detailed schema and lifecycle rules: [contracts](docs/contracts.md).
+are errors. Existing configurations without `users` and `workspaces` remain
+owner-only. Detailed schema and lifecycle rules: [contracts](docs/contracts.md).
 
 Keep actual configuration in an ignored `config.local.json`. Reference an
 existing external `secrets.local.json` using `secretsPath`; bot entries reference
 secret keys, never token values. Do not copy credentials, private agent
 instructions, knowledge files, or personal documents into this repository.
 The configured agent workspace must remain separate from this service's code.
+A knowledge workspace may use exactly the same directory as the agent workspace,
+so one root can hold both knowledge and agent instructions; every member of such
+a shared workspace can read and change those instructions. Ancestor/descendant
+overlaps with the agent workspace remain rejected.
 
 Local configuration, credentials, dependency caches, runtime data, attachments,
 database files, logs, and scratch files are ignored. Use `data/`, `runtime/`,
@@ -74,10 +81,15 @@ commit safeguard, not access control; review staged changes before committing.
 2. Create a bot for each desired persona through BotFather. Store its token only
    in the existing external canonical `secrets.local.json`; set `tokenRef` to
    that key. Never paste tokens into command-line arguments, commits or logs.
-3. Set your numeric Telegram `ownerId` and explicit `bindings`. For a private
-   chat, use your numeric user/chat ID and `topicId: null`. Send `/start` to the
-   bot yourself. Groups use a negative chat ID; forum bindings require the exact
-   topic ID. Other bots/topics/users are ignored before LLM or media processing.
+3. Set your numeric Telegram `ownerId` and explicit `bindings`. To add a person,
+   add their numeric Telegram ID to `users`, grant only the required bot IDs in
+   `allowedBotIds`, and add a private binding using that person's ID as `chatId`.
+   Send `/start` to the bot from each account. Groups use a negative chat ID;
+   forum bindings require the exact topic ID. Unconfigured users and unbound
+   chats are ignored before LLM or media processing.
+   Each configured workspace path must already be an existing local directory;
+   it need not be a Git repository. Densemble does not initialize Git, configure
+   remotes, create commits, push changes or synchronize workspace contents.
 4. For groups, disable BotFather privacy mode or grant the necessary bot rights,
    then verify reception with a real ordinary message without `@`. Membership
    alone does not establish the binding. Existing webhooks cause an explicit
@@ -97,10 +109,19 @@ messages, poll updates or invoke MCP tools. Exit 2 means prerequisites or actual
 MCP acceptance remain incomplete. Audio is optional for starting text service:
 missing ASR prerequisites produce an explicit voice error, never cloud fallback.
 
-Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`, `/stop`.
-The bot registers its command menu at startup so Telegram suggests commands when
+Commands in Telegram: `/help`, `/status`, `/model`, `/new`, `/sessions`,
+`/workspace`, `/stop`, `/proactive`. `/workspace` lists only the current user's
+authorized knowledge workspaces; `/workspace <id>` switches to a new session
+without carrying prior conversation history across workspaces. When a user has
+multiple workspaces, a new conversation starts in an empty lobby until one is
+selected. Repository synchronization is not part of this feature. The bot
+registers its command menu at startup so Telegram suggests commands when
 you type `/`. New runs do not post an automatic Stop button; send `/stop` to stop.
-Questions/manual permissions and session/model controls use scoped, expiring buttons.
+Clarifications are ordinary text messages: the agent asks one question at a time,
+ends its turn, and waits for your normal reply. No form, inline choices, or reply
+to a specific message is required. Manual permissions and session/model controls
+still use scoped, expiring buttons. This service has only a Telegram front-end;
+desktop Copilot CLI forms are unaffected.
 `/new` retains old history; deletion needs confirmation. `/stop` is scoped to
 the current bot/chat/topic and does not undo external actions. An unknown
 external-action or Telegram-send outcome is reported as uncertain, not retried
@@ -117,7 +138,7 @@ shell/network/MCP actions and explicit file exports: use trusted agents and
 workspaces. Set `"permissionMode": "manual"` in `config.local.json` to require
 per-action confirmation instead, or `"autopilot"` to select the default explicitly.
 Restart the service after changing this setting. Agent clarification questions
-still require an answer.
+still wait for your ordinary chat reply, not a structured form.
 
 Autopilot does not bypass managed policy, enable undeclared MCP servers, allow
 detached processes or revive stopped/stale runs. `/stop` retains its normal
@@ -133,6 +154,87 @@ crash, owned runtimes are reconciled before database recovery. The service is
 unavailable while the Mac sleeps; reconnect cannot recover messages older than
 Telegram's update-retention window.
 
+### Proactivity
+
+Each persona agent can schedule its own one-off reminders, recurring check-ins
+and silent checks (via the `densemble_manage_proactivity` tool) within its own
+chat/scope; it can only see and manage its own items. A background scheduler
+(polling every 30s, no cron/timezone dependency beyond `Intl`) fires due items
+through the normal inbox/run/outbox pipeline, so replies, `/stop`, and
+restart-recovery all work exactly as for an ordinary Telegram message. A firing
+never interleaves into an already-running turn; it waits and retries on the next
+poll. Multiple items due for the same chat are batched into a single message
+instead of one ping per item. Silent checks reply with nothing when there is
+nothing worth reporting.
+
+Configure `quietHours` (default `01:00`–`09:30`, `Europe/Kyiv`) and `proactivity`
+guardrails (`minIntervalMs`, default 30 minutes; `maxActiveItemsPerAgent`, default
+20) in `config.local.json` — see [`config.example.json`](config.example.json).
+No proactive message is sent during quiet hours; accumulated items fire once,
+batched, right after the window ends or on restart.
+
+Oleh oversees and overrides proactivity per chat with `/proactive`:
+`/proactive` or `/proactive list` shows that agent's active/paused items and
+next due times; `/proactive pause [id]` / `/proactive resume [id]` / `/proactive
+cancel <id>` act on one item, or on the whole agent's proactivity when no id is
+given. Resuming a paused agent drops anything missed during the pause instead of
+firing a catch-up batch.
+
+## Claude Code engine (optional)
+
+Every bot runs on **Copilot** unless its entry says otherwise. A bot can instead
+run its persona through **Claude Code**, using your Claude subscription. Both
+engines run side by side in one service, and one persona may be served by a
+Copilot bot and a Claude Code bot at the same time. The engine is chosen only in
+`config.local.json` and takes effect on restart; it cannot be switched from Telegram.
+
+```json
+"claudeCode": { "homePath": "./runtime/claude", "defaultModel": "claude-sonnet-5-5" },
+"bots": [
+  { "id": "alfred-bot", "agentId": "alfred", "tokenRef": "telegram.alfred" },
+  { "id": "alfred-claude-bot", "agentId": "alfred", "tokenRef": "telegram.alfred_claude",
+    "engine": "claude-code", "model": "claude-opus-5-5" }
+]
+```
+
+`model` is optional and falls back to `claudeCode.defaultModel`. Launcher
+`model:` values remain Copilot models. `homePath` is the service-owned
+`CLAUDE_CONFIG_DIR`. It must be a private directory separate from
+`~/.claude`, the Copilot home, data, workspaces and secrets.
+
+One-time setup (pinned `@anthropic-ai/claude-agent-sdk@0.3.305`, which bundles
+Claude Code **2.1.305**; no global `claude` is used):
+
+```sh
+npm ci
+make claude-login        # browser login into claudeCode.homePath only
+make doctor              # claude-runtime / claude-authentication / claude-models
+```
+
+`make claude-login` runs the pinned binary with a clean environment and
+`CLAUDE_CONFIG_DIR` set to the service home. Your interactive Claude Code login,
+settings and history are not touched, and no API key or token is written to
+`secrets.local.json`. Subscription usage limits are shared with your
+interactive use.
+
+Claude Code sessions use the same persona (`AGENT.md`), workspace `AGENTS.md`,
+skills (owner only, exposed through a generated private plugin of symlinks),
+team personas, MCP allowlist, permission mode, `/stop`, `/model`, proactivity
+and file export as Copilot sessions. They load no user/project/local Claude
+settings, hooks, CLAUDE.md, memories, bundled skills or plugins of their own.
+Built-in subagents, `AskUserQuestion`, background Bash/agents, cron/wakeup tools
+and sandbox escalation are denied. Differences from Copilot:
+
+- Messages sent while a Claude Code answer is running stay queued and run next,
+  because mid-answer steering is not supported. The bot says so once per answer.
+- A session keeps the engine it was created with. After an engine change, `/new`
+  starts on the new engine; no context moves between engines.
+- If Claude Code is missing, logged out or rate-limited, that bot replies with
+  the cause and never falls back to Copilot; Copilot bots are unaffected.
+
+Claude Code history lives in `<homePath>/projects/`. Deleting a session removes
+only its own transcript. `backup` does not yet include Claude Code history.
+
 ## Local voice and media
 
 Documents: text PDF, DOCX, UTF-8 TXT/Markdown/CSV. Photos are PNG/JPEG/WebP;
@@ -143,8 +245,9 @@ tool governed by the configured permission mode, not automatic sending of a
 model-mentioned path.
 
 Provision FFmpeg and whisper.cpp explicitly, and download a **multilingual
-Whisper small GGML** model yourself (not `small.en` or Python `.pt`). Optional
-configuration, using your actual local paths:
+whisper.cpp GGML** model yourself (any size; not `.en` or Python `.pt`). Voice
+messages keep the small model. Optional configuration, using your actual local
+paths (`vocabulary` hints and a Silero `vadModelPath` are optional):
 
 ```json
 "audio": {
@@ -153,7 +256,8 @@ configuration, using your actual local paths:
   "whisperPath": "/opt/homebrew/bin/whisper-cli",
   "modelPath": "/absolute/path/to/ggml-small.bin",
   "language": "auto",
-  "threads": 4
+  "threads": 4,
+  "vocabulary": ["НБУВ", "бібліотекознавство"]
 }
 ```
 
@@ -162,6 +266,79 @@ voice stays local to ASR, then only the labelled transcript goes to Copilot.
 Raw voice/WAV are removed on success, failure and cancellation; inputs expire
 after seven days unless retained for active work/delivery. See the
 [media adapter](src/media/README.md) and [Telegram adapter](src/telegram/README.md).
+
+## Modules
+
+A **module** is an optional feature that plugs into the core without core edits:
+one folder `src/modules/<id>/` with its own settings, health, owner docs and,
+optionally, abilities (tools) for agents. Absent `modules` (or `{}`) means core
+only. Recording transcription is the first module. Contract, folder layout and
+rules for module authors: [`src/modules/README.md`](src/modules/README.md);
+config keys, health codes and files:
+[contracts → Modules](docs/contracts.md#modules).
+
+```json
+"coordinatorAgentId": "alfred",
+"modules": {
+  "recordings": {
+    "enabled": true,
+    "agents": ["alfred"],
+    "settings": { "path": "/absolute/path/to/workspace/raw/recordings",
+                  "modelPath": "./models/ggml-large-v3-turbo.bin",
+                  "vadModelPath": "./models/ggml-silero-v5.1.2.bin" }
+  }
+}
+```
+
+- **Enable / disable** only in `config.local.json`, then `make restart`:
+  `enabled` defaults to `true`; `"enabled": false` keeps the settings but loads,
+  checks and runs nothing. No Telegram command or agent switches a module.
+- **Settings** are validated by the module itself. Invalid settings, a missing
+  prerequisite (e.g. a model file) or an unmet dependency make only that module
+  `unavailable`; a crash in its background work makes only that module `failed`.
+  Chat, voice and proactivity keep working.
+- **Abilities and instructions:** `agents` lists the personas allowed to use the
+  module's abilities (default none; an unknown persona is a config error). Those
+  agents get the abilities plus the module's `INSTRUCTIONS.md` in their sessions,
+  in owner sessions only. Every agent gets the read-only `densemble_state` ability
+  and the core module instructions, so it can explain a module's state, cause
+  and fix — but never changes anything itself.
+- **Coordinator:** `coordinatorAgentId` (a persona with an owner private chat)
+  tells the owner once in its chat when a module stops working and once when it
+  recovers; quiet hours apply unless the cause is urgent. Without it there are
+  no module notices.
+- **Status:** `make modules-status` (`modules-status [--json]`, lock-free) lists
+  each module with enabled/state, cause, fix and its status line; the owner's
+  `/status` in Telegram has a «Модулі» section; `make doctor` adds a
+  `module:<id>` line (and the module's own checks only when it is enabled).
+
+## Recording transcription (optional)
+
+The `recordings` [module](#modules). User-facing setup, everyday use and
+troubleshooting: [user guide → Recording transcription](docs/user-guide/recordings.md);
+module settings, prerequisites and what it gives agents (`recordings_status`):
+[`src/modules/recordings/README.md`](src/modules/recordings/README.md).
+
+Configure it under `modules.recordings.settings` (same fields and defaults as
+before). The old top-level `recordings` block still works unchanged and is
+reported as moved (`MODULE_SETTING_MOVED` in `make doctor` → `config-migration`
+and in `make modules-status`); both at once is a config error
+(`MODULE_SETTINGS_DUPLICATED`). Its data moved from `runtimeDataPath/recordings/`
+to `runtimeDataPath/modules/recordings/` (renamed once at the first start).
+
+Implementation: `src/modules/recordings/` (worker, filing, transcription, status,
+notifications, legacy-lock interop), started by the module host in
+`src/service.ts` after media cleanup and stopped first on shutdown. Voice messages and recordings share one
+`SpeechGate` (`src/media/speech-gate.ts`): a voice message SIGSTOPs the
+recording's process group and SIGCONTs it afterwards (`src/media/process.ts`).
+Model header checks and whisper.cpp arguments live in `src/media/whisper.ts`;
+defaults (first pass, retry, silence detection) in `src/modules/recordings/settings.ts`,
+silence detection in `src/modules/recordings/silence.ts`.
+`recordings-status [--json]` (`make transcribe-status`) reads the worker's
+heartbeat snapshot without the process lock; `doctor` adds the `recordings-*`
+checks. The folder/file contract, the only allowed mutations, diagnostics and
+failure reasons are specified in
+[contracts → Recording transcription](docs/contracts.md#recording-transcription).
 
 ## macOS background operation
 
@@ -244,7 +421,9 @@ local macOS ARM64 native CLI package directly, not the global `copilot` launcher
 or the SDK's bundled 1.0.90 runtime. `--no-auto-update` is explicit; the real
 `getStatus()` RPC must report 1.0.91. The executable gate now verifies the
 required authenticated SDK contracts below. This is **not** Telegram, media,
-or production-service acceptance.
+or production-service acceptance. The isolated question/abort/resume probes
+intentionally retain `ask_user` to test SDK capabilities. Telegram sessions instead
+exclude that tool and register no user-input or elicitation handlers.
 
 ### Runbook
 
