@@ -1,4 +1,4 @@
-import type { ProcessControl, ProcessRunner } from "../media/process.js";
+import type { ProcessControl, ProcessRunner } from "../core-api.js";
 import type { RecordingSilenceSettings } from "./settings.js";
 
 /** A stretch of digital silence (no audio signal), in seconds from the start of the recording. */

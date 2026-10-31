@@ -88,3 +88,9 @@ it("shows recording transcription status without building or locking the service
   expect(make("transcribe-status").status).toBe(0);
   expect(commands()).toEqual(["node dist/main.js recordings-status --config synthetic config.json"]);
 });
+
+it("shows module status without building or locking the service", () => {
+  expect(make("modules-status").status).toBe(0);
+  expect(commands()).toEqual(["node dist/main.js modules-status --config synthetic config.json"]);
+  expect(make("help").stdout).toContain("make modules-status");
+});

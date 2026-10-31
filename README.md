@@ -267,19 +267,73 @@ Raw voice/WAV are removed on success, failure and cancellation; inputs expire
 after seven days unless retained for active work/delivery. See the
 [media adapter](src/media/README.md) and [Telegram adapter](src/telegram/README.md).
 
+## Modules
+
+A **module** is an optional feature that plugs into the core without core edits:
+one folder `src/modules/<id>/` with its own settings, health, owner docs and,
+optionally, abilities (tools) for agents. Absent `modules` (or `{}`) means core
+only. Recording transcription is the first module. Contract, folder layout and
+rules for module authors: [`src/modules/README.md`](src/modules/README.md);
+config keys, health codes and files:
+[contracts → Modules](docs/contracts.md#modules).
+
+```json
+"coordinatorAgentId": "alfred",
+"modules": {
+  "recordings": {
+    "enabled": true,
+    "agents": ["alfred"],
+    "settings": { "path": "/absolute/path/to/workspace/raw/recordings",
+                  "modelPath": "./models/ggml-large-v3-turbo.bin",
+                  "vadModelPath": "./models/ggml-silero-v5.1.2.bin" }
+  }
+}
+```
+
+- **Enable / disable** only in `config.local.json`, then `make restart`:
+  `enabled` defaults to `true`; `"enabled": false` keeps the settings but loads,
+  checks and runs nothing. No Telegram command or agent switches a module.
+- **Settings** are validated by the module itself. Invalid settings, a missing
+  prerequisite (e.g. a model file) or an unmet dependency make only that module
+  `unavailable`; a crash in its background work makes only that module `failed`.
+  Chat, voice and proactivity keep working.
+- **Abilities and instructions:** `agents` lists the personas allowed to use the
+  module's abilities (default none; an unknown persona is a config error). Those
+  agents get the abilities plus the module's `INSTRUCTIONS.md` in their sessions,
+  in owner sessions only. Every agent gets the read-only `densemble_state` ability
+  and the core module instructions, so it can explain a module's state, cause
+  and fix — but never changes anything itself.
+- **Coordinator:** `coordinatorAgentId` (a persona with an owner private chat)
+  tells the owner once in its chat when a module stops working and once when it
+  recovers; quiet hours apply unless the cause is urgent. Without it there are
+  no module notices.
+- **Status:** `make modules-status` (`modules-status [--json]`, lock-free) lists
+  each module with enabled/state, cause, fix and its status line; the owner's
+  `/status` in Telegram has a «Модулі» section; `make doctor` adds a
+  `module:<id>` line (and the module's own checks only when it is enabled).
+
 ## Recording transcription (optional)
 
-User-facing setup, everyday use and troubleshooting:
-[user guide → Recording transcription](docs/user-guide/recordings.md).
+The `recordings` [module](#modules). User-facing setup, everyday use and
+troubleshooting: [user guide → Recording transcription](docs/user-guide/recordings.md);
+module settings, prerequisites and what it gives agents (`recordings_status`):
+[`src/modules/recordings/README.md`](src/modules/recordings/README.md).
 
-Implementation: `src/recordings/` (worker, filing, transcription, status,
-notifications, legacy-lock interop), wired in `src/service.ts` after media
-cleanup and stopped first on shutdown. Voice messages and recordings share one
+Configure it under `modules.recordings.settings` (same fields and defaults as
+before). The old top-level `recordings` block still works unchanged and is
+reported as moved (`MODULE_SETTING_MOVED` in `make doctor` → `config-migration`
+and in `make modules-status`); both at once is a config error
+(`MODULE_SETTINGS_DUPLICATED`). Its data moved from `runtimeDataPath/recordings/`
+to `runtimeDataPath/modules/recordings/` (renamed once at the first start).
+
+Implementation: `src/modules/recordings/` (worker, filing, transcription, status,
+notifications, legacy-lock interop), started by the module host in
+`src/service.ts` after media cleanup and stopped first on shutdown. Voice messages and recordings share one
 `SpeechGate` (`src/media/speech-gate.ts`): a voice message SIGSTOPs the
 recording's process group and SIGCONTs it afterwards (`src/media/process.ts`).
 Model header checks and whisper.cpp arguments live in `src/media/whisper.ts`;
-defaults (first pass, retry, silence detection) in `src/recordings/settings.ts`,
-silence detection in `src/recordings/silence.ts`.
+defaults (first pass, retry, silence detection) in `src/modules/recordings/settings.ts`,
+silence detection in `src/modules/recordings/silence.ts`.
 `recordings-status [--json]` (`make transcribe-status`) reads the worker's
 heartbeat snapshot without the process lock; `doctor` adds the `recordings-*`
 checks. The folder/file contract, the only allowed mutations, diagnostics and

@@ -15,6 +15,10 @@ import { opaqueId, sanitizeParameters } from "../permissions/index.js";
 import type { ControlledRuntime, ControlledSessionOptions, ProactivityRequest } from "./contracts.js";
 import { bounded, RuntimeError } from "./contracts.js";
 import { workspaceViolation } from "./workspace-guard.js";
+import { copilotModuleTool, type ModuleToolGuard } from "./module-tools.js";
+import type { ModuleHost } from "../modules/host.js";
+import { buildSessionModules } from "../modules/instructions.js";
+import { DENSEMBLE_STATE } from "../modules/state.js";
 import { ProcessSupervisor, recoverOwnedProcesses } from "./supervisor.js";
 import type { ProcessFailure } from "./supervisor.js";
 
@@ -78,6 +82,8 @@ export interface CopilotRuntimeOptions {
   abortGraceMs?: number;
   requestTimeoutMs?: number;
   previewIntervalMs?: number;
+  /** Resolved module host: its declared abilities join the fixed tool set; sessions get their allowed ones. */
+  modules?: ModuleHost;
 }
 type Waiting = { identity: RunIdentity; payload: RequestPayload; resolve: (answer: RequestAnswer | null) => void };
 type Turn = {
@@ -210,6 +216,10 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
   const secrets: string[] = [];
   const mcpServers: Record<string, MCPServerConfig> = {};
   const tools = new ToolSet().addBuiltIn(builtinTools).addCustom("densemble_export_file").addCustom("densemble_manage_proactivity");
+  if (options.modules) {
+    // `availableTools` is fixed here, so the host must be resolved before the runtime is created.
+    for (const name of [DENSEMBLE_STATE, ...options.modules.declaredAbilityNames()]) tools.addCustom(name);
+  }
   if (config.config.mcp.mode === "allowlist") {
     for (const declaration of config.config.mcp.servers) {
       const secret = (reference: string): string => {
@@ -417,6 +427,20 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         .filter((path) => path !== session.workspace),
     ].filter((path) => Boolean(path) && path !== session.workspace);
     if (!agents.some((agent) => agent.id === session.agentId)) throw new RuntimeError("RUNTIME_AGENT_MISSING");
+    const sessionModules = options.modules
+      ? await buildSessionModules(options.modules, { agentId: session.agentId, owner })
+      : { instructions: "", abilities: [] };
+    const moduleNames = sessionModules.abilities.map((ability) => ability.spec.name);
+    const readOnlyModuleTools = new Set(sessionModules.abilities.filter((ability) => ability.spec.readOnly).map((ability) => ability.spec.name));
+    const moduleGuard: ModuleToolGuard | undefined = options.modules && {
+      host: options.modules, diagnostics,
+      call: (invocation) => {
+        const turn = slot.turn;
+        if (!turn || !live(slot, turn) || invocation.sessionId !== slot.native?.sessionId) return undefined;
+        return { scope: slot.scope, agentId: session.agentId, userId: user, owner, workspace: session.workspace,
+          signal: invocation.signal ? AbortSignal.any([turn.controller.signal, invocation.signal]) : turn.controller.signal };
+      },
+    };
     const models = await (await slot.host).client.listModels();
     const allowed = models.filter((model) => model.policy?.state !== "disabled").map((model) => model.id);
     for (const model of [session.appliedModel, ...agents.filter((agent) => agent.id !== session.agentId).map((agent) => agent.defaultModel)]) {
@@ -426,7 +450,10 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       name: agent.id, description: agent.description,
       model: agent.id === session.agentId ? session.appliedModel : agent.defaultModel,
       prompt: `Source: ${relative(session.workspace, agent.canonicalPath)}\n${await readFile(agent.canonicalPath, "utf8")}`,
-      ...(agent.tools ? { tools: agent.tools.filter((name) => !excludedTools.includes(name)) } : {}),
+      // Module access is decided by `modules.<id>.agents`, not by a launcher allowlist: the session agent's allowed
+      // module tools are appended to its allowlist so Copilot does not hide them.
+      ...(agent.tools ? { tools: [...agent.tools.filter((name) => !excludedTools.includes(name)),
+        ...(agent.id === session.agentId ? moduleNames.filter((name) => !agent.tools!.includes(name)) : [])] } : {}),
       ...(agent.infer === undefined ? {} : { infer: agent.infer }),
     })));
     return {
@@ -443,13 +470,14 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       remoteSession: "off", streaming: true, includeSubAgentStreamingEvents: true,
       availableTools: tools, excludedTools,
       // No user-input/elicitation handlers: do not advertise either SDK capability.
-      systemMessage: { mode: "append", content: owner
+      systemMessage: { mode: "append", content: (owner
         ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
           "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
         : `You are chatting with ${userLabel(config.config.users?.find((entry) => entry.telegramUserId === user)?.displayName)} in Telegram. ` +
           "Do not use structured question forms. " +
           "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply. " +
-          "Work only inside the current workspace directory; never read, list or modify anything outside it, including repository metadata." },
+          "Work only inside the current workspace directory; never read, list or modify anything outside it, including repository metadata.") +
+        (sessionModules.instructions ? `\n\n${sessionModules.instructions}` : "") },
       onEvent: (event) => eventFor(slot, event),
       onPermissionRequest: async (permission, invocation) => {
         const turn = slot.turn;
@@ -491,6 +519,9 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
         }
         if (input.toolName === "densemble_manage_proactivity") {
           return { permissionDecision: "allow", permissionDecisionReason: "Дозволений інструмент управління нагадуваннями Densemble." };
+        }
+        if (readOnlyModuleTools.has(input.toolName)) {
+          return { permissionDecision: "allow", permissionDecisionReason: "Дозволений інструмент Densemble лише для читання." };
         }
         return { permissionDecision: "ask" };
       } },
@@ -570,6 +601,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
             return result;
           },
         }),
+        ...(moduleGuard ? sessionModules.abilities.map((ability) => copilotModuleTool(ability, moduleGuard)) : []),
       ],
     };
   }

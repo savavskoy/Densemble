@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MediaError } from "../../src/media/errors.js";
 import { runManagedProcess, type ProcessRunner } from "../../src/media/process.js";
 import { fileRecording, isFinished, isOpenByAnyProcess, probeDuration, repairInterruptedFiling,
-  type FinishedCheckOptions } from "../../src/recordings/filing.js";
+  type FinishedCheckOptions } from "../../src/modules/recordings/filing.js";
 
 let root: string;
 beforeEach(() => {

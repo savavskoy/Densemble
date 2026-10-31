@@ -1,7 +1,6 @@
 import { link, lstat, mkdir, unlink } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import { MediaError } from "../media/errors.js";
-import type { ProcessRunner } from "../media/process.js";
+import { MediaError, type ProcessRunner } from "../core-api.js";
 
 export interface FinishedCheckOptions {
   runner: ProcessRunner;

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classify, dayFolder, isMediaName, localDate, MEDIA_EXTENSIONS, obsDate, PARTIAL_PATTERN, parseDayFolder,
   parseReviewLog, recordingName, rootTargetDate, transcriptKey, type DayMedia, type ReviewLog,
-} from "../../src/recordings/contract.js";
+} from "../../src/modules/recordings/contract.js";
 
 // Verbatim copy of raw/recordings/review-log.tsv on 29.10.2026 (read-only fixture).
 const REAL_LOG = [

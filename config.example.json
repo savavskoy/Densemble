@@ -106,29 +106,38 @@
       "Lecturer Name"
     ]
   },
-  "recordings": {
-    "path": "/absolute/path/to/workspace/raw/recordings",
-    "modelPath": "./models/ggml-large-v3-turbo.bin",
-    "vadModelPath": "./models/ggml-silero-v5.1.2.bin",
-    "language": "auto",
-    "threads": 4,
-    "quietMinutes": 2,
-    "pollIntervalMs": 60000,
-    "vad": {
-      "threshold": 0.35,
-      "minSpeechMs": 250,
-      "minSilenceMs": 500,
-      "padMs": 200
-    },
-    "suppressNonSpeech": false,
-    "maxContext": 0,
-    "retry": {
-      "modelPath": "./models/ggml-large-v3.bin"
-    },
-    "silence": {
-      "thresholdDb": -80,
-      "minSeconds": 60
-    },
-    "notifications": true
+  "coordinatorAgentId": "example-agent",
+  "modules": {
+    "recordings": {
+      "enabled": true,
+      "agents": [
+        "example-agent"
+      ],
+      "settings": {
+        "path": "/absolute/path/to/workspace/raw/recordings",
+        "modelPath": "./models/ggml-large-v3-turbo.bin",
+        "vadModelPath": "./models/ggml-silero-v5.1.2.bin",
+        "language": "auto",
+        "threads": 4,
+        "quietMinutes": 2,
+        "pollIntervalMs": 60000,
+        "vad": {
+          "threshold": 0.35,
+          "minSpeechMs": 250,
+          "minSilenceMs": 500,
+          "padMs": 200
+        },
+        "suppressNonSpeech": false,
+        "maxContext": 0,
+        "retry": {
+          "modelPath": "./models/ggml-large-v3.bin"
+        },
+        "silence": {
+          "thresholdDb": -80,
+          "minSeconds": 60
+        },
+        "notifications": true
+      }
+    }
   }
 }

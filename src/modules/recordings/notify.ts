@@ -1,5 +1,4 @@
-import type { ProcessRunner } from "../media/process.js";
-import type { DiagnosticSink } from "../ports.js";
+import type { ProcessRunner, DiagnosticSink } from "../core-api.js";
 
 export interface RecordingNotifier {
   /** `id` (default: the file name) identifies the recording for once-per-outcome deduplication; `note` is appended. */

@@ -28,7 +28,10 @@ vi.mock("grammy", () => ({
     async getWebhookInfo() { state.botMethods.push("getWebhookInfo"); return { url: "" }; }
   },
 }));
-const { doctor, recordingChecks } = await import("../../src/operations/doctor.js");
+const { doctor } = await import("../../src/operations/doctor.js");
+const { recordingChecks } = await import("../../src/modules/recordings/doctor.js");
+const { recordingSettings } = await import("../../src/modules/recordings/settings.js");
+const { module: recordings } = await import("../../src/modules/recordings/index.js");
 const config: LoadedConfig = {
   config: { workspacePath: "/synthetic/workspace", agentDefinitionsPath: "/synthetic/workspace/agents",
     agentLaunchersPath: "/synthetic/workspace/launchers", secretsPath: "/synthetic/workspace/secrets.local.json",
@@ -100,8 +103,9 @@ describe("recording transcription diagnostics", () => {
     [0x67676d6c, vocab, 1500, 1280, 20, 32, 448, 1280, 20, 4, 128, 1].forEach((value, index) => bytes.writeInt32LE(value, index * 4));
     return bytes;
   };
-  const withRecordings = (modelPath: string): LoadedConfig => ({ ...config, config: { ...config.config,
-    recordings: { path: `${root}/folder`, modelPath, vadModelPath: `${root}/vad.bin` } } });
+  const audio = { ffmpegPath: "ffmpeg", ffprobePath: "ffprobe", whisperPath: "whisper-cli", vocabulary: [] };
+  const withRecordings = (modelPath: string, retryModel?: string) => recordingSettings({ path: `${root}/folder`, modelPath,
+    vadModelPath: `${root}/vad.bin`, ...(retryModel ? { retry: { modelPath: retryModel } } : {}) }, audio);
   beforeEach(async () => {
     const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
     rmSync(root, { recursive: true, force: true });
@@ -110,10 +114,10 @@ describe("recording transcription diagnostics", () => {
     writeFileSync(`${root}/english.bin`, header(51864));
     writeFileSync(`${root}/vad.bin`, Buffer.from([0x6c, 0x6d, 0x67, 0x67, 0]));
   });
-  it("reports recordings off as a ready, informational state", async () => {
-    const report = await doctor(config, { legacyPlist: `${root}/missing.plist` });
-    expect(report.checks).toContainEqual({ component: "recordings", ready: true, code: "RECORDINGS_DISABLED" });
-    expect(report.checks.some((check) => check.component === "recordings-model")).toBe(false);
+  it("reports nothing about recordings when the module is not configured", async () => {
+    const report = await doctor(config);
+    expect(report.checks.some((check) => check.component.includes("recordings"))).toBe(false);
+    expect(report.checks).toContainEqual({ component: "coordinator", ready: true, code: "MODULE_COORDINATOR_NOT_CONFIGURED" });
   });
   it("reports folder, model, VAD and the legacy job with names only in details", async () => {
     const ready = await recordingChecks(withRecordings(`${root}/turbo.bin`), `${root}/missing.plist`);
@@ -136,9 +140,7 @@ describe("recording transcription diagnostics", () => {
     expect(missing.checks).toContainEqual({ component: "recordings-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
   });
   it("checks a separately configured retry model on its own", async () => {
-    const base = withRecordings(`${root}/turbo.bin`);
-    const withRetry = (retryModel: string): LoadedConfig => ({ ...base, config: { ...base.config,
-      recordings: { ...base.config.recordings!, retry: { modelPath: retryModel } } } });
+    const withRetry = (retryModel: string) => withRecordings(`${root}/turbo.bin`, retryModel);
     const missing = await recordingChecks(withRetry(`${root}/large.bin`), `${root}/missing.plist`);
     expect(missing.checks).toContainEqual({ component: "recordings-model", ready: true, code: "MEDIA_AUDIO_READY" });
     expect(missing.checks).toContainEqual({ component: "recordings-retry-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
@@ -147,5 +149,50 @@ describe("recording transcription diagnostics", () => {
     writeFileSync(`${root}/large.bin`, header(51866));
     const ready = await recordingChecks(withRetry(`${root}/large.bin`), `${root}/missing.plist`);
     expect(ready.checks).toContainEqual({ component: "recordings-retry-model", ready: true, code: "MEDIA_AUDIO_READY" });
+  });
+});
+describe("module diagnostics", () => {
+  const root = `${process.cwd()}/.cache/doctor-modules-${process.pid}`;
+  const withModules = (extra: Partial<LoadedConfig["config"]>): LoadedConfig => ({ ...config,
+    config: { ...config.config, workspacePath: root, ...extra } });
+  const settings = { path: `${root}/folder`, modelPath: `${root}/absent.bin`, vadModelPath: `${root}/absent-vad.bin` };
+  const components = (report: { checks: { component: string }[] }) => report.checks.map((check) => check.component);
+  beforeEach(async () => {
+    const { mkdirSync, rmSync } = await import("node:fs");
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(`${root}/folder`, { recursive: true });
+  });
+  it("adds only MODULE_DISABLED for a disabled module, even with a missing model (SC-002)", async () => {
+    const report = await doctor(withModules({ modules: { recordings: { enabled: false, settings } } }));
+    expect(report.checks).toContainEqual({ component: "module:recordings", ready: true, code: "MODULE_DISABLED" });
+    expect(components(report).filter((name) => name.includes("recordings"))).toEqual(["module:recordings"]);
+  });
+  it("runs the module's own checks when it is enabled and resolves, and names a moved setting", async () => {
+    const report = await doctor(withModules({ recordings: settings, coordinatorAgentId: "helper" }));
+    expect(report.checks).toContainEqual({ component: "config-migration", ready: true, code: "MODULE_SETTING_MOVED" });
+    expect(report.checks).toContainEqual({ component: "coordinator", ready: true, code: "MODULE_COORDINATOR_CONFIGURED" });
+    expect(report.checks).toContainEqual({ component: "module:recordings", ready: true, code: "MODULE_ENABLED" });
+    expect(report.checks).toContainEqual({ component: "recordings-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
+    expect(report.checks).toContainEqual({ component: "recordings-folder", ready: true, code: "RECORDINGS_FOLDER_READY" });
+    expect(report.details).toMatchObject({ "recordings-folder": `${root}/folder`, "recordings-model": "absent.bin" });
+    expect(report.ready).toBe(false);
+  });
+  it("reports unknown modules and invalid settings without running module checks", async () => {
+    const report = await doctor(withModules({ modules: { recordings: { settings: { ...settings, pollIntervalMs: 1 } }, ghost: {} } }));
+    expect(report.checks).toContainEqual({ component: "module:recordings", ready: false, code: "MODULE_SETTINGS_INVALID" });
+    expect(report.checks).toContainEqual({ component: "module:ghost", ready: false, code: "MODULE_UNKNOWN" });
+    expect(components(report).some((name) => name.startsWith("recordings"))).toBe(false);
+    const outside = await doctor(withModules({ modules: { recordings: { settings: { ...settings, path: `${process.cwd()}/tests` } } } }));
+    expect(outside.checks).toContainEqual({ component: "module:recordings", ready: false, code: "RECORDINGS_PATH_OUTSIDE_WORKSPACE" });
+  });
+  it("calls a module doctor only through the host", async () => {
+    let called = 0;
+    const loader = async (id: string) => id === "recordings" ? { ...recordings,
+      doctor: async () => { called++; return [{ component: "recordings-probe", ready: true, code: "PROBE_READY", detail: "x" }]; } } : undefined;
+    const report = await doctor(withModules({ modules: { recordings: { settings } } }), { moduleLoader: loader });
+    expect(called).toBe(1);
+    expect(report.checks).toContainEqual({ component: "recordings-probe", ready: true, code: "PROBE_READY" });
+    await doctor(withModules({ modules: { recordings: { enabled: false, settings } } }), { moduleLoader: loader });
+    expect(called).toBe(1);
   });
 });

@@ -5,13 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import { MediaError } from "../../src/media/errors.js";
 import type { ProcessControl, ProcessOptions, ProcessRunner } from "../../src/media/process.js";
 import { SpeechGate } from "../../src/media/speech-gate.js";
-import { acquireLegacyLock, legacyJobInstalled } from "../../src/recordings/legacy.js";
+import { acquireLegacyLock, legacyJobInstalled } from "../../src/modules/recordings/legacy.js";
 import type { DiagnosticSink } from "../../src/ports.js";
-import { createNotifier, type RecordingNotifier } from "../../src/recordings/notify.js";
-import { RECORDING_DEFAULTS, type RecordingSettings } from "../../src/recordings/settings.js";
-import { readStatus, type RecordingStatus } from "../../src/recordings/status.js";
-import { filterTranscript, NO_SPEECH } from "../../src/recordings/transcribe.js";
-import { createRecordingWorker, type RecordingWorkerOptions } from "../../src/recordings/worker.js";
+import { createNotifier, type RecordingNotifier } from "../../src/modules/recordings/notify.js";
+import { RECORDING_DEFAULTS, type RecordingSettings } from "../../src/modules/recordings/settings.js";
+import { readStatus, type RecordingStatus } from "../../src/modules/recordings/status.js";
+import { filterTranscript, NO_SPEECH } from "../../src/modules/recordings/transcribe.js";
+import { createRecordingWorker, type RecordingWorkerOptions } from "../../src/modules/recordings/worker.js";
 
 const MAGIC = 0x67676d6c;
 const OBS = "2026-10-29 17-01-21.mp4";
@@ -97,7 +97,7 @@ const legacyLock = () => join(tmp, "legacy.lock");
 
 function worker(extra: Partial<RecordingWorkerOptions> = {}) {
   return createRecordingWorker({
-    settings: settings(), runtimeDataPath: runtime, diagnostics, runner: fake.runner, now: () => clock, notifier,
+    settings: settings(), dataPath: join(runtime, "recordings"), diagnostics, runner: fake.runner, now: () => clock, notifier,
     legacy: { plist: legacyPlist(), lock: legacyLock() }, ...extra,
   });
 }
@@ -441,7 +441,7 @@ describe("recording worker: filing and transcription", () => {
 
   it("notifies through osascript when no notifier is injected", async () => {
     media("2026/10/29/a.mp4");
-    await createRecordingWorker({ settings: settings({ notifications: true }), runtimeDataPath: runtime, diagnostics,
+    await createRecordingWorker({ settings: settings({ notifications: true }), dataPath: join(runtime, "recordings"), diagnostics,
       runner: fake.runner, now: () => clock, legacy: { plist: legacyPlist(), lock: legacyLock() } }).pass();
     const osascript = fake.calls.filter((call) => basename(call.executable) === "osascript");
     expect(osascript).toHaveLength(1);
@@ -687,7 +687,7 @@ describe("createNotifier", () => {
   it("notifies separately for same-named recordings in different day folders", async () => {
     media("2026/10/28/meeting.m4a");
     media("2026/10/29/meeting.m4a");
-    await createRecordingWorker({ settings: settings({ notifications: true }), runtimeDataPath: runtime, diagnostics,
+    await createRecordingWorker({ settings: settings({ notifications: true }), dataPath: join(runtime, "recordings"), diagnostics,
       runner: fake.runner, now: () => clock, legacy: { plist: legacyPlist(), lock: legacyLock() } }).pass();
     expect(fake.calls.filter((call) => basename(call.executable) === "osascript")).toHaveLength(2);
   });

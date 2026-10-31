@@ -1,4 +1,4 @@
-export type CommandName = "start" | "doctor" | "backup" | "restore" | "launchd" | "recordings-status";
+export type CommandName = "start" | "doctor" | "backup" | "restore" | "launchd" | "recordings-status" | "modules-status";
 export interface CommandLine {
   command: CommandName;
   config: string;
@@ -9,14 +9,14 @@ export interface CommandLine {
 export function parseArguments(args: string[]): CommandLine {
   const explicit = args[0] !== undefined && !args[0].startsWith("--");
   const command = explicit ? args[0]! : "start";
-  if (!["start", "doctor", "backup", "restore", "launchd", "recordings-status"].includes(command)) {
+  if (!["start", "doctor", "backup", "restore", "launchd", "recordings-status", "modules-status"].includes(command)) {
     throw new Error("UNKNOWN_COMMAND");
   }
   const options = new Map<string, string>();
   let json = false;
   for (let index = explicit ? 1 : 0; index < args.length; index += 2) {
     const flag = args[index]!;
-    if (flag === "--json" && command === "recordings-status" && !json) {
+    if (flag === "--json" && (command === "recordings-status" || command === "modules-status") && !json) {
       json = true;
       index--;
       continue;

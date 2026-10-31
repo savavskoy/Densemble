@@ -2,10 +2,7 @@ import { constants } from "node:fs";
 import { link, mkdir, open, rm, statfs, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { MediaError } from "../media/errors.js";
-import { readBounded } from "../media/paths.js";
-import type { ProcessControl, ProcessRunner } from "../media/process.js";
-import { checkVadModel, checkWhisperModel, vocabularyPrompt, whisperArgs } from "../media/whisper.js";
+import { MediaError, readBounded, checkVadModel, checkWhisperModel, vocabularyPrompt, whisperArgs, type ProcessControl, type ProcessRunner } from "../core-api.js";
 import type { RecordingSettings } from "./settings.js";
 import { detectSilences, type SilenceSpan } from "./silence.js";
 

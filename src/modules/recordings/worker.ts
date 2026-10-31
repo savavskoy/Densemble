@@ -1,9 +1,6 @@
 import { lstat, mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { MediaError } from "../media/errors.js";
-import { runManagedProcess, type ProcessControl, type ProcessRunner } from "../media/process.js";
-import { SpeechGate } from "../media/speech-gate.js";
-import type { DiagnosticSink } from "../ports.js";
+import { MediaError, runManagedProcess, SpeechGate, type ProcessControl, type ProcessRunner, type DiagnosticSink } from "../core-api.js";
 import { classify, dayFolder, isMediaName, parseDayFolder, parseReviewLog, PARTIAL_PATTERN, rootTargetDate,
   transcriptKey, type DayMedia } from "./contract.js";
 import { fileRecording, isFinished, repairInterruptedFiling, type FinishedCheckOptions } from "./filing.js";
@@ -16,19 +13,24 @@ import { RecordingError, transcribeRecording, type RecordingFailure } from "./tr
 
 export interface RecordingWorkerOptions {
   settings: RecordingSettings;
-  runtimeDataPath: string;
+  /** Private data directory (`runtimeDataPath/modules/recordings`): status, work files, the active process. */
+  dataPath: string;
   diagnostics: DiagnosticSink;
   gate?: SpeechGate;
   runner?: ProcessRunner;
   now?: () => number;
   notifier?: RecordingNotifier;
   legacy?: { plist?: string; lock?: string };
+  /** Module health: a pass that cannot read the watched folder fails it; the next good pass recovers it. */
+  health?: { fail(code: string): void; recovered(): void };
 }
 export interface RecordingWorker {
   start(): Promise<void>;
   stop(): Promise<void>;
   /** One scan-and-transcribe pass; exposed for tests and one-shot runs. */
   pass(): Promise<void>;
+  /** The current status snapshot (what `status.json` holds). */
+  snapshot(): RecordingStatus;
 }
 
 interface Job { path: string; dayRel: string; file: string; mtimeMs: number; mode: "first" | "retry" }
@@ -45,7 +47,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
   const controller = new AbortController();
   const signal = controller.signal;
   const notifier = options.notifier ?? createNotifier({ runner, enabled: settings.notifications, diagnostics, signal });
-  const base = join(options.runtimeDataPath, "recordings");
+  const base = options.dataPath;
   const workRoot = join(base, "work");
   const statusPath = join(base, "status.json");
   // The running FFmpeg/whisper group, so a restart after a crash can end an orphan instead of running twice.
@@ -63,11 +65,14 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
   const check: FinishedCheckOptions = { runner, ffprobePath: settings.ffprobePath, quietMs: settings.quietMinutes * 60_000, now, signal };
   const rel = (path: string) => path.slice(root.length + 1);
 
+  const snapshot = (): RecordingStatus => {
+    status.failed = [...failures.values()];
+    return structuredClone(status);
+  };
   const publishStatus = () => {
     status.updatedAt = new Date(now()).toISOString();
-    status.failed = [...failures.values()];
-    const snapshot = structuredClone(status);
-    writing = writing.then(() => writeStatus(statusPath, snapshot)).catch(() => { diagnostics.record("RECORDINGS_STATUS_FAILED"); });
+    const current = snapshot();
+    writing = writing.then(() => writeStatus(statusPath, current)).catch(() => { diagnostics.record("RECORDINGS_STATUS_FAILED"); });
     return writing;
   };
 
@@ -101,6 +106,15 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
     } catch { /* Gone already. */ }
   }
 
+  /** The watched folder itself; failing to read it is a module health failure, not a per-file one. */
+  async function readRoot() {
+    try { return await readdir(root, { withFileTypes: true }); }
+    catch (error) {
+      options.health?.fail("RECORDINGS_FOLDER_UNREADABLE");
+      throw error;
+    }
+  }
+
   /** Day folders that can be read; an unreadable one is skipped, never fatal for the others. */
   async function dayFolders(): Promise<string[]> {
     let levels = [""];
@@ -108,7 +122,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
       const next: string[] = [];
       for (const level of levels) {
         let entries;
-        try { entries = await readdir(join(root, level), { withFileTypes: true }); }
+        try { entries = level ? await readdir(join(root, level), { withFileTypes: true }) : await readRoot(); }
         catch (error) {
           if (!level) throw error;
           diagnostics.record("RECORDINGS_FOLDER_UNREADABLE");
@@ -148,7 +162,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
   async function fileRoot(): Promise<void> {
     const waiting = status.waiting;
     const conflicts = status.conflicts;
-    for (const entry of await readdir(root, { withFileTypes: true })) {
+    for (const entry of await readRoot()) {
       if (!entry.isFile() || !isMediaName(entry.name)) continue;
       const source = join(root, entry.name);
       let stats;
@@ -305,8 +319,14 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
     }
   }
 
-  /** Rescans after every job, so recordings finished meanwhile are filed and queued in oldest-first order. */
+  /** A completed pass read the folder, so a folder failure is over. */
   async function pass(): Promise<void> {
+    await scan();
+    options.health?.recovered();
+  }
+
+  /** Rescans after every job, so recordings finished meanwhile are filed and queued in oldest-first order. */
+  async function scan(): Promise<void> {
     await mkdir(workRoot, { recursive: true, mode: 0o700 });
     const attempted = new Set<string>();
     for (let first = true; !signal.aborted; first = false) {
@@ -362,5 +382,6 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
       await writing;
     },
     pass,
+    snapshot,
   };
 }

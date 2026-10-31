@@ -2,7 +2,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync }
 import { randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { estimateSeconds, formatStatus, isStale, readStatus, writeStatus, type RecordingStatus } from "../../src/recordings/status.js";
+import { estimateSeconds, formatStatus, isStale, readStatus, writeStatus, type RecordingStatus } from "../../src/modules/recordings/status.js";
 
 let root: string;
 beforeEach(() => {

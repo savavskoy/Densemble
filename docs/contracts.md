@@ -107,7 +107,10 @@ explicitly if launched from elsewhere.
   configuration file; bare executable names use PATH. Missing audio tools/model
   do not prevent text service startup, but voice fails explicitly. No automatic
   model download.
-- Optional `recordings` turns on recording transcription (absent → off). Required:
+- Optional `coordinatorAgentId` and `modules`: see [Modules](#modules).
+- Recording transcription is the `recordings` module: its settings live in
+  `modules.recordings.settings` (absent → off). The legacy top-level `recordings`
+  block is the same object and still accepted (see [Modules](#modules)). Required:
   `path` (existing non-symlink directory inside `workspacePath` or an
   owner-owned workspace, disjoint from code, runtime, interactive/Claude homes,
   configuration and secrets; else `RECORDINGS_PATH_OUTSIDE_WORKSPACE` /
@@ -122,8 +125,9 @@ explicitly if launched from elsewhere.
   and `notifications` (default true). An unusable `retry.modelPath` is reported
   (`RECORDING_RETRY_MODEL_UNAVAILABLE`, doctor `recordings-retry-model`) and fails
   retries only (`MODEL_UNAVAILABLE`). Tool paths are shared with `audio`. An
-  unusable model keeps recordings off with a `RECORDING_MODEL_*` diagnostic; the
-  service still starts. Settings apply after a restart, to new transcriptions only.
+  unusable model or path keeps the recordings module `unavailable` with that code
+  (`RECORDING_MODEL_*`, `RECORDINGS_PATH_OUTSIDE_WORKSPACE`, …); the service still
+  starts. Settings apply after a restart, to new transcriptions only.
 
 `ConfigError.code` is a fixed diagnostic, never a serialized Zod/YAML error with
 configuration values. Examples are deliberately not executable private settings.
@@ -249,10 +253,106 @@ inbox bodies; it does not delete native history, attachments or user files.
 0600 destination before copying, removes its owned incomplete destination on failure, refuses an existing target,
 and does not copy a live database/WAL with raw filesystem operations.
 
+## Modules
+
+Optional features in `src/modules/<id>/` behind one contract (`src/modules/contract.ts`);
+module authors: [`src/modules/README.md`](../src/modules/README.md).
+
+### Configuration
+
+```json
+"coordinatorAgentId": "alfred",
+"modules": { "<id>": { "enabled": true, "agents": ["alfred"], "settings": { } } }
+```
+
+- `modules` is an optional record keyed by module id (`^[a-z][a-z0-9-]{0,31}$`, else
+  `MODULE_ID_INVALID`); absent or `{}` → core only. Each entry is strict: `enabled`
+  (default `true`; `false` → nothing loaded, checked or run), `agents` (persona ids allowed to
+  use the module's abilities, default `[]`; an unknown id → `MODULE_AGENT_UNKNOWN`) and
+  `settings` (opaque to the core, validated by the module at start; relative paths resolve
+  from the config file's directory).
+- `coordinatorAgentId` (optional) must be a persona with an owner private binding, else
+  `COORDINATOR_BINDING_MISSING`.
+- Legacy top-level `recordings` = `modules.recordings` with `enabled: true`, `agents: []` and
+  those settings; reported as `MODULE_SETTING_MOVED` (startup diagnostic, doctor
+  `config-migration`, `modules-status`). Both at once → `MODULE_SETTINGS_DUPLICATED`.
+- Config-load codes above stop the service as any `ConfigError`. Everything checked at module
+  start (unknown id, invalid settings, `prepare` path codes, missing prerequisites) affects
+  only that module. Changes take effect on `make restart`; nothing switches a module at runtime.
+
+### Health
+
+| State | Codes |
+|---|---|
+| `disabled` | `MODULE_DISABLED` |
+| `unavailable` | `MODULE_UNKNOWN`, `MODULE_SETTINGS_INVALID`, `MODULE_DEPENDENCY_UNAVAILABLE` (`detail` = dependency id), `MODULE_DEPENDENCY_CYCLE`, `MODULE_ABILITY_DUPLICATE`, `MODULE_ABILITY_INVALID`, `MODULE_INSTRUCTIONS_MISSING`, module codes (e.g. `RECORDING_MODEL_MISSING`, `RECORDINGS_PATH_OUTSIDE_WORKSPACE`) |
+| `starting` | `MODULE_STARTING` |
+| `ready` | `MODULE_READY` |
+| `failed` | `MODULE_START_FAILED`, `MODULE_FAILED`, module codes from `ctx.fail` or a `ctx.run` rejection (e.g. `RECORDINGS_FOLDER_UNREADABLE`) |
+
+- Modules start in dependency order (`requires`) after media cleanup and before the
+  application; they stop first on shutdown, in reverse order, each bounded to 10 s
+  (`MODULE_STOP_TIMEOUT` / `MODULE_STOP_FAILED`; shutdown then reports
+  `MODULE_STOP_INCOMPLETE`).
+- A module that leaves `ready` makes its dependents `unavailable`
+  (`MODULE_DEPENDENCY_UNAVAILABLE`) until the next restart. `ctx.recovered()` returns a
+  `failed` module to `ready`.
+- Every code has a Ukrainian `cause` and `fix` (host texts for `MODULE_*`, the module's
+  `reasons` for its own). Codes are fixed strings; diagnostics carry the module id and state,
+  never paths, content or secrets. Host diagnostics: the health codes above plus
+  `MODULE_SETTINGS_ISSUES` (`count`), `MODULE_ABILITY_FAILED`, `MODULE_ABILITY_REFUSED`,
+  `MODULE_STATE_WRITE_FAILED`.
+
+### Files
+
+```text
+runtimeDataPath/modules/<id>/        module-private data (0700), created by the host
+runtimeDataPath/modules/state.json   { version: 1, updatedAt, modules: ModuleStateReport[] }
+runtimeDataPath/modules/notices.json { version: 1, modules: { <id>: { notified: <code> | "ok", pending?: { code, at } } } }
+```
+
+- `state.json` (0600, atomic) is written at start, on every health change and every 60 s;
+  `modules-status [--json]` (`make modules-status`) reads it without the process lock and
+  treats it as "service not running" when older than 3 minutes. A row: `id`, `version?`,
+  `enabled`, `state`, `code`, `detail?`, `cause?`, `fix?`, `requires`, `agents`, `status?`
+  (one line from the module), `movedSettings?`.
+- The owner's Telegram `/status` adds a «Модулі» section from the same rows. `doctor` adds
+  `module:<id>` (`MODULE_DISABLED` ready for a disabled module, `MODULE_ENABLED` or the
+  unavailable code otherwise), the module's own checks only when it is enabled and resolves,
+  `config-migration` for moved settings and `MODULE_COORDINATOR_CONFIGURED|NOT_CONFIGURED`.
+
+### Abilities and instructions
+
+- Module abilities are static, named `<id>_<verb>` (never `densemble_*`), with a zod input.
+  A session gets them only when the module is `ready`, the persona is in
+  `modules.<id>.agents` and the session is the owner's; each call is checked again (live
+  turn, ready, agent, owner: `MODULE_NOT_PERMITTED` / `MODULE_UNAVAILABLE`), the input is
+  validated (`MODULE_INPUT_INVALID`) and a module error becomes `MODULE_FAILED`. Hard limits
+  live in module code (`<ID>_NOT_ALLOWED`), not in instructions.
+- Core ability `densemble_state` (every agent, every engine, read-only, input `{ module? }`):
+  the owner gets `{ ok, modules: ModuleStateReport[], coordinator?, note }`, where `note`
+  says modules change only in `config.local.json` + `make restart`; anyone else gets
+  `{ ok: true, modules: [], note }`.
+- Session instructions: the core `src/modules/INSTRUCTIONS.md` for every agent, plus each
+  allowed module's `src/modules/<id>/INSTRUCTIONS.md` (one `## <ability>` section with
+  Purpose, Inputs, Returns, Limits, Errors). Densemble never reads or writes the workspace
+  for this.
+
+### Coordinator notices
+
+- With `coordinatorAgentId`, Densemble sends a fixed (non-LLM) text to that persona's owner
+  private chat when a module goes `unavailable`/`failed` with a code different from the last
+  one notified, and once when it is `ready` again. The ledger `notices.json` survives
+  restarts, so a persisting failure is not re-sent.
+- During `quietHours` a notice waits (`pending`) and goes once per module after the window,
+  unless the reason is `urgent`. Re-evaluated every 60 s. No coordinator → no notices.
+
 ## Recording transcription
 
-The recordings worker owns one watched folder; its file contract is shared with
-the owner's review tooling and does not change:
+The `recordings` module (settings `modules.recordings.settings`, data
+`runtimeDataPath/modules/recordings/`; owner docs
+[`src/modules/recordings/README.md`](../src/modules/recordings/README.md)) owns one watched
+folder; its file contract is shared with the owner's review tooling and does not change:
 
 ```text
 <path>/review-log.tsv                                   read-only for Densemble
@@ -275,7 +375,7 @@ the owner's review tooling and does not change:
   The folder is rescanned after every recording; an unreadable day folder is
   skipped (`RECORDINGS_FOLDER_UNREADABLE`), never fatal. FFmpeg/ffprobe read only
   local files (`-protocol_whitelist file`). The running tool's process group id
-  is kept in `runtimeDataPath/recordings/active-process.json`, so a restart after
+  is kept in `runtimeDataPath/modules/recordings/active-process.json`, so a restart after
   a crash ends an orphaned FFmpeg/whisper group before starting again.
 - A recording is **done** when `<key>.txt`, `<label>_<key>.txt` or
   `<key>.attempt-N.txt` exists, even if the recording was deleted; a **retry** is
@@ -301,13 +401,15 @@ the owner's review tooling and does not change:
   (`count`, `seconds`). A failed check never fails the transcription
   (`RECORDING_SILENCE_CHECK_FAILED`, no `silences` field). Recordings are
   processed one at a time, oldest first; a failure is remembered (path, size,
-  mtime) until restart. Work files live under `runtimeDataPath/recordings/work`
+  mtime) until restart. Work files live under `runtimeDataPath/modules/recordings/work`
   and are removed on completion and at start.
 - Voice first: one `SpeechGate` per service; a voice message stops (`SIGSTOP`)
   the recording's process group and continues it (`SIGCONT`) afterwards; paused
   time does not count toward the recording's timeout. `/stop` never reaches it.
-- Status: `runtimeDataPath/recordings/status.json` (0600, atomic) is read by
-  `recordings-status [--json]` without the process lock; stale after 3 × poll
+- Status: `runtimeDataPath/modules/recordings/status.json` (0600, atomic) is read by
+  `recordings-status [--json]` without the process lock (falling back to the spec 004
+  `runtimeDataPath/recordings/status.json`, which the module renames into its data
+  directory once at the first start); stale after 3 × poll
   interval → "service not running". macOS notifications "Transcription ready" /
   "Transcription failed" go once per outcome per file per run.
 - Legacy launchd job: while `~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist`

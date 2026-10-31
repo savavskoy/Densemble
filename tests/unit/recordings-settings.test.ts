@@ -1,18 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { ServiceConfig } from "../../src/config/index.js";
-import { recordingSettings } from "../../src/operations/audio-settings.js";
-import { clock, describeSilences, parseSilences } from "../../src/recordings/silence.js";
+import { recordingSettings, type RecordingsConfig } from "../../src/modules/recordings/settings.js";
+import { clock, describeSilences, parseSilences } from "../../src/modules/recordings/silence.js";
 
-const withRecordings = (recordings: Partial<NonNullable<ServiceConfig["recordings"]>>, audio: ServiceConfig["audio"] = undefined) =>
-  ({ audio, recordings: { path: "/w/rec", modelPath: "/m/turbo.bin", vadModelPath: "/m/vad.bin", ...recordings } }) as unknown as ServiceConfig;
+const audio = { ffmpegPath: "ffmpeg", ffprobePath: "ffprobe", whisperPath: "whisper-cli", vocabulary: [] as string[] };
+const withRecordings = (recordings: Partial<RecordingsConfig>): RecordingsConfig =>
+  ({ path: "/w/rec", modelPath: "/m/turbo.bin", vadModelPath: "/m/vad.bin", ...recordings });
 
 describe("recordingSettings", () => {
-  it("is undefined without a recordings section", () => {
-    expect(recordingSettings({} as ServiceConfig)).toBeUndefined();
+  it("shares tools and, unless set, vocabulary with voice", () => {
+    const shared = { ...audio, ffmpegPath: "/x/ffmpeg", vocabulary: ["НБУВ"] };
+    expect(recordingSettings(withRecordings({}), shared)).toMatchObject({ ffmpegPath: "/x/ffmpeg", ffprobePath: "ffprobe",
+      whisperPath: "whisper-cli", vocabulary: ["НБУВ"], language: "auto", threads: 4, quietMinutes: 2, pollIntervalMs: 60_000,
+      notifications: true });
+    expect(recordingSettings(withRecordings({ vocabulary: ["бібліотека"] }), shared).vocabulary).toEqual(["бібліотека"]);
   });
 
   it("defaults the first pass to the benchmark's best config and the retry to the same pass", () => {
-    const settings = recordingSettings(withRecordings({}))!;
+    const settings = recordingSettings(withRecordings({}), audio);
     expect(settings.vad).toEqual({ threshold: 0.35, minSpeechMs: 250, minSilenceMs: 500, padMs: 200 });
     expect([settings.suppressNonSpeech, settings.maxContext]).toEqual([false, 0]);
     expect(settings.retry).toEqual({ modelPath: "/m/turbo.bin", vad: settings.vad, suppressNonSpeech: false, maxContext: 0 });
@@ -23,7 +27,7 @@ describe("recordingSettings", () => {
     const settings = recordingSettings(withRecordings({
       vad: { threshold: 0.4, padMs: 300 }, suppressNonSpeech: true, maxContext: 16,
       retry: { modelPath: "/m/large-v3.bin", vadMinSpeechMs: 400 }, silence: { minSeconds: 120 },
-    }))!;
+    }), audio);
     expect(settings.vad).toEqual({ threshold: 0.4, minSpeechMs: 250, minSilenceMs: 500, padMs: 300 });
     expect(settings.retry).toEqual({ modelPath: "/m/large-v3.bin", vad: { threshold: 0.4, minSpeechMs: 400, minSilenceMs: 500, padMs: 300 },
       suppressNonSpeech: true, maxContext: 16 });

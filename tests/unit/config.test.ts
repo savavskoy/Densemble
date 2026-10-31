@@ -9,10 +9,18 @@ import {
   defaultProactivityGuardrails,
   defaultQuietHours,
   loadConfig,
+  moduleEntries,
   secretResolver,
+  type LoadedConfig,
   type ServiceConfig,
   workspacesFor,
 } from "../../src/config/index.js";
+import { SpeechGate } from "../../src/media/speech-gate.js";
+import type { PrepareResult } from "../../src/modules/contract.js";
+import { createModuleHost } from "../../src/modules/host.js";
+import { createCoreOffer } from "../../src/modules/offer.js";
+import { module } from "../../src/modules/recordings/index.js";
+import { recordingSettings, type RecordingSettings, type RecordingsConfig } from "../../src/modules/recordings/settings.js";
 
 let root: string;
 let source: string;
@@ -68,6 +76,22 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+/** Resolves the real recordings module without starting it; `settings` are the prepared module settings. */
+async function recordingsModule(loaded: LoadedConfig): Promise<{
+  state: string; code: string; settings?: RecordingsConfig; recordingSettings?: RecordingSettings;
+}> {
+  const core = createCoreOffer(loaded, new SpeechGate());
+  const entries = moduleEntries(loaded.config);
+  const host = createModuleHost({ entries, core, runtimeDataPath: loaded.config.runtimeDataPath, diagnostics: { record: () => undefined } });
+  await host.resolve();
+  const health = host.health("recordings")!;
+  if (health.state !== "starting") return { state: health.state, code: health.code };
+  const prepared = module.prepare!(module.settings.parse(entries[0]!.settings), core) as PrepareResult<RecordingsConfig>;
+  if (!prepared.ok) throw new Error("unexpected");
+  return { state: health.state, code: health.code, settings: prepared.settings,
+    recordingSettings: recordingSettings(prepared.settings, core.audio) };
+}
+
 describe("private configuration and discovery", () => {
   it("defaults to autopilot and accepts explicit manual/autopilot permissions", () => {
     expect(load().config.permissionMode).toBe("autopilot");
@@ -97,43 +121,97 @@ describe("private configuration and discovery", () => {
       expect(load).toThrow("CONFIG_SCHEMA_INVALID");
     }
   });
-  it("accepts a recordings folder inside an owner workspace with strict, bounded settings", () => {
+  it("accepts a recordings folder inside an owner workspace with strict, bounded settings", async () => {
     mkdirSync(join(source, "raw/recordings"), { recursive: true });
-    config.recordings = { path: join(source, "raw/recordings"), modelPath: "./models/large.bin", vadModelPath: "./models/vad.bin",
+    const recordings = { path: join(source, "raw/recordings"), modelPath: "./models/large.bin", vadModelPath: "./models/vad.bin",
       vocabulary: ["НБУВ"], quietMinutes: 2, pollIntervalMs: 60_000, vad: { threshold: 0.5, minSpeechMs: 250 },
       suppressNonSpeech: false, maxContext: 0, silence: { thresholdDb: -80, minSeconds: 60 },
       retry: { modelPath: "./models/large-v3.bin", vadThreshold: 0.6, suppressNonSpeech: true, maxContext: 0 }, notifications: false };
-    expect(load().config.recordings).toMatchObject({
+    config.recordings = recordings;
+    expect(await recordingsModule(load())).toMatchObject({ state: "starting", settings: {
       path: join(source, "raw/recordings"), modelPath: join(code, "models/large.bin"), vadModelPath: join(code, "models/vad.bin"),
       retry: { modelPath: join(code, "models/large-v3.bin") },
-    });
+    } });
     for (const invalid of [{ pollIntervalMs: 1_000 }, { quietMinutes: 0 }, { vad: { threshold: 1 } },
       { retry: { maxContext: 300 } }, { retry: { modelPath: "" } }, { maxContext: 300 }, { suppressNonSpeech: "yes" },
       { silence: { thresholdDb: -10 } }, { silence: { minSeconds: 1 } }, { silence: { extra: 1 } },
       { unknown: true }, { language: "Ukrainian" }]) {
-      write(configPath, JSON.stringify({ ...config, recordings: { ...config.recordings, ...invalid } }));
-      expect(() => loadConfig(configPath, { codeRoot: code })).toThrow("CONFIG_SCHEMA_INVALID");
+      // Invalid module settings no longer stop the service: only the module is unavailable.
+      config.recordings = { ...recordings, ...invalid };
+      expect(await recordingsModule(load())).toEqual({ state: "unavailable", code: "MODULE_SETTINGS_INVALID" });
     }
-    const { modelPath: _model, ...withoutModel } = config.recordings;
-    write(configPath, JSON.stringify({ ...config, recordings: withoutModel }));
-    expect(() => loadConfig(configPath, { codeRoot: code })).toThrow("CONFIG_SCHEMA_INVALID");
+    const { modelPath: _model, ...withoutModel } = recordings;
+    config.recordings = withoutModel;
+    expect(await recordingsModule(load())).toEqual({ state: "unavailable", code: "MODULE_SETTINGS_INVALID" });
   });
-  it("rejects recordings folders outside owner workspaces, missing, symlinked or overlapping protected paths", () => {
+  it("makes recordings unavailable, not the service, for folders outside owner workspaces, missing, symlinked or overlapping protected paths", async () => {
     const recordings = (path: string) => ({ path, modelPath: "./m.bin", vadModelPath: "./v.bin" });
     mkdirSync(join(root, "elsewhere"), { recursive: true });
-    config.recordings = recordings(join(root, "elsewhere"));
-    expect(load).toThrow("RECORDINGS_PATH_OUTSIDE_WORKSPACE");
-    config.recordings = recordings(join(source, "missing"));
-    expect(load).toThrow("PATH_MISSING_OR_UNREADABLE");
+    const unavailable = async (path: string) => {
+      config.recordings = recordings(path);
+      return (await recordingsModule(load())).code;
+    };
+    expect(await unavailable(join(root, "elsewhere"))).toBe("RECORDINGS_PATH_OUTSIDE_WORKSPACE");
+    expect(await unavailable(join(source, "missing"))).toBe("PATH_MISSING_OR_UNREADABLE");
     symlinkSync(join(root, "elsewhere"), join(source, "linked"));
-    config.recordings = recordings(join(source, "linked"));
-    expect(load).toThrow("SYMLINK_PATH_REJECTED");
+    expect(await unavailable(join(source, "linked"))).toBe("SYMLINK_PATH_REJECTED");
     // The workspace root holds the secrets file, so recordings must live in a subfolder.
-    config.recordings = recordings(source);
-    expect(load).toThrow("UNSAFE_PATH_OVERLAP");
+    expect(await unavailable(source)).toBe("UNSAFE_PATH_OVERLAP");
   });
   it("keeps recordings off when the section is absent", () => {
     expect(load().config.recordings).toBeUndefined();
+    expect(moduleEntries(load().config)).toEqual([]);
+  });
+  it("maps the legacy top-level recordings to modules.recordings with identical recording settings", async () => {
+    mkdirSync(join(source, "raw/recordings"), { recursive: true });
+    const recordings = { path: "../workspace/raw/recordings", modelPath: "./models/turbo.bin", vadModelPath: "./models/vad.bin",
+      retry: { modelPath: "./models/large.bin", vadThreshold: 0.6 }, vad: { padMs: 300 } };
+    config.audio = { vocabulary: ["НБУВ"], ffmpegPath: "/opt/ffmpeg" };
+    config.recordings = recordings;
+    const legacy = load();
+    expect(moduleEntries(legacy.config)).toEqual([{ id: "recordings", enabled: true, agents: [], settings: recordings,
+      movedSettings: { from: "recordings", to: "modules.recordings.settings" } }]);
+    const fromLegacy = await recordingsModule(legacy);
+    delete config.recordings;
+    config.modules = { recordings: { agents: ["helper-one"], settings: recordings } };
+    const modern = load();
+    expect(moduleEntries(modern.config)).toEqual([{ id: "recordings", enabled: true, agents: ["helper-one"], settings: recordings }]);
+    const fromModules = await recordingsModule(modern);
+    expect(fromModules.state).toBe("starting");
+    expect(fromModules.recordingSettings).toEqual(fromLegacy.recordingSettings);
+    expect(fromModules.recordingSettings).toMatchObject({ path: join(source, "raw/recordings"), ffmpegPath: "/opt/ffmpeg",
+      vocabulary: ["НБУВ"], modelPath: join(code, "models/turbo.bin"), retry: { modelPath: join(code, "models/large.bin") } });
+    config.recordings = recordings;
+    expect(load).toThrow("MODULE_SETTINGS_DUPLICATED");
+  });
+  it("validates module entries strictly with defaults and known personas", () => {
+    config.modules = { "voice-notes": {}, recordings: { enabled: false, settings: { anything: true } } };
+    expect(moduleEntries(load().config)).toEqual([
+      { id: "voice-notes", enabled: true, agents: [], settings: undefined },
+      { id: "recordings", enabled: false, agents: [], settings: { anything: true } },
+    ]);
+    for (const id of ["Recordings", "1st", "a".repeat(33), "with_underscore"]) {
+      config.modules = { [id]: {} };
+      expect(load).toThrow("MODULE_ID_INVALID");
+    }
+    config.modules = { recordings: { enabled: true, extra: 1 } } as unknown as ServiceConfig["modules"];
+    expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+    config.modules = { recordings: { agents: ["helper-one", "missing"] } };
+    expect(load).toThrow("MODULE_AGENT_UNKNOWN");
+    // Workers have no chat of their own, so they cannot use module abilities.
+    config.modules = { recordings: { agents: ["worker"] } };
+    expect(load).toThrow("MODULE_AGENT_UNKNOWN");
+  });
+  it("requires the coordinator to be a persona with an owner private binding", () => {
+    config.coordinatorAgentId = "helper-one";
+    expect(load().config.coordinatorAgentId).toBe("helper-one");
+    for (const agentId of ["helper-three", "missing", "worker"]) {
+      config.coordinatorAgentId = agentId;
+      expect(load).toThrow("COORDINATOR_BINDING_MISSING");
+    }
+    config.coordinatorAgentId = "helper-one";
+    config.bindings = config.bindings.filter((binding) => !(binding.botId === "bot-one" && binding.kind === "private"));
+    expect(load).toThrow("COORDINATOR_BINDING_MISSING");
   });
   it("discovers all personas and workers with references, launcher-only models and explicit skills", () => {
     const result = load();

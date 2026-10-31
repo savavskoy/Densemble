@@ -5,6 +5,7 @@ import { z } from "zod";
 import { engineIds, type ChatKind, type EngineId, type Scope } from "../domain.js";
 import { discoverAllAgents, type AgentDefinition } from "./agents.js";
 import { assertDisjoint, checkedPath, ConfigError, isWithin, sourcePath } from "./paths.js";
+import { MODULE_ID, type ModuleEntry } from "../modules/contract.js";
 import { canUseBot, resolveWorkspaces, userSchema, validateUsers, workspaceSchema } from "./workspaces.js";
 
 const name = z.string().regex(/^[a-z0-9][a-z0-9_-]*$/);
@@ -20,31 +21,11 @@ const threads = z.number().int().min(1).max(8);
 /** Recognition hints joined into one whisper prompt; bounded so they never crowd out speech context. */
 const vocabulary = z.array(z.string().trim().min(1).max(60).regex(/^[^\p{Cc}]+$/u)).max(100)
   .refine((terms) => terms.join(", ").length <= 800);
-const vadThreshold = z.number().min(0.1).max(0.95);
-const vadMs = z.number().int().min(0).max(10_000);
-const maxContext = z.number().int().min(-1).max(224);
-const recordingsSchema = z.object({
-  path: nonempty,
-  modelPath: nonempty,
-  vadModelPath: nonempty,
-  language: language.optional(),
-  threads: threads.optional(),
-  vocabulary: vocabulary.optional(),
-  quietMinutes: z.number().int().min(1).max(60).optional(),
-  pollIntervalMs: z.number().int().min(30_000).max(300_000).optional(),
-  vad: z.object({
-    threshold: vadThreshold.optional(), minSpeechMs: vadMs.optional(), minSilenceMs: vadMs.optional(), padMs: vadMs.optional(),
-  }).strict().optional(),
-  suppressNonSpeech: z.boolean().optional(),
-  maxContext: maxContext.optional(),
-  retry: z.object({
-    modelPath: nonempty.optional(), vadThreshold: vadThreshold.optional(), vadMinSpeechMs: vadMs.optional(),
-    suppressNonSpeech: z.boolean().optional(), maxContext: maxContext.optional(),
-  }).strict().optional(),
-  silence: z.object({
-    thresholdDb: z.number().int().min(-120).max(-30).optional(), minSeconds: z.number().int().min(10).max(3_600).optional(),
-  }).strict().optional(),
-  notifications: z.boolean().optional(),
+/** `modules.<id>`: the core checks only the entry shape; each module validates its own `settings` at start. */
+const moduleEntrySchema = z.object({
+  enabled: z.boolean().optional(),
+  agents: z.array(nonempty).optional(),
+  settings: z.unknown().optional(),
 }).strict();
 const mcpSchema = z.discriminatedUnion("type", [
   z.object({
@@ -107,7 +88,10 @@ export const configSchema = z.object({
     decodeTimeoutMs: z.number().int().min(1).max(120_000).optional(),
     asrTimeoutMs: z.number().int().min(1).max(900_000).optional(),
   }).strict().optional(),
-  recordings: recordingsSchema.optional(),
+  coordinatorAgentId: name.optional(),
+  modules: z.record(z.string(), moduleEntrySchema).optional(),
+  /** Legacy location of `modules.recordings.settings` (spec 004); validated by the recordings module. */
+  recordings: z.unknown().optional(),
 }).strict();
 export type ServiceConfig = z.infer<typeof configSchema>;
 export type BotConfig = ServiceConfig["bots"][number];
@@ -126,6 +110,8 @@ export const defaultProactivityGuardrails = Object.freeze({
 export interface LoadedConfig {
   config: ServiceConfig;
   agents: AgentDefinition[];
+  /** Set by `loadConfig`: module path rules resolve from the config file and stay off the code root. */
+  paths?: { configFile: string; codeRoot: string };
   tokenForBot(botId: string): string;
   resolveSecret(reference: string): string;
 }
@@ -263,19 +249,13 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
       runtimeDataPath: config.runtimeDataPath, runtimeHomePath: config.runtimeHomePath, interactiveHomePath: interactive,
     }, fromConfig);
   }
-  if (config.recordings) {
-    // Model files are checked at service start: a bad model disables recordings, not the service.
-    config.recordings.modelPath = fromConfig(config.recordings.modelPath);
-    config.recordings.vadModelPath = fromConfig(config.recordings.vadModelPath);
-    if (config.recordings.retry?.modelPath) config.recordings.retry.modelPath = fromConfig(config.recordings.retry.modelPath);
-    const folder = checkedPath(fromConfig(config.recordings.path), "directory");
-    const ownerRoots = [config.workspacePath, ...(config.workspaces ?? [])
-      .filter((workspace) => workspace.ownerUserId === config.ownerId).map((workspace) => workspace.path)];
-    if (!ownerRoots.some((root) => isWithin(root, folder))) throw new ConfigError("RECORDINGS_PATH_OUTSIDE_WORKSPACE");
-    for (const managed of [code, config.runtimeDataPath, config.runtimeHomePath, interactive,
-      ...(config.claudeCode ? [config.claudeCode.homePath] : [])]) assertDisjoint(managed, folder);
-    if (isWithin(folder, file) || isWithin(folder, config.secretsPath)) throw new ConfigError("UNSAFE_PATH_OVERLAP");
-    config.recordings.path = folder;
+  const personas = new Set(agents.filter((agent) => agent.userInvocable).map((agent) => agent.id));
+  for (const entry of moduleEntries(config)) {
+    if (entry.agents.some((agentId) => !personas.has(agentId))) throw new ConfigError("MODULE_AGENT_UNKNOWN");
+  }
+  if (config.coordinatorAgentId !== undefined && !config.bots.some((bot) => bot.agentId === config.coordinatorAgentId &&
+      config.bindings.some((binding) => binding.botId === bot.id && binding.kind === "private" && binding.chatId === config.ownerId))) {
+    throw new ConfigError("COORDINATOR_BINDING_MISSING");
   }
   if (config.mcp.mode === "allowlist") {
     const names = new Set<string>();
@@ -292,13 +272,31 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
     }
   }
   return {
-    config, agents, resolveSecret,
+    config, agents, resolveSecret, paths: { configFile: file, codeRoot: code },
     tokenForBot(botId) {
       const token = tokens.get(botId);
       if (!token) throw new ConfigError("UNKNOWN_BOT");
       return token;
     },
   };
+}
+
+/**
+ * Configured modules in config order with defaults (`enabled: true`, `agents: []`). A legacy top-level
+ * `recordings` becomes `modules.recordings` and carries `movedSettings`; both together are a config error.
+ */
+export function moduleEntries(config: Pick<ServiceConfig, "modules" | "recordings">): ModuleEntry[] {
+  const entries: ModuleEntry[] = [];
+  for (const [id, entry] of Object.entries(config.modules ?? {})) {
+    if (!MODULE_ID.test(id)) throw new ConfigError("MODULE_ID_INVALID");
+    entries.push({ id, enabled: entry.enabled ?? true, agents: [...entry.agents ?? []], settings: entry.settings });
+  }
+  if (config.recordings !== undefined) {
+    if (entries.some((entry) => entry.id === "recordings")) throw new ConfigError("MODULE_SETTINGS_DUPLICATED");
+    entries.push({ id: "recordings", enabled: true, agents: [], settings: config.recordings,
+      movedSettings: { from: "recordings", to: "modules.recordings.settings" } });
+  }
+  return entries;
 }
 
 /** The engine a bot runs; bots without an explicit engine stay on Copilot. */

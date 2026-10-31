@@ -24,6 +24,9 @@ import { detachedAction, proactivityRequestSchema } from "./copilot.js";
 import { ProcessSupervisor } from "./supervisor.js";
 import type { ProcessFailure } from "./supervisor.js";
 import { workspaceViolation } from "./workspace-guard.js";
+import { claudeModuleTool, claudeModuleToolName, type ModuleToolGuard } from "./module-tools.js";
+import type { ModuleHost } from "../modules/host.js";
+import { buildSessionModules } from "../modules/instructions.js";
 
 // The Claude Code equivalents of the Copilot built-in tool set; nothing else is exposed.
 const baseTools = ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Skill", "WebFetch", "TodoWrite"];
@@ -75,6 +78,8 @@ export interface ClaudeRuntimeOptions {
   requestTimeoutMs?: number;
   previewIntervalMs?: number;
   catalogTtlMs?: number;
+  /** Resolved module host: allowed module abilities join the `densemble` MCP server per session. */
+  modules?: ModuleHost;
 }
 type Waiting = { identity: RunIdentity; payload: RequestPayload; resolve: (answer: RequestAnswer | null) => void };
 type Turn = {
@@ -371,6 +376,21 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
     const service = owner ? await preparedSkills() : { plugin: null, skills: [] };
     const expected = service.skills.map((skill) => `${pluginName}:${skill.name}`);
     const instructions = await workspaceInstructions(session.workspace);
+    const sessionModules = options.modules
+      ? await buildSessionModules(options.modules, { agentId: session.agentId, owner })
+      : { instructions: "", abilities: [] };
+    const moduleTools = new Set(sessionModules.abilities.map((ability) => claudeModuleToolName(ability.spec.name)));
+    const readOnlyModuleTools = new Set(sessionModules.abilities.filter((ability) => ability.spec.readOnly)
+      .map((ability) => claudeModuleToolName(ability.spec.name)));
+    const moduleGuard: ModuleToolGuard | undefined = options.modules && {
+      host: options.modules, diagnostics,
+      call: () => {
+        const turn = slot.turn;
+        if (!turn || !live(slot, turn)) return undefined;
+        return { scope: slot.scope, agentId: session.agentId, userId: user, owner, workspace: session.workspace,
+          signal: turn.controller.signal };
+      },
+    };
     const telegram = owner
       ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
         "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
@@ -384,7 +404,10 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
       `# Densemble service\n${telegram}\n` +
         "Densemble tools are provided by the `densemble` MCP server: `densemble_manage_proactivity` " +
         `(${proactivityTool}) manages your own reminders and check-ins; \`densemble_export_file\` (${exportTool}) ` +
-        "returns a generated workspace file to this chat. A path mentioned in text is not an export.",
+        "returns a generated workspace file to this chat. A path mentioned in text is not an export." +
+        (sessionModules.abilities.length ? " Densemble state and module abilities are tools of the same server " +
+          `(${[...moduleTools].map((name) => `\`${name}\``).join(", ")}).` : ""),
+      ...(sessionModules.instructions ? [sessionModules.instructions] : []),
     ].join("\n\n");
     const deny = (code: string, reason: string) => {
       diagnostics.record(code);
@@ -403,7 +426,8 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
         return deny("TOOL_DETACHED_ACTION_REJECTED", "Запуск відокремленого процесу заборонено: /stop має зупиняти всю роботу.");
       }
       const name = input.tool_name === "Task" ? "Agent" : input.tool_name;
-      const known = tools.includes(name) || name === exportTool || name === proactivityTool || (owner && allowedMcp.has(name));
+      const known = tools.includes(name) || name === exportTool || name === proactivityTool || moduleTools.has(name) ||
+        (owner && allowedMcp.has(name));
       if (!known) return deny("TOOL_EXCLUDED_REJECTED", "Цей інструмент вимкнений у керованому сервісі.");
       if (name === "Agent") {
         const type = (input.tool_input as { subagent_type?: unknown } | null)?.subagent_type;
@@ -415,6 +439,10 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
         return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow",
           permissionDecisionReason: "Дозволений інструмент управління нагадуваннями Densemble." } };
       }
+      if (readOnlyModuleTools.has(name)) {
+        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow",
+          permissionDecisionReason: "Дозволений інструмент Densemble лише для читання." } };
+      }
       // Never let Claude Code self-approve (e.g. reads or read-only shell): the service policy decides every call.
       return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask" } };
     };
@@ -425,7 +453,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
       if (!turn || !live(slot, turn) || JSON.stringify(input).length > 12_000 || claudeDetached(name, input) ||
           (!owner && (context.blockedPath !== undefined || workspaceViolation(input, forbiddenRoots)))) return refuse;
       if (config.config.permissionMode === "manual") {
-        const answer = await request(slot, { kind: "permission", action: permissionNames[name] ?? "Зовнішня дія",
+        const answer = await request(slot, { kind: "permission", action: permissionNames[name] ?? (moduleTools.has(name) ? "Викликати інструмент модуля" : "Зовнішня дія"),
           parameters: sanitizeParameters({ tool: name, ...input }, secrets) });
         if (answer?.kind !== "permission" || !answer.approved) return refuse;
       }
@@ -485,6 +513,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
           }
           return result(response);
         }),
+      ...(moduleGuard ? sessionModules.abilities.map((ability) => claudeModuleTool(ability, moduleGuard)) : []),
     ] });
     return {
       expected,

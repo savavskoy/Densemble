@@ -16,6 +16,7 @@ sent anywhere.
 - [Your files are safe](#your-files-are-safe)
 - [When something goes wrong](#when-something-goes-wrong)
 - [All settings](#all-settings)
+- [Asking an agent](#asking-an-agent)
 - [Turning it off](#turning-it-off)
 - [Moving from the standalone transcriber](#moving-from-the-standalone-transcriber)
 
@@ -68,29 +69,41 @@ curl -fL -o models/ggml-large-v3.bin https://huggingface.co/ggerganov/whisper.cp
 ```
 
 Then add `"retry": { "modelPath": "./models/ggml-large-v3.bin" }` to the
-`recordings` block (step 2).
+recordings `settings` (step 2).
 
-**2. Add a `recordings` block** to `config.local.json`, with the full path to your
-recordings folder:
+**2. Turn on the recordings module** in `config.local.json`, with the full path to
+your recordings folder:
 
 ```json
-"recordings": {
-  "path": "/Users/you/workspace/raw/recordings",
-  "modelPath": "./models/ggml-large-v3-turbo.bin",
-  "vadModelPath": "./models/ggml-silero-v5.1.2.bin"
+"modules": {
+  "recordings": {
+    "agents": ["alfred"],
+    "settings": {
+      "path": "/Users/you/workspace/raw/recordings",
+      "modelPath": "./models/ggml-large-v3-turbo.bin",
+      "vadModelPath": "./models/ggml-silero-v5.1.2.bin"
+    }
+  }
 }
 ```
 
-These three lines are all you need. Everything else has sensible defaults
-(see [All settings](#all-settings)).
+The three `settings` lines are all you need. Everything else has sensible defaults
+(see [All settings](#all-settings)). `agents` is optional: it lists the agents that
+may tell you about your recordings ([Asking an agent](#asking-an-agent)).
+
+Already have an older top-level `"recordings": { … }` block? It keeps working as
+is; `make doctor` and `make modules-status` only remind you that it has moved to
+`modules.recordings.settings`. Move it when convenient (do not keep both: that is a
+configuration error).
 
 **3. Check and start:**
 
 ```sh
 make stop
-make doctor      # every "recordings-…" line should say ready
+make doctor      # "module:recordings" and every "recordings-…" line should say ready
 make start
 make transcribe-status
+make modules-status   # recordings — ready
 ```
 
 If `make transcribe-status` says "Idle: nothing is being transcribed.", you are
@@ -219,10 +232,10 @@ come out wrong. Check anything important against the recording.
 ## Better spelling of names and terms
 
 Give Densemble a list of words it should spell correctly: names, organisations,
-terms. Add `vocabulary` to the `recordings` block:
+terms. Add `vocabulary` to the recordings `settings`:
 
 ```json
-"recordings": {
+"settings": {
   "path": "…",
   "modelPath": "./models/ggml-large-v3-turbo.bin",
   "vadModelPath": "./models/ggml-silero-v5.1.2.bin",
@@ -283,7 +296,7 @@ conflict instead of guessing.
 
 | Message | What to do |
 |---|---|
-| Recording transcription is off (no recordings folder configured) | Add the `recordings` block ([Set up](#set-up-once)) and `make restart`. |
+| Recording transcription is off (no recordings folder configured) | Add `modules.recordings` ([Set up](#set-up-once)), or set its `enabled` to `true`, and `make restart`. |
 | Recording transcription is off (model or VAD model not ready; run make doctor) | A model file is missing or wrong. Run `make stop`, `make doctor`, fix what it shows, `make start`. |
 | Recording transcription: service not running | Densemble is not running or is stuck. `make status`, then `make start` or `make restart`. |
 | A file stays in "Waiting to finish recording" | Some app still has it open (OBS still recording, a copy still running), or it keeps changing. Close the app or wait. |
@@ -317,7 +330,7 @@ Run it with the service stopped (`make stop` first).
 
 | Line | If not ready |
 |---|---|
-| `recordings-folder` | The folder doesn't exist, can't be read, or isn't inside your workspace. Fix `recordings.path`. |
+| `recordings-folder` | The folder doesn't exist, can't be read, or isn't inside your workspace. Fix `modules.recordings.settings.path`. |
 | `recordings-model` | `…MODEL_MISSING`: download the model. `…ENGLISH_ONLY`: you used a `.en` model; use the multilingual one. `…UNSUPPORTED`: not a whisper.cpp model file. |
 | `recordings-retry-model` | The same for `retry.modelPath` (or the main model when it is not set). New first attempts still work; only repeated attempts fail with `MODEL_UNAVAILABLE`. |
 | `recordings-vad` | The Silero file is missing or wrong; download it again. |
@@ -325,8 +338,9 @@ Run it with the service stopped (`make stop` first).
 
 ## All settings
 
-All of these go in the `recordings` block of `config.local.json`. Only the first
-three are required. Run `make restart` after any change.
+All of these go in `modules.recordings.settings` of `config.local.json` (or in the
+older top-level `recordings` block, if you still have it). Only the first three are
+required. Run `make restart` after any change.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -347,9 +361,22 @@ three are required. Run `make restart` after any change.
 
 `config.example.json` shows every setting with its default.
 
+## Asking an agent
+
+Agents listed in `modules.recordings.agents` (for example `["alfred"]`) can check
+transcription for you: ask «що з транскрипцією записів?» in your own chat and the
+agent answers from the same status as `make transcribe-status`. Agents only read
+the status: they cannot start, retry, move or delete anything, and they answer
+only you (the owner), never other users. Change the list and run `make restart`.
+
+If something is wrong with the module (for example a missing model), `make
+modules-status` and the «Модулі» section of `/status` show the cause and what to
+do, and the coordinator agent (`coordinatorAgentId`) tells you once in its chat.
+
 ## Turning it off
 
-Remove the `recordings` block from `config.local.json` and run `make restart`.
+Set `"enabled": false` in `modules.recordings` (the settings stay for later) or
+remove `modules.recordings` from `config.local.json`, then run `make restart`.
 Your recordings and transcripts stay where they are.
 
 ## Moving from the standalone transcriber

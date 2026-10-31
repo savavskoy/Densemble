@@ -23,6 +23,8 @@ import { handleProactiveCommand } from "./proactive-commands.js";
 import { handleProactivityRequest } from "./proactive-tool.js";
 import { defaultSessionWorkspace, parseWorkspaceCommand, workspaceListText, workspaceRequiredText } from "./workspace-commands.js";
 import type { ProactivityGuardrails } from "./proactive-tool.js";
+import type { ModuleStateReport } from "../modules/contract.js";
+import { formatModulesSection } from "../modules/state.js";
 
 export interface ApplicationMedia extends MediaPreparation {
   releaseRun(identity: RunIdentity): void;
@@ -41,11 +43,19 @@ export interface ApplicationOptions {
   stopTimeoutMs?: number;
   idleReleaseMs?: number;
   refreshAgents?: boolean;
+  /** Module rows for the owner's `/status` «Модулі» section. */
+  modules?: { report(): ModuleStateReport[] };
 }
 export interface Application extends IngressHandler {
   start(recovery?: Recovery): Promise<void>;
   recover(recovery: Recovery): void;
   triggerProactive(item: ProactiveItem): Promise<boolean>;
+  /**
+   * Plain text to the owner's private chat with a bot serving `coordinatorAgentId` (a Copilot bot preferred),
+   * in that chat's current session. A `dedupKey` already in that chat's outbox is a no-op. False when no
+   * coordinator chat exists or the application is stopping.
+   */
+  notifyCoordinator(text: string, dedupKey: string): boolean;
   shutdown(): Promise<void>;
   /** Wait for admitted work; useful for shutdown/tests, never the polling loop. */
   drain(): Promise<void>;
@@ -774,10 +784,42 @@ export function createApplication(options: ApplicationOptions): Application {
       `Модель: ${session.appliedModel}\nОчікувана модель: ${session.pendingModel ?? "немає"}\n` +
       `Активних запитів: ${pending.length}\nПроблема runtime: ${runtimeFaults.get(scopeKey(session.scope)) ?? "немає"}\n` +
       `Проблем доставки: ${failures.length}` +
-      (held.has(scopeKey(session.scope)) ? "\nЗбережена черга утримується після перезапуску." : ""));
+      (held.has(scopeKey(session.scope)) ? "\nЗбережена черга утримується після перезапуску." : "") +
+      modulesSection(session));
     for (const item of failures.slice(-5)) {
       menu(session, `Доставка ${item.status === "uncertain" ? "не підтверджена" : "невдала"}. Повтор не запускає агента.`,
         [[{ text: "Повторити доставку", action: { kind: "retry", outboxId: item.id, confirmed: false } }]]);
+    }
+  }
+  function modulesSection(session: Session): string {
+    if (!options.modules || session.scope.ownerId !== config.config.ownerId) return "";
+    let section: string;
+    try { section = formatModulesSection(options.modules.report()); } catch { return ""; }
+    return section ? `\n\n${section}` : "";
+  }
+  function coordinatorScope(): Scope | undefined {
+    const agentId = config.config.coordinatorAgentId;
+    if (agentId === undefined) return undefined;
+    const ownerId = config.config.ownerId;
+    const chats = config.config.bots.filter((bot) => bot.agentId === agentId).flatMap((bot) =>
+      config.config.bindings.filter((binding) => binding.botId === bot.id && binding.kind === "private" && binding.chatId === ownerId)
+        .map((binding) => ({ binding, copilot: botEngine(config.config, bot.id) === "copilot" })));
+    const chosen = chats.find((chat) => chat.copilot) ?? chats[0];
+    if (!chosen) return undefined;
+    const { binding } = chosen;
+    return { ownerId: scopeOwnerId(config.config, binding), botId: binding.botId, chatId: binding.chatId, topicId: binding.topicId };
+  }
+  function notifyCoordinator(value: string, dedupKey: string): boolean {
+    if (stopped || closing || !value.trim() || !dedupKey.trim()) return false;
+    const scope = coordinatorScope();
+    if (!scope) return false;
+    try {
+      if (store.outbox.list(scope).some((item) => item.dedupKey === dedupKey)) return true;
+      text(current(scope), value, dedupKey);
+      return true;
+    } catch {
+      diagnostics.record("MODULE_NOTICE_UNDELIVERED");
+      return false;
     }
   }
   async function finishDeletion(intent: DeletionIntent): Promise<void> {
@@ -1028,6 +1070,7 @@ export function createApplication(options: ApplicationOptions): Application {
       while (jobs.size) await Promise.allSettled([...jobs]);
     },
     triggerProactive,
+    notifyCoordinator,
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       closing = true;
