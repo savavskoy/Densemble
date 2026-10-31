@@ -36,6 +36,12 @@ vi.mock("../../src/agents/index.js", async () => ({
   createEngineRouter: (await vi.importActual<typeof import("../../src/agents/router.js")>("../../src/agents/router.js")).createEngineRouter,
 }));
 vi.mock("../../src/media/index.js", () => ({ createMediaPipeline: () => harness.media }));
+vi.mock("../../src/recordings/index.js", () => ({
+  startRecordingTranscription: async (options: { settings?: unknown }) => {
+    harness.calls.push(options.settings ? "recordings.start" : "recordings.off");
+    return options.settings ? { stop: async () => { harness.calls.push("recordings.stop"); } } : undefined;
+  },
+}));
 vi.mock("../../src/application/index.js", () => ({ createApplication: () => harness.application }));
 vi.mock("../../src/telegram/index.js", () => ({
   createTelegramAdapter: () => ({
@@ -69,10 +75,18 @@ describe("service composition lifecycle", () => {
   it("recovers owned processes before database work and accepts input only after media recovery", async () => {
     const service = await startService(config);
     expect(harness.calls).toEqual(["lock.acquire", "runtime.recover", "store.open",
-      "store.recover", "media.cleanup", "app.start", "telegram.start"]);
+      "store.recover", "media.cleanup", "recordings.off", "app.start", "telegram.start"]);
     await service.stop();
     await service.stop();
-    expect(harness.calls.slice(7)).toEqual(["telegram.stop", "app.stop", "runtime.stop", "app.drain", "store.close", "lock.release"]);
+    expect(harness.calls.slice(8)).toEqual(["telegram.stop", "app.stop", "runtime.stop", "app.drain", "store.close", "lock.release"]);
+  });
+  it("starts the recordings worker after media recovery and stops it before the store closes", async () => {
+    const service = await startService({ ...config, config: { ...config.config, recordings: {
+      path: "/synthetic/workspace/raw/recordings", modelPath: "/m.bin", vadModelPath: "/v.bin" } } });
+    expect(harness.calls.indexOf("recordings.start")).toBe(harness.calls.indexOf("media.cleanup") + 1);
+    await service.stop();
+    expect(harness.calls.indexOf("recordings.stop")).toBeLessThan(harness.calls.indexOf("store.close"));
+    expect(harness.calls.indexOf("recordings.stop")).toBeLessThan(harness.calls.indexOf("telegram.stop"));
   });
   it("unwinds partial startup while still closing runtime before releasing the process lock", async () => {
     harness.telegramFails = true;

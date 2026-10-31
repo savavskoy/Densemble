@@ -19,7 +19,7 @@ NODE := $(firstword \
 	$(sort $(wildcard $(HOME)/.nvm/versions/node/v24.*/bin/node)) \
 	node)
 
-.PHONY: help build typecheck test doctor claude-login run install start stop restart status logs
+.PHONY: help build typecheck test doctor claude-login run install start stop restart status logs transcribe-status
 
 help:
 	@printf '%s\n' \
@@ -34,6 +34,7 @@ help:
 		'make typecheck  Check application and test types' \
 		'make test       Run offline tests' \
 		'make doctor     Check prerequisites (stop the service first)' \
+		'make transcribe-status  Show recording transcription progress, queue and failures' \
 		'make claude-login  Log the service-owned Claude Code home in with your Claude subscription' \
 		'' \
 		'First background launch: make install && make start' \
@@ -51,6 +52,10 @@ test:
 
 doctor: build
 	$(NODE) dist/main.js doctor --config "$(CONFIG)"
+
+# Read-only; works while the service runs (no process lock).
+transcribe-status:
+	$(NODE) dist/main.js recordings-status --config "$(CONFIG)"
 
 # One-time, interactive: logs the pinned Claude Code binary in under the service-owned CLAUDE_CONFIG_DIR
 # from claudeCode.homePath. It never touches the interactive ~/.claude or stores an API key.

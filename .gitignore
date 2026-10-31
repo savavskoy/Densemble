@@ -47,3 +47,7 @@ coverage/
 *.swp
 *.swo
 *~
+
+# Speech models are provisioned explicitly (README); only the voice default is tracked
+/models/*
+!/models/ggml-small.bin

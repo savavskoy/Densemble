@@ -28,7 +28,7 @@ vi.mock("grammy", () => ({
     async getWebhookInfo() { state.botMethods.push("getWebhookInfo"); return { url: "" }; }
   },
 }));
-const { doctor } = await import("../../src/operations/doctor.js");
+const { doctor, recordingChecks } = await import("../../src/operations/doctor.js");
 const config: LoadedConfig = {
   config: { workspacePath: "/synthetic/workspace", agentDefinitionsPath: "/synthetic/workspace/agents",
     agentLaunchersPath: "/synthetic/workspace/launchers", secretsPath: "/synthetic/workspace/secrets.local.json",
@@ -91,5 +91,61 @@ describe("engine diagnostics", () => {
     const report = await doctor(claudeConfig, { claudeHost: host({ authenticated: false }) });
     expect(report.checks).toContainEqual({ component: "claude-authentication", ready: false, code: "CLAUDE_LOGIN_REQUIRED" });
     expect(report.checks.some((check) => check.component === "claude-models")).toBe(false);
+  });
+});
+describe("recording transcription diagnostics", () => {
+  const root = `${process.cwd()}/.cache/doctor-recordings-${process.pid}`;
+  const header = (vocab: number) => {
+    const bytes = Buffer.alloc(48);
+    [0x67676d6c, vocab, 1500, 1280, 20, 32, 448, 1280, 20, 4, 128, 1].forEach((value, index) => bytes.writeInt32LE(value, index * 4));
+    return bytes;
+  };
+  const withRecordings = (modelPath: string): LoadedConfig => ({ ...config, config: { ...config.config,
+    recordings: { path: `${root}/folder`, modelPath, vadModelPath: `${root}/vad.bin` } } });
+  beforeEach(async () => {
+    const { mkdirSync, rmSync, writeFileSync } = await import("node:fs");
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(`${root}/folder`, { recursive: true });
+    writeFileSync(`${root}/turbo.bin`, header(51866));
+    writeFileSync(`${root}/english.bin`, header(51864));
+    writeFileSync(`${root}/vad.bin`, Buffer.from([0x6c, 0x6d, 0x67, 0x67, 0]));
+  });
+  it("reports recordings off as a ready, informational state", async () => {
+    const report = await doctor(config, { legacyPlist: `${root}/missing.plist` });
+    expect(report.checks).toContainEqual({ component: "recordings", ready: true, code: "RECORDINGS_DISABLED" });
+    expect(report.checks.some((check) => check.component === "recordings-model")).toBe(false);
+  });
+  it("reports folder, model, VAD and the legacy job with names only in details", async () => {
+    const ready = await recordingChecks(withRecordings(`${root}/turbo.bin`), `${root}/missing.plist`);
+    expect(ready.checks).toEqual([
+      { component: "recordings", ready: true, code: "RECORDINGS_ENABLED" },
+      { component: "recordings-folder", ready: true, code: "RECORDINGS_FOLDER_READY" },
+      { component: "recordings-model", ready: true, code: "MEDIA_AUDIO_READY" },
+      { component: "recordings-retry-model", ready: true, code: "MEDIA_AUDIO_READY" },
+      { component: "recordings-vad", ready: true, code: "MEDIA_AUDIO_READY" },
+      { component: "recordings-legacy-job", ready: true, code: "RECORDINGS_LEGACY_JOB_ABSENT" },
+    ]);
+    expect(ready.details).toEqual({ recordingsFolder: `${root}/folder`, recordingsModel: "turbo.bin",
+      recordingsRetryModel: "turbo.bin", recordingsVadModel: "vad.bin" });
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(`${root}/legacy.plist`, "<plist/>");
+    const warned = await recordingChecks(withRecordings(`${root}/english.bin`), `${root}/legacy.plist`);
+    expect(warned.checks).toContainEqual({ component: "recordings-model", ready: false, code: "MEDIA_AUDIO_MODEL_ENGLISH_ONLY" });
+    expect(warned.checks).toContainEqual({ component: "recordings-legacy-job", ready: false, code: "RECORDINGS_LEGACY_JOB_INSTALLED" });
+    const missing = await recordingChecks(withRecordings(`${root}/absent.bin`), `${root}/missing.plist`);
+    expect(missing.checks).toContainEqual({ component: "recordings-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
+  });
+  it("checks a separately configured retry model on its own", async () => {
+    const base = withRecordings(`${root}/turbo.bin`);
+    const withRetry = (retryModel: string): LoadedConfig => ({ ...base, config: { ...base.config,
+      recordings: { ...base.config.recordings!, retry: { modelPath: retryModel } } } });
+    const missing = await recordingChecks(withRetry(`${root}/large.bin`), `${root}/missing.plist`);
+    expect(missing.checks).toContainEqual({ component: "recordings-model", ready: true, code: "MEDIA_AUDIO_READY" });
+    expect(missing.checks).toContainEqual({ component: "recordings-retry-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
+    expect(missing.details.recordingsRetryModel).toBe("large.bin");
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(`${root}/large.bin`, header(51866));
+    const ready = await recordingChecks(withRetry(`${root}/large.bin`), `${root}/missing.plist`);
+    expect(ready.checks).toContainEqual({ component: "recordings-retry-model", ready: true, code: "MEDIA_AUDIO_READY" });
   });
 });

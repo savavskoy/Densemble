@@ -8,6 +8,7 @@ import { assertScope, scopeKey, type Attachment, type IncomingAttachment,
   type PreparedInput, type RunIdentity, type Scope } from "../domain.js";
 import type { DiagnosticSink, MediaPreparation, StateStore } from "../ports.js";
 import { createAudioTranscriber, type AudioSettings } from "./audio.js";
+import type { SpeechGate } from "./speech-gate.js";
 import { checkAbort, MediaError, mediaError } from "./errors.js";
 import { extractFile, type ExtractionOptions } from "./extraction.js";
 import { MEDIA_LIMITS } from "./limits.js";
@@ -18,7 +19,9 @@ import { SerialQueue } from "./process.js";
 export { MediaError, mediaMessages, type MediaErrorCode } from "./errors.js";
 export { MEDIA_LIMITS } from "./limits.js";
 export { checkAudioReadiness, type AudioSettings, type AudioReadiness } from "./audio.js";
-export { runManagedProcess, type ProcessRunner, type ProcessOptions, type ProcessResult } from "./process.js";
+export { runManagedProcess, type ProcessControl, type ProcessRunner, type ProcessOptions, type ProcessResult } from "./process.js";
+export { SpeechGate } from "./speech-gate.js";
+export { checkVadModel, checkWhisperModel, type WhisperModelCode } from "./whisper.js";
 
 export type MediaDownload = (botId: string, fileId: string, destination: string,
   signal: AbortSignal, maxBytes: number) => Promise<unknown>;
@@ -29,6 +32,8 @@ export interface MediaPipelineOptions {
   download: MediaDownload;
   diagnostics: DiagnosticSink;
   audio?: AudioSettings;
+  /** Shared with the recordings worker: voice messages pause background transcription. */
+  speechGate?: SpeechGate;
   extraction?: ExtractionOptions;
   now?: () => number;
 }
@@ -67,7 +72,7 @@ export function createMediaPipeline(options: MediaPipelineOptions): MediaPipelin
   const root = join(runtime, "media");
   const store = options.store;
   const now = options.now ?? Date.now;
-  const audio = createAudioTranscriber(options.audio);
+  const audio = createAudioTranscriber(options.audio, options.speechGate);
   const extractionQueue = new SerialQueue();
   const active = new Set<string>();
   let ready: Promise<void> | undefined;

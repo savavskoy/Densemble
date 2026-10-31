@@ -33,6 +33,16 @@ async function main(): Promise<void> {
     }));
     return;
   }
+  if (args.command === "recordings-status") {
+    // Read-only and lock-free: it only reads the snapshot the running service writes.
+    const { formatStatus, readStatus } = await import("./recordings/index.js");
+    const status = config.config.recordings
+      ? await readStatus(join(config.config.runtimeDataPath, "recordings", "status.json")) : undefined;
+    process.stdout.write(args.json
+      ? `${JSON.stringify({ configured: Boolean(config.config.recordings), status: status ?? null }, null, 2)}\n`
+      : formatStatus({ configured: Boolean(config.config.recordings), status, now: Date.now() }));
+    return;
+  }
   if (args.command === "start") {
     const { startService } = await import("./service.js");
     let stopping = false;

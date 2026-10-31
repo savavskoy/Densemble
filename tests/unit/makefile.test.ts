@@ -83,3 +83,8 @@ it("stops before rebuilding and restarting, and never proceeds after a stop fail
   expect(commands()[1]).toBe("npm run build");
   expect(commands().at(-1)).toContain("launchctl bootstrap");
 });
+
+it("shows recording transcription status without building or locking the service", () => {
+  expect(make("transcribe-status").status).toBe(0);
+  expect(commands()).toEqual(["node dist/main.js recordings-status --config synthetic config.json"]);
+});

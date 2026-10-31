@@ -245,8 +245,9 @@ tool governed by the configured permission mode, not automatic sending of a
 model-mentioned path.
 
 Provision FFmpeg and whisper.cpp explicitly, and download a **multilingual
-Whisper small GGML** model yourself (not `small.en` or Python `.pt`). Optional
-configuration, using your actual local paths:
+whisper.cpp GGML** model yourself (any size; not `.en` or Python `.pt`). Voice
+messages keep the small model. Optional configuration, using your actual local
+paths (`vocabulary` hints and a Silero `vadModelPath` are optional):
 
 ```json
 "audio": {
@@ -255,7 +256,8 @@ configuration, using your actual local paths:
   "whisperPath": "/opt/homebrew/bin/whisper-cli",
   "modelPath": "/absolute/path/to/ggml-small.bin",
   "language": "auto",
-  "threads": 4
+  "threads": 4,
+  "vocabulary": ["НБУВ", "бібліотекознавство"]
 }
 ```
 
@@ -264,6 +266,25 @@ voice stays local to ASR, then only the labelled transcript goes to Copilot.
 Raw voice/WAV are removed on success, failure and cancellation; inputs expire
 after seven days unless retained for active work/delivery. See the
 [media adapter](src/media/README.md) and [Telegram adapter](src/telegram/README.md).
+
+## Recording transcription (optional)
+
+User-facing setup, everyday use and troubleshooting:
+[user guide → Recording transcription](docs/user-guide/recordings.md).
+
+Implementation: `src/recordings/` (worker, filing, transcription, status,
+notifications, legacy-lock interop), wired in `src/service.ts` after media
+cleanup and stopped first on shutdown. Voice messages and recordings share one
+`SpeechGate` (`src/media/speech-gate.ts`): a voice message SIGSTOPs the
+recording's process group and SIGCONTs it afterwards (`src/media/process.ts`).
+Model header checks and whisper.cpp arguments live in `src/media/whisper.ts`;
+defaults (first pass, retry, silence detection) in `src/recordings/settings.ts`,
+silence detection in `src/recordings/silence.ts`.
+`recordings-status [--json]` (`make transcribe-status`) reads the worker's
+heartbeat snapshot without the process lock; `doctor` adds the `recordings-*`
+checks. The folder/file contract, the only allowed mutations, diagnostics and
+failure reasons are specified in
+[contracts → Recording transcription](docs/contracts.md#recording-transcription).
 
 ## macOS background operation
 

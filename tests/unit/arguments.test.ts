@@ -10,11 +10,16 @@ describe("explicit service CLI operations", () => {
     expect(parseArguments(["backup", "--target", "/private/backup"])).toEqual({
       command: "backup", config: "config.local.json", target: "/private/backup",
     });
+    expect(parseArguments(["recordings-status", "--json", "--config", "c.json"])).toEqual({
+      command: "recordings-status", config: "c.json", json: true,
+    });
+    expect(parseArguments(["recordings-status"])).toEqual({ command: "recordings-status", config: "config.local.json" });
   });
   it.each([
     ["unknown"], ["start", "--config"], ["start", "--config", "--target"],
     ["backup"], ["start", "--target", "/private/backup"], ["doctor", "--verbose"],
-    ["doctor", "--config", "a", "--config", "b"],
+    ["doctor", "--config", "a", "--config", "b"], ["doctor", "--json"], ["recordings-status", "--json", "--json"],
+    ["recordings-status", "--target", "/x"],
   ])("rejects unsupported or incomplete arguments %j", (...args) => {
     expect(() => parseArguments(args)).toThrow();
   });

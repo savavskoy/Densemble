@@ -5,13 +5,49 @@ import { checkedPath } from "../config/paths.js";
 import { pinnedRuntimePath, serviceClientOptions } from "../agents/copilot.js";
 import { checkAudioReadiness } from "../media/index.js";
 import { bounded } from "../agents/contracts.js";
-import { audioSettings } from "./audio-settings.js";
+import { audioSettings, recordingSettings } from "./audio-settings.js";
+import { constants } from "node:fs";
+import { access } from "node:fs/promises";
+import { basename } from "node:path";
+import { checkVadModel, checkWhisperModel } from "../media/whisper.js";
+import { legacyJobInstalled } from "../recordings/legacy.js";
 import type { ClaudeHostFactory } from "../agents/claude.js";
 import { botEngine } from "../config/index.js";
 
 export interface DoctorReport {
   ready: boolean;
   checks: { component: string; ready: boolean; code: string; count?: number }[];
+  /** Owner-local configuration names for humans; never written to logs. */
+  details?: {
+    voiceModel?: string; recordingsFolder?: string; recordingsModel?: string; recordingsRetryModel?: string; recordingsVadModel?: string;
+  };
+}
+
+/** Recording transcription readiness (FR-024, FR-025); "off" is a valid, ready state. */
+export async function recordingChecks(config: LoadedConfig, legacyPlist?: string): Promise<{
+  checks: DoctorReport["checks"]; details: NonNullable<DoctorReport["details"]>;
+}> {
+  const settings = recordingSettings(config.config);
+  if (!settings) return { checks: [{ component: "recordings", ready: true, code: "RECORDINGS_DISABLED" }], details: {} };
+  let readable = true;
+  try { await access(settings.path, constants.R_OK | constants.W_OK | constants.X_OK); } catch { readable = false; }
+  const model = await checkWhisperModel(settings.modelPath);
+  const retryModel = settings.retry.modelPath === settings.modelPath ? model : await checkWhisperModel(settings.retry.modelPath);
+  const vad = await checkVadModel(settings.vadModelPath);
+  const legacy = await legacyJobInstalled(legacyPlist);
+  return {
+    checks: [
+      { component: "recordings", ready: true, code: "RECORDINGS_ENABLED" },
+      { component: "recordings-folder", ready: readable, code: readable ? "RECORDINGS_FOLDER_READY" : "RECORDINGS_FOLDER_UNREADABLE" },
+      { component: "recordings-model", ready: model === "MEDIA_AUDIO_READY", code: model },
+      { component: "recordings-retry-model", ready: retryModel === "MEDIA_AUDIO_READY", code: retryModel },
+      { component: "recordings-vad", ready: vad === "MEDIA_AUDIO_READY", code: vad },
+      { component: "recordings-legacy-job", ready: !legacy,
+        code: legacy ? "RECORDINGS_LEGACY_JOB_INSTALLED" : "RECORDINGS_LEGACY_JOB_ABSENT" },
+    ],
+    details: { recordingsFolder: settings.path, recordingsModel: basename(settings.modelPath),
+      recordingsRetryModel: basename(settings.retry.modelPath), recordingsVadModel: basename(settings.vadModelPath) },
+  };
 }
 
 /** Zero-inference Claude Code readiness: pinned version, service login and the configured models. */
@@ -45,7 +81,7 @@ async function claudeChecks(config: LoadedConfig, factory?: ClaudeHostFactory): 
   return checks;
 }
 
-export async function doctor(config: LoadedConfig, options: { claudeHost?: ClaudeHostFactory } = {}): Promise<DoctorReport> {
+export async function doctor(config: LoadedConfig, options: { claudeHost?: ClaudeHostFactory; legacyPlist?: string } = {}): Promise<DoctorReport> {
   const checks: DoctorReport["checks"] = [];
   let client: CopilotClient | undefined;
   try {
@@ -104,7 +140,10 @@ export async function doctor(config: LoadedConfig, options: { claudeHost?: Claud
   }
   const audio = await checkAudioReadiness(audioSettings(config.config));
   checks.push({ component: "audio", ready: audio.ready, code: audio.code });
+  const recordings = await recordingChecks(config, options.legacyPlist);
+  checks.push(...recordings.checks);
+  const details = { ...(config.config.audio?.modelPath ? { voiceModel: basename(config.config.audio.modelPath) } : {}), ...recordings.details };
   checks.push({ component: "mcp", ready: config.config.mcp.mode === "none",
     code: config.config.mcp.mode === "none" ? "MCP_EXPLICITLY_DISABLED" : "MCP_REQUIRES_TOOL_ACCEPTANCE" });
-  return { ready: checks.every((check) => check.ready), checks };
+  return { ready: checks.every((check) => check.ready), checks, ...(Object.keys(details).length ? { details } : {}) };
 }

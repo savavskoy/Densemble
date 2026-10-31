@@ -88,6 +88,53 @@ describe("private configuration and discovery", () => {
     config.audio.threads = 9;
     expect(load).toThrow("CONFIG_SCHEMA_INVALID");
   });
+  it("bounds vocabulary hints and resolves the optional voice VAD model", () => {
+    config.audio = { vocabulary: ["НБУВ", "бібліотекознавство"], vadModelPath: "./models/vad.bin" };
+    expect(load().config.audio).toMatchObject({ vocabulary: ["НБУВ", "бібліотекознавство"], vadModelPath: join(code, "models/vad.bin") });
+    for (const vocabulary of [[""], ["x".repeat(61)], ["bad\u0007term"], Array.from({ length: 101 }, () => "a"),
+      Array.from({ length: 20 }, () => "y".repeat(45))]) {
+      config.audio = { vocabulary };
+      expect(load).toThrow("CONFIG_SCHEMA_INVALID");
+    }
+  });
+  it("accepts a recordings folder inside an owner workspace with strict, bounded settings", () => {
+    mkdirSync(join(source, "raw/recordings"), { recursive: true });
+    config.recordings = { path: join(source, "raw/recordings"), modelPath: "./models/large.bin", vadModelPath: "./models/vad.bin",
+      vocabulary: ["НБУВ"], quietMinutes: 2, pollIntervalMs: 60_000, vad: { threshold: 0.5, minSpeechMs: 250 },
+      suppressNonSpeech: false, maxContext: 0, silence: { thresholdDb: -80, minSeconds: 60 },
+      retry: { modelPath: "./models/large-v3.bin", vadThreshold: 0.6, suppressNonSpeech: true, maxContext: 0 }, notifications: false };
+    expect(load().config.recordings).toMatchObject({
+      path: join(source, "raw/recordings"), modelPath: join(code, "models/large.bin"), vadModelPath: join(code, "models/vad.bin"),
+      retry: { modelPath: join(code, "models/large-v3.bin") },
+    });
+    for (const invalid of [{ pollIntervalMs: 1_000 }, { quietMinutes: 0 }, { vad: { threshold: 1 } },
+      { retry: { maxContext: 300 } }, { retry: { modelPath: "" } }, { maxContext: 300 }, { suppressNonSpeech: "yes" },
+      { silence: { thresholdDb: -10 } }, { silence: { minSeconds: 1 } }, { silence: { extra: 1 } },
+      { unknown: true }, { language: "Ukrainian" }]) {
+      write(configPath, JSON.stringify({ ...config, recordings: { ...config.recordings, ...invalid } }));
+      expect(() => loadConfig(configPath, { codeRoot: code })).toThrow("CONFIG_SCHEMA_INVALID");
+    }
+    const { modelPath: _model, ...withoutModel } = config.recordings;
+    write(configPath, JSON.stringify({ ...config, recordings: withoutModel }));
+    expect(() => loadConfig(configPath, { codeRoot: code })).toThrow("CONFIG_SCHEMA_INVALID");
+  });
+  it("rejects recordings folders outside owner workspaces, missing, symlinked or overlapping protected paths", () => {
+    const recordings = (path: string) => ({ path, modelPath: "./m.bin", vadModelPath: "./v.bin" });
+    mkdirSync(join(root, "elsewhere"), { recursive: true });
+    config.recordings = recordings(join(root, "elsewhere"));
+    expect(load).toThrow("RECORDINGS_PATH_OUTSIDE_WORKSPACE");
+    config.recordings = recordings(join(source, "missing"));
+    expect(load).toThrow("PATH_MISSING_OR_UNREADABLE");
+    symlinkSync(join(root, "elsewhere"), join(source, "linked"));
+    config.recordings = recordings(join(source, "linked"));
+    expect(load).toThrow("SYMLINK_PATH_REJECTED");
+    // The workspace root holds the secrets file, so recordings must live in a subfolder.
+    config.recordings = recordings(source);
+    expect(load).toThrow("UNSAFE_PATH_OVERLAP");
+  });
+  it("keeps recordings off when the section is absent", () => {
+    expect(load().config.recordings).toBeUndefined();
+  });
   it("discovers all personas and workers with references, launcher-only models and explicit skills", () => {
     const result = load();
     expect(result.agents).toHaveLength(6);

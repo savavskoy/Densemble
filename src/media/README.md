@@ -168,10 +168,15 @@ not claim to make arbitrary shell/MCP or concurrently modified user files safe.
 
 Nothing installs FFmpeg/whisper.cpp or downloads an ASR model automatically.
 Provision those explicitly and supply an absolute `audio.modelPath` pointing at
-the **GGML multilingual small** whisper.cpp model (quantized variants supported).
-The model header is checked for the small multilingual architecture, rejecting
-`small.en` and other model families. This header check is not a model checksum or
-proof of real recognition quality.
+a **multilingual** whisper.cpp GGML model of any size (tiny…large-v3, large-v3-turbo,
+quantized variants supported). `whisper.ts` checks the header: `n_vocab` 51865/51866,
+a known audio state/layer pair with matching heads, text layers equal or 4 (turbo),
+80/128 mels. `.en` models (`n_vocab` 51864) return `MEDIA_AUDIO_MODEL_ENGLISH_ONLY`,
+other or truncated files `MEDIA_AUDIO_MODEL_UNSUPPORTED`, absent ones
+`MEDIA_AUDIO_MODEL_MISSING`. This header check is not a model checksum or proof of
+real recognition quality. An optional `vadModelPath` (Silero GGML, magic-checked,
+`MEDIA_AUDIO_VAD_MODEL_INVALID`) enables whisper.cpp VAD, so silence/music are not
+decoded and automatic language detection runs on speech.
 
 `AudioSettings` supports:
 
@@ -179,6 +184,7 @@ proof of real recognition quality.
   `ffmpeg`, `whisper-cli`);
 - `modelPath` (required for ASR; no default download location);
 - `language` (`auto` by default), `threads` (default 4, bounded to 1–8);
+- `vocabulary` (joined into the Whisper `--prompt`) and `vadModelPath`;
 - lower `probeTimeoutMs`, `decodeTimeoutMs`, `asrTimeoutMs`;
 - `processRunner` for deterministic tests, not a cloud-provider fallback.
 
@@ -193,9 +199,18 @@ ownership. They are not unreferenced or left running. Raw/WAV/transcript files
 are removed after success, failure or cancellation; only transcript text reaches
 the application/session. Startup removes marked orphan audio.
 
+Voice recognition enters the shared `SpeechGate` (`speech-gate.ts`). The
+recordings worker registers the control handle of its running FFmpeg/whisper
+process group (`runManagedProcess` `onSpawn`), which the gate stops with `SIGSTOP`
+while any voice message is recognised and continues with `SIGCONT` afterwards;
+the managed-process timeout is suspended while paused. `onStderrLine` and
+`discardStdout` let long runs stream whisper's `-pp` progress without
+accumulating output.
+
 `checkAudioReadiness(settings)` performs **non-executing prerequisite checks** and
-returns `{ready, code}` (`MEDIA_AUDIO_READY`, `MEDIA_AUDIO_TOOLS_MISSING`, or
-`MEDIA_AUDIO_MODEL_MISSING`). Doctor should expose this separately from a real
+returns `{ready, code}` (`MEDIA_AUDIO_READY`, `MEDIA_AUDIO_TOOLS_MISSING`,
+`MEDIA_AUDIO_MODEL_MISSING`, `MEDIA_AUDIO_MODEL_ENGLISH_ONLY`,
+`MEDIA_AUDIO_MODEL_UNSUPPORTED` or `MEDIA_AUDIO_VAD_MODEL_INVALID`). Doctor should expose this separately from a real
 voice acceptance test. Tests cover real worker/process cancellation, synthetic
 audio with installed ffmpeg/ffprobe when available, and a stand-in ASR runner.
 They do **not** demonstrate Ukrainian ASR accuracy; that requires an explicitly

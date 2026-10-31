@@ -98,11 +98,32 @@ explicitly if launched from elsewhere.
   supplies `url` and `headers`. Environment/header values are `{ secretRef }`;
   arguments may be plain nonsecret strings or `{ secretRef }`. URL credentials
   and query strings are rejected. There is no implicit global or IDE-only MCP.
-- Optional `audio` selects local FFmpeg/ffprobe/whisper.cpp executables, the
-  explicitly provisioned multilingual small GGML model, language/threads and
-  bounded timeouts. Relative paths resolve beside the configuration file;
-  bare executable names use PATH. Missing audio tools/model do not prevent text
-  service startup, but voice fails explicitly. No automatic model download.
+- Optional `audio` selects local FFmpeg/ffprobe/whisper.cpp executables, an
+  explicitly provisioned multilingual whisper.cpp GGML model (any size, quantized
+  allowed; `.en` rejected), `language` (`auto` by default, detected from speech
+  when a VAD model is set), threads, bounded timeouts, `vocabulary` (≤ 100 hints,
+  each 1–60 chars, joined ≤ 800 chars, passed as the Whisper prompt) and an
+  optional `vadModelPath` (Silero GGML). Relative paths resolve beside the
+  configuration file; bare executable names use PATH. Missing audio tools/model
+  do not prevent text service startup, but voice fails explicitly. No automatic
+  model download.
+- Optional `recordings` turns on recording transcription (absent → off). Required:
+  `path` (existing non-symlink directory inside `workspacePath` or an
+  owner-owned workspace, disjoint from code, runtime, interactive/Claude homes,
+  configuration and secrets; else `RECORDINGS_PATH_OUTSIDE_WORKSPACE` /
+  `UNSAFE_PATH_OVERLAP`), `modelPath`, `vadModelPath`. Optional: `language`,
+  `threads` (1–8), `vocabulary` (overrides `audio.vocabulary`), `quietMinutes`
+  (1–60, default 2), `pollIntervalMs` (30 000–300 000, default 60 000), `vad`
+  (`threshold` 0.1–0.95, `minSpeechMs`/`minSilenceMs`/`padMs` 0–10 000; default
+  0.35/250/500/200), `suppressNonSpeech` (default false), `maxContext` (−1…224,
+  default 0), `retry` (`modelPath`, `vadThreshold`, `vadMinSpeechMs`,
+  `suppressNonSpeech`, `maxContext`; each defaults to the first-pass value),
+  `silence` (`thresholdDb` −120…−30, default −80; `minSeconds` 10–3 600, default 60)
+  and `notifications` (default true). An unusable `retry.modelPath` is reported
+  (`RECORDING_RETRY_MODEL_UNAVAILABLE`, doctor `recordings-retry-model`) and fails
+  retries only (`MODEL_UNAVAILABLE`). Tool paths are shared with `audio`. An
+  unusable model keeps recordings off with a `RECORDING_MODEL_*` diagnostic; the
+  service still starts. Settings apply after a restart, to new transcriptions only.
 
 `ConfigError.code` is a fixed diagnostic, never a serialized Zod/YAML error with
 configuration values. Examples are deliberately not executable private settings.
@@ -227,6 +248,78 @@ inbox bodies; it does not delete native history, attachments or user files.
 `backup(destination)` uses SQLite's online backup API, exclusively creates a private
 0600 destination before copying, removes its owned incomplete destination on failure, refuses an existing target,
 and does not copy a live database/WAL with raw filesystem operations.
+
+## Recording transcription
+
+The recordings worker owns one watched folder; its file contract is shared with
+the owner's review tooling and does not change:
+
+```text
+<path>/review-log.tsv                                   read-only for Densemble
+<path>/<recording>.<ext>                                root: filed when finished
+<path>/YYYY/MM/DD/<name>.<ext>
+<path>/YYYY/MM/DD/transcript_YYYY-MM-DD_<name, spaces as _>.txt
+<path>/YYYY/MM/DD/<label>_transcript_….txt              written by review only
+<path>/YYYY/MM/DD/transcript_….attempt-1.txt            written by review only
+<path>/YYYY/MM/DD/.densemble-<uuid>.partial             Densemble temp only
+```
+
+- Media: m4a mp3 wav mp4 mkv mov flv webm ogg opus aac (case-insensitive); hidden,
+  non-media files and other subfolders are ignored.
+- A root file is filed when no process holds it open (`lsof`), it is unmodified
+  for `quietMinutes` and ffprobe reads a positive duration; its day comes from an
+  OBS name `YYYY-MM-DD HH-MM-SS.ext`, else the local mtime date. Filing is
+  `link()` + `unlink()`: an existing target is a reported conflict, never
+  overwritten; a same-inode root remnant of an interrupted move is removed; a
+  symlinked or non-directory `YYYY/MM/DD` component is a `TARGET_UNSAFE` conflict.
+  The folder is rescanned after every recording; an unreadable day folder is
+  skipped (`RECORDINGS_FOLDER_UNREADABLE`), never fatal. FFmpeg/ffprobe read only
+  local files (`-protocol_whitelist file`). The running tool's process group id
+  is kept in `runtimeDataPath/recordings/active-process.json`, so a restart after
+  a crash ends an orphaned FFmpeg/whisper group before starting again.
+- A recording is **done** when `<key>.txt`, `<label>_<key>.txt` or
+  `<key>.attempt-N.txt` exists, even if the recording was deleted; a **retry** is
+  pending when `review-log.tsv` has `retranscribe` for `<day>/<key>.txt` and no
+  transcript exists — it runs with the `retry` settings: `retry.modelPath` (a
+  stronger model), otherwise the first-pass model, VAD and flags.
+  Two media files with the same key in one day: the oldest is transcribed, the
+  others are reported as `SAME_KEY` conflicts.
+- Densemble's only mutations: filing, creating a `<key>.txt` that did not exist
+  (temp → `fsync` → exclusive `link()`), and creating/removing its own
+  `.densemble-*.partial`. Nothing is renamed, emptied or deleted otherwise.
+- Recognition: whisper.cpp with Silero VAD, vocabulary prompt, language detected
+  from speech, `-mc 0` (no carried text context) on the first pass; transcripts
+  are post-filtered (tag-only lines dropped, runs of ≥ 3 identical lines or of
+  ≥ 3 identical consecutive clauses — split at `, . ! ? …` — within a line kept
+  once; empty →
+  `[no speech detected]`).
+- Digital silence: after decoding, FFmpeg `silencedetect`
+  (`noise=<thresholdDb>dB:d=<minSeconds>`) runs over the WAV; spans
+  `{ startSeconds, durationSeconds, toEnd? }` go to `status.json` (`current.silences`,
+  `recent[].silences`), `recordings-status` and the ready notification
+  ("no audio signal from 13:23 to the end (68 min)"), plus `RECORDING_SILENCE_FOUND`
+  (`count`, `seconds`). A failed check never fails the transcription
+  (`RECORDING_SILENCE_CHECK_FAILED`, no `silences` field). Recordings are
+  processed one at a time, oldest first; a failure is remembered (path, size,
+  mtime) until restart. Work files live under `runtimeDataPath/recordings/work`
+  and are removed on completion and at start.
+- Voice first: one `SpeechGate` per service; a voice message stops (`SIGSTOP`)
+  the recording's process group and continues it (`SIGCONT`) afterwards; paused
+  time does not count toward the recording's timeout. `/stop` never reaches it.
+- Status: `runtimeDataPath/recordings/status.json` (0600, atomic) is read by
+  `recordings-status [--json]` without the process lock; stale after 3 × poll
+  interval → "service not running". macOS notifications "Transcription ready" /
+  "Transcription failed" go once per outcome per file per run.
+- Legacy launchd job: while `~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist`
+  exists, Densemble warns (`RECORDINGS_LEGACY_JOB_INSTALLED`) and holds the old
+  script's lock dir `/tmp/transcribe-new-recordings.lock` around each recording;
+  a foreign lock means skip (`RECORDINGS_LEGACY_LOCK_BUSY`). The lock's mtime is
+  refreshed every 10 minutes (the old script treats 6 h as stale) and only the
+  same directory Densemble created is removed.
+- Diagnostics (codes only): `RECORDINGS_STARTED|DISABLED|START_FAILED|PASS_FAILED|STATUS_FAILED|FOLDER_UNREADABLE|LEGACY_LOCK_BUSY`,
+  `RECORDING_FILED|WAITING|CONFLICT|STARTED|PAUSED|RESUMED|DONE|FAILED|INTERRUPTED|NOTIFY_FAILED|ORPHAN_ENDED`,
+  `RECORDING_MODEL_MISSING|ENGLISH_ONLY|UNSUPPORTED`; failure `reason` is one of
+  `DECODE_FAILED ASR_FAILED TIMEOUT DISK_FULL TARGET_EXISTS MODEL_UNAVAILABLE OUTPUT_INVALID`.
 
 ## Remaining adapter responsibilities
 

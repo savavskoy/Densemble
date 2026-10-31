@@ -15,6 +15,37 @@ const secretRef = z.string().regex(/^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$/)
   .refine((ref) => !ref.split(".").some((part) => ["__proto__", "prototype", "constructor"].includes(part)));
 const secretValue = z.object({ secretRef }).strict();
 const mcpCommon = { name, tools: z.array(nonempty).min(1) };
+const language = z.string().regex(/^(auto|[a-z]{2,3})$/);
+const threads = z.number().int().min(1).max(8);
+/** Recognition hints joined into one whisper prompt; bounded so they never crowd out speech context. */
+const vocabulary = z.array(z.string().trim().min(1).max(60).regex(/^[^\p{Cc}]+$/u)).max(100)
+  .refine((terms) => terms.join(", ").length <= 800);
+const vadThreshold = z.number().min(0.1).max(0.95);
+const vadMs = z.number().int().min(0).max(10_000);
+const maxContext = z.number().int().min(-1).max(224);
+const recordingsSchema = z.object({
+  path: nonempty,
+  modelPath: nonempty,
+  vadModelPath: nonempty,
+  language: language.optional(),
+  threads: threads.optional(),
+  vocabulary: vocabulary.optional(),
+  quietMinutes: z.number().int().min(1).max(60).optional(),
+  pollIntervalMs: z.number().int().min(30_000).max(300_000).optional(),
+  vad: z.object({
+    threshold: vadThreshold.optional(), minSpeechMs: vadMs.optional(), minSilenceMs: vadMs.optional(), padMs: vadMs.optional(),
+  }).strict().optional(),
+  suppressNonSpeech: z.boolean().optional(),
+  maxContext: maxContext.optional(),
+  retry: z.object({
+    modelPath: nonempty.optional(), vadThreshold: vadThreshold.optional(), vadMinSpeechMs: vadMs.optional(),
+    suppressNonSpeech: z.boolean().optional(), maxContext: maxContext.optional(),
+  }).strict().optional(),
+  silence: z.object({
+    thresholdDb: z.number().int().min(-120).max(-30).optional(), minSeconds: z.number().int().min(10).max(3_600).optional(),
+  }).strict().optional(),
+  notifications: z.boolean().optional(),
+}).strict();
 const mcpSchema = z.discriminatedUnion("type", [
   z.object({
     ...mcpCommon, type: z.literal("stdio"), command: nonempty, args: z.array(z.union([z.string(), secretValue])),
@@ -68,12 +99,15 @@ export const configSchema = z.object({
     ffprobePath: nonempty.optional(),
     whisperPath: nonempty.optional(),
     modelPath: nonempty.optional(),
-    language: z.string().regex(/^(auto|[a-z]{2,3})$/).optional(),
-    threads: z.number().int().min(1).max(8).optional(),
+    language: language.optional(),
+    threads: threads.optional(),
+    vocabulary: vocabulary.optional(),
+    vadModelPath: nonempty.optional(),
     probeTimeoutMs: z.number().int().min(1).max(15_000).optional(),
     decodeTimeoutMs: z.number().int().min(1).max(120_000).optional(),
     asrTimeoutMs: z.number().int().min(1).max(900_000).optional(),
   }).strict().optional(),
+  recordings: recordingsSchema.optional(),
 }).strict();
 export type ServiceConfig = z.infer<typeof configSchema>;
 export type BotConfig = ServiceConfig["bots"][number];
@@ -129,6 +163,7 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
   const fromConfig = (path: string) => resolve(dirname(file), path);
   if (config.audio) {
     if (config.audio.modelPath) config.audio.modelPath = fromConfig(config.audio.modelPath);
+    if (config.audio.vadModelPath) config.audio.vadModelPath = fromConfig(config.audio.vadModelPath);
     for (const key of ["ffmpegPath", "ffprobePath", "whisperPath"] as const) {
       const command = config.audio[key];
       if (command?.includes("/")) config.audio[key] = fromConfig(command);
@@ -227,6 +262,20 @@ export function loadConfig(configPath: string, options: { codeRoot?: string } = 
       code, configFile: file, secretsPath: config.secretsPath, serviceWorkspace: config.workspacePath,
       runtimeDataPath: config.runtimeDataPath, runtimeHomePath: config.runtimeHomePath, interactiveHomePath: interactive,
     }, fromConfig);
+  }
+  if (config.recordings) {
+    // Model files are checked at service start: a bad model disables recordings, not the service.
+    config.recordings.modelPath = fromConfig(config.recordings.modelPath);
+    config.recordings.vadModelPath = fromConfig(config.recordings.vadModelPath);
+    if (config.recordings.retry?.modelPath) config.recordings.retry.modelPath = fromConfig(config.recordings.retry.modelPath);
+    const folder = checkedPath(fromConfig(config.recordings.path), "directory");
+    const ownerRoots = [config.workspacePath, ...(config.workspaces ?? [])
+      .filter((workspace) => workspace.ownerUserId === config.ownerId).map((workspace) => workspace.path)];
+    if (!ownerRoots.some((root) => isWithin(root, folder))) throw new ConfigError("RECORDINGS_PATH_OUTSIDE_WORKSPACE");
+    for (const managed of [code, config.runtimeDataPath, config.runtimeHomePath, interactive,
+      ...(config.claudeCode ? [config.claudeCode.homePath] : [])]) assertDisjoint(managed, folder);
+    if (isWithin(folder, file) || isWithin(folder, config.secretsPath)) throw new ConfigError("UNSAFE_PATH_OVERLAP");
+    config.recordings.path = folder;
   }
   if (config.mcp.mode === "allowlist") {
     const names = new Set<string>();

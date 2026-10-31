@@ -12,7 +12,9 @@ import { createProactiveScheduler } from "./scheduling/scheduler.js";
 import { openStore } from "./storage/index.js";
 import { acquireProcessLock } from "./storage/process-lock.js";
 import { createDiagnostics } from "./operations/diagnostics.js";
-import { audioSettings } from "./operations/audio-settings.js";
+import { audioSettings, recordingSettings } from "./operations/audio-settings.js";
+import { SpeechGate } from "./media/speech-gate.js";
+import { startRecordingTranscription, type RecordingWorker } from "./recordings/index.js";
 
 export async function startService(config: LoadedConfig, options: { shutdownTimeoutMs?: number } = {}): Promise<{ stop(): Promise<void> }> {
   const diagnostics = createDiagnostics({ botIds: config.config.bots.map((bot) => bot.id) });
@@ -25,11 +27,13 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
   let maintenance: Promise<void> | undefined;
   let timer: NodeJS.Timeout | undefined;
   let scheduler: { start(): void; stop(): void } | undefined;
+  let recordings: RecordingWorker | undefined;
   function stop(): Promise<void> {
     return closing ??= (async () => {
       scheduler?.stop();
       clearInterval(timer);
       const errors: unknown[] = [];
+      try { await recordings?.stop(); } catch (error) { errors.push(error); }
       let confirmed = true;
       try { await maintenance; } catch (error) { errors.push(error); confirmed = false; }
       try { await telegram?.stop(); } catch (error) { errors.push(error); confirmed = false; }
@@ -66,15 +70,18 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
     await runtime.recoverOwnedProcesses();
     store = openStore({ path: join(config.config.runtimeDataPath, "state.sqlite") });
     let media: MediaPipeline;
+    const speechGate = new SpeechGate();
     telegram = createTelegramAdapter({
       config, store, diagnostics,
       resolveAttachment: (scope, id) => media.resolveAttachment(scope, id),
     });
     media = createMediaPipeline({
-      config, store, diagnostics, download: telegram.downloadFile, audio: audioSettings(config.config),
+      config, store, diagnostics, download: telegram.downloadFile, audio: audioSettings(config.config), speechGate,
     });
     const recovery = store.recover();
     await media.cleanup();
+    recordings = await startRecordingTranscription({ settings: recordingSettings(config.config),
+      runtimeDataPath: config.config.runtimeDataPath, diagnostics, gate: speechGate });
     application = createApplication({ config, store, runtime, media, delivery: telegram.transport, diagnostics });
     await application.start(recovery);
     scheduler = createProactiveScheduler({
