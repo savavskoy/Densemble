@@ -48,6 +48,5 @@ coverage/
 *.swo
 *~
 
-# Speech models are provisioned explicitly (README); only the voice default is tracked
+# Speech models are provisioned explicitly (README) and never tracked (GitHub rejects files over 100 MB)
 /models/*
-!/models/ggml-small.bin
