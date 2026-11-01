@@ -3,10 +3,12 @@ import { access } from "node:fs/promises";
 import { basename } from "node:path";
 import { checkVadModel, checkWhisperModel, type ModuleCheck } from "../core-api.js";
 import { legacyJobInstalled } from "./legacy.js";
+import { checkSpeakerModels } from "./speakers/index.js";
 import type { RecordingSettings } from "./settings.js";
 
 export interface RecordingDetails {
   recordingsFolder?: string; recordingsModel?: string; recordingsRetryModel?: string; recordingsVadModel?: string;
+  recordingsSpeakers?: string;
 }
 
 /** Recording transcription readiness (FR-024, FR-025): folder, models, VAD and the legacy job. */
@@ -19,6 +21,8 @@ export async function recordingChecks(settings: RecordingSettings, legacyPlist?:
   const retryModel = settings.retry.modelPath === settings.modelPath ? model : await checkWhisperModel(settings.retry.modelPath);
   const vad = await checkVadModel(settings.vadModelPath);
   const legacy = await legacyJobInstalled(legacyPlist);
+  // Speaker separation is optional at runtime (transcripts fall back to "Speaker"), but doctor reports missing models.
+  const speakers = settings.speakers ? await checkSpeakerModels(settings.speakers) : "SPEAKERS_DISABLED";
   return {
     checks: [
       { component: "recordings", ready: true, code: "RECORDINGS_ENABLED" },
@@ -26,11 +30,13 @@ export async function recordingChecks(settings: RecordingSettings, legacyPlist?:
       { component: "recordings-model", ready: model === "MEDIA_AUDIO_READY", code: model },
       { component: "recordings-retry-model", ready: retryModel === "MEDIA_AUDIO_READY", code: retryModel },
       { component: "recordings-vad", ready: vad === "MEDIA_AUDIO_READY", code: vad },
+      { component: "recordings-speakers", ready: speakers === "SPEAKERS_READY" || speakers === "SPEAKERS_DISABLED", code: speakers },
       { component: "recordings-legacy-job", ready: !legacy,
         code: legacy ? "RECORDINGS_LEGACY_JOB_INSTALLED" : "RECORDINGS_LEGACY_JOB_ABSENT" },
     ],
     details: { recordingsFolder: settings.path, recordingsModel: basename(settings.modelPath),
-      recordingsRetryModel: basename(settings.retry.modelPath), recordingsVadModel: basename(settings.vadModelPath) },
+      recordingsRetryModel: basename(settings.retry.modelPath), recordingsVadModel: basename(settings.vadModelPath),
+      ...(settings.speakers ? { recordingsSpeakers: `${basename(settings.speakers.segmentationModelPath)}, ${basename(settings.speakers.embeddingModelPath)}` } : {}) },
   };
 }
 
@@ -40,6 +46,7 @@ export async function recordingDoctor(settings: RecordingSettings, legacyPlist?:
   const detail: Record<string, string | undefined> = {
     "recordings-folder": details.recordingsFolder, "recordings-model": details.recordingsModel,
     "recordings-retry-model": details.recordingsRetryModel, "recordings-vad": details.recordingsVadModel,
+    "recordings-speakers": details.recordingsSpeakers,
   };
   return checks.map((check) => {
     const name = detail[check.component];

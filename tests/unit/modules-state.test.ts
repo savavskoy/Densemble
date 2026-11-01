@@ -175,9 +175,11 @@ describe("Application.notifyCoordinator", () => {
       expect(f.app.notifyCoordinator("Модуль «x» недоступний.", "module:x:CODE:1")).toBe(true);
       expect(f.app.notifyCoordinator("Модуль «x» знову працює.", "module:x:ok:2")).toBe(true);
       const items = f.store.outbox.list(scope).filter((item) => item.dedupKey.startsWith("module:"));
-      expect(items.map((item) => item.payload)).toEqual([
+      // Same-millisecond outbox rows are ordered by their random id, so only the set is stable.
+      expect(items.map((item) => item.payload)).toHaveLength(2);
+      expect(items.map((item) => item.payload)).toEqual(expect.arrayContaining([
         { kind: "text", text: "Модуль «x» недоступний." }, { kind: "text", text: "Модуль «x» знову працює." },
-      ]);
+      ]));
     } finally { await f.close(); }
   });
 });

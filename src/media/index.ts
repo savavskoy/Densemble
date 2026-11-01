@@ -43,6 +43,11 @@ export interface MediaPipeline extends MediaPreparation {
   removeArtifacts(artifacts: Attachment[]): Promise<void>;
   releaseRun(identity: RunIdentity): void;
   generatedRunDirectory(identity: RunIdentity): Promise<string>;
+  /**
+   * Run-less export for a module: same rules as `exportFile` (session workspace only). The attachment stays
+   * pinned until `release()`, which the caller invokes once an outbox delivery holds it.
+   */
+  exportModuleFile(scope: Scope, sessionId: string, path: string, signal: AbortSignal): Promise<{ attachment: Attachment; release(): void }>;
 }
 interface Marker {
   version: 1;
@@ -104,12 +109,12 @@ export function createMediaPipeline(options: MediaPipelineOptions): MediaPipelin
       return marker;
     } catch { throw new MediaError("MEDIA_PATH_UNSAFE"); }
   };
-  const newDirectory = async (kind: Marker["kind"], scope: Scope, identity?: RunIdentity) => {
+  const newDirectory = async (kind: Marker["kind"], scope: Scope, owner?: { sessionId: string; runId: string | null }) => {
     await initialize();
     const directory = await newOwnedDirectory(join(root, kind), active);
     active.add(directory);
     const marker: Marker = { version: 1, id: randomUUID(), kind, scope,
-      sessionId: identity?.sessionId ?? null, runId: identity?.runId ?? null };
+      sessionId: owner?.sessionId ?? null, runId: owner?.runId ?? null };
     try { await exclusiveFile(join(directory, MARKER), JSON.stringify(marker)); }
     catch (error) {
       active.delete(directory);
@@ -117,6 +122,74 @@ export function createMediaPipeline(options: MediaPipelineOptions): MediaPipelin
       throw error;
     }
     return { directory, marker, path: join(directory, "payload") };
+  };
+  /**
+   * Copies a regular file of the session's workspace (or `generated`) into a pinned output attachment:
+   * no secret names, symlinks or hard links, at most 50 MB, unchanged while copied.
+   */
+  const copyOutgoing = async (scope: Scope, sessionId: string, runId: string | null, source: string,
+    generated: string | undefined, check: () => void, pinFor: (id: string) => string): Promise<Attachment> => {
+    let owned: Awaited<ReturnType<typeof newDirectory>> | undefined;
+    let registered = false;
+    try {
+      check();
+      if (secretName(source)) throw new MediaError("MEDIA_PATH_UNSAFE");
+      const path = lexicalPath(source);
+      const session = store.sessions.get(scope, sessionId);
+      const sessionRoot = session ? workspaceRoots.find((root) => root === resolve(session.workspace)) : undefined;
+      if (!sessionRoot) throw new MediaError("MEDIA_PATH_UNSAFE");
+      if (!within(sessionRoot, path) && !(generated !== undefined && within(generated, path))) throw new MediaError("MEDIA_PATH_UNSAFE");
+      await checkedPath(path, "file");
+      check();
+      const sourceHandle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const before = await sourceHandle.stat();
+        if (!before.isFile() || before.nlink !== 1) throw new MediaError("MEDIA_PATH_UNSAFE");
+        if (before.size > MEDIA_LIMITS.outgoingBytes) throw new MediaError("MEDIA_TOO_LARGE");
+        owned = await newDirectory("outgoing", scope, { sessionId, runId });
+        check();
+        await exclusiveFile(owned.path);
+        const destination = await open(owned.path, constants.O_WRONLY | constants.O_NOFOLLOW);
+        try {
+          const buffer = Buffer.alloc(64 * 1024);
+          let copied = 0;
+          for (;;) {
+            check();
+            const chunk = await sourceHandle.read(buffer, 0, buffer.length, copied);
+            if (!chunk.bytesRead) break;
+            copied += chunk.bytesRead;
+            if (copied > MEDIA_LIMITS.outgoingBytes) throw new MediaError("MEDIA_TOO_LARGE");
+            let written = 0;
+            while (written < chunk.bytesRead) {
+              const result = await destination.write(buffer, written, chunk.bytesRead - written, copied - chunk.bytesRead + written);
+              written += result.bytesWritten;
+            }
+          }
+          const after = await sourceHandle.stat();
+          if (copied !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
+              before.ctimeMs !== after.ctimeMs) throw new MediaError("MEDIA_PATH_UNSAFE");
+        } finally { await destination.close(); }
+        await checkedPath(path, "file");
+        const latest = await lstat(path);
+        if (latest.dev !== before.dev || latest.ino !== before.ino) throw new MediaError("MEDIA_PATH_UNSAFE");
+        await checkedPath(owned.path, "file");
+        check();
+        const createdAt = now();
+        const record = store.attachments.add({ id: owned.marker.id, scope, sessionId, runId, kind: "output",
+          relativePath: relative(root, owned.path), fileName: displayName(basename(path), "export"),
+          mimeType: "application/octet-stream", sizeBytes: before.size, createdAt,
+          expiresAt: createdAt + MEDIA_LIMITS.inputRetentionMs });
+        store.attachments.pin(scope, record.id, pinFor(record.id));
+        registered = true;
+        return record;
+      } finally { await sourceHandle.close(); }
+    } catch (error) { throw report(error); }
+    finally {
+      if (owned) {
+        try { if (!registered) await deleteOwnedDirectory(owned.directory); }
+        finally { active.delete(owned.directory); }
+      }
+    }
   };
   const download = async (attachment: IncomingAttachment, scope: Scope, path: string, signal: AbortSignal,
     guard: () => void = () => {}) => {
@@ -311,70 +384,19 @@ export function createMediaPipeline(options: MediaPipelineOptions): MediaPipelin
       live(identity);
       return run;
     },
-    async exportFile(identity, source, signal) {
-      let owned: Awaited<ReturnType<typeof newDirectory>> | undefined;
-      let registered = false;
-      try {
-        live(identity, signal);
-        if (secretName(source)) throw new MediaError("MEDIA_PATH_UNSAFE");
-        const path = lexicalPath(source);
-        const session = store.sessions.get(identity.scope, identity.sessionId)!;
-        const sessionRoot = workspaceRoots.find((root) => root === resolve(session.workspace));
-        if (!sessionRoot) throw new MediaError("MEDIA_PATH_UNSAFE");
-        const generated = join(runtime, "generated", identity.sessionId, identity.runId);
-        if (!within(sessionRoot, path) && !within(generated, path)) throw new MediaError("MEDIA_PATH_UNSAFE");
-        await checkedPath(path, "file");
-        live(identity, signal);
-        const sourceHandle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          const before = await sourceHandle.stat();
-          if (!before.isFile() || before.nlink !== 1) throw new MediaError("MEDIA_PATH_UNSAFE");
-          if (before.size > MEDIA_LIMITS.outgoingBytes) throw new MediaError("MEDIA_TOO_LARGE");
-          owned = await newDirectory("outgoing", identity.scope, identity);
-          live(identity, signal);
-          await exclusiveFile(owned.path);
-          const destination = await open(owned.path, constants.O_WRONLY | constants.O_NOFOLLOW);
-          try {
-            const buffer = Buffer.alloc(64 * 1024);
-            let copied = 0;
-            for (;;) {
-              live(identity, signal);
-              const chunk = await sourceHandle.read(buffer, 0, buffer.length, copied);
-              if (!chunk.bytesRead) break;
-              copied += chunk.bytesRead;
-              if (copied > MEDIA_LIMITS.outgoingBytes) throw new MediaError("MEDIA_TOO_LARGE");
-              let written = 0;
-              while (written < chunk.bytesRead) {
-                const result = await destination.write(buffer, written, chunk.bytesRead - written, copied - chunk.bytesRead + written);
-                written += result.bytesWritten;
-              }
-            }
-            const after = await sourceHandle.stat();
-            if (copied !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
-                before.ctimeMs !== after.ctimeMs) throw new MediaError("MEDIA_PATH_UNSAFE");
-          } finally { await destination.close(); }
-          await checkedPath(path, "file");
-          const latest = await lstat(path);
-          if (latest.dev !== before.dev || latest.ino !== before.ino) throw new MediaError("MEDIA_PATH_UNSAFE");
-          await checkedPath(owned.path, "file");
-          live(identity, signal);
-          const createdAt = now();
-          const record = store.attachments.add({ id: owned.marker.id, scope: identity.scope,
-            sessionId: identity.sessionId, runId: identity.runId, kind: "output",
-            relativePath: relative(root, owned.path), fileName: displayName(basename(path), "export"),
-            mimeType: "application/octet-stream", sizeBytes: before.size, createdAt,
-            expiresAt: createdAt + MEDIA_LIMITS.inputRetentionMs });
-          store.attachments.pin(identity.scope, record.id, `${runPin(identity)}:${record.id}`);
-          registered = true;
-          return record;
-        } finally { await sourceHandle.close(); }
-      } catch (error) { throw report(error); }
-      finally {
-        if (owned) {
-          try { if (!registered) await deleteOwnedDirectory(owned.directory); }
-          finally { active.delete(owned.directory); }
-        }
-      }
+    exportFile(identity, source, signal) {
+      return copyOutgoing(identity.scope, identity.sessionId, identity.runId, source,
+        join(runtime, "generated", identity.sessionId, identity.runId), () => live(identity, signal),
+        (id) => `${runPin(identity)}:${id}`);
+    },
+    async exportModuleFile(scope, sessionId, source, signal) {
+      const pin = (id: string) => `media-module:${id}`;
+      const attachment = await copyOutgoing(scope, sessionId, null, source, undefined, () => {
+        checkAbort(signal);
+        safeScope(scope);
+        if (!OWNED_ID.test(sessionId) || !store.sessions.get(scope, sessionId)) throw new MediaError("MEDIA_STALE_RUN");
+      }, pin);
+      return { attachment, release: () => { store.attachments.unpin(pin(attachment.id)); } };
     },
     async resolveAttachment(scope, id, signal) {
       try {

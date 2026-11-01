@@ -80,6 +80,34 @@ export interface ModuleInstance<P = unknown> {
   stop(): Promise<void>;
 }
 
+/**
+ * Talks back to a chat where one of the module's abilities was invoked (`AbilityCall.scope`). Every call
+ * rechecks that the scope is a configured owner binding whose agent is in `modules.<id>.agents`; it returns
+ * false before the service is ready, while it stops, or on any refusal (a fixed diagnostic is recorded).
+ */
+export interface ModuleChat {
+  /** Plain text into the chat of `scope` (outbox); a repeated `dedupKey` is a no-op. */
+  send(scope: Scope, text: string, dedupKey: string): boolean;
+  /**
+   * A regular file inside the workspace of the scope's current session, copied (≤ 50 MB) and sent as a
+   * Telegram document with an optional caption; a repeated `dedupKey` is a no-op.
+   */
+  sendFile(scope: Scope, path: string, options: { caption?: string; dedupKey: string }): Promise<boolean>;
+  /**
+   * Wakes the scope's agent with `[Densemble module <id>] <note>` as a synthetic inbound message: its own turn,
+   * queued behind an active run. A repeated `dedupKey` is a no-op.
+   */
+  wake(scope: Scope, note: string, dedupKey: string): Promise<boolean>;
+}
+
+/** Core side of `ModuleChat`; the host adds the calling module. */
+export interface ModuleChatCaller { id: string; agents: readonly string[] }
+export interface ModuleChatBridge {
+  send(caller: ModuleChatCaller, scope: Scope, text: string, dedupKey: string): boolean;
+  sendFile(caller: ModuleChatCaller, scope: Scope, path: string, options: { caption?: string; dedupKey: string }): Promise<boolean>;
+  wake(caller: ModuleChatCaller, scope: Scope, note: string, dedupKey: string): Promise<boolean>;
+}
+
 export interface ModuleContext<S = unknown> {
   settings: S;
   /** `runtimeDataPath/modules/<id>/`, created 0700. */
@@ -95,6 +123,7 @@ export interface ModuleContext<S = unknown> {
   recovered(): void;
   /** Aborted when the host stops the module. */
   signal: AbortSignal;
+  chat: ModuleChat;
 }
 
 /** Method syntax keeps any `ModuleDefinition<S, P>` assignable to `ModuleDefinition`. */

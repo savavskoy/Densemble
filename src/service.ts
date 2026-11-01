@@ -33,6 +33,7 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
   let modules: ModuleHost | undefined;
   let moduleState: { stop(): Promise<void> } | undefined;
   let notices: { stop(): Promise<void> } | undefined;
+  let chatReady = false;
   function stop(): Promise<void> {
     return closing ??= (async () => {
       scheduler?.stop();
@@ -72,8 +73,10 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
     const speechGate = new SpeechGate();
     const entries = moduleEntries(config.config);
     for (const entry of entries) if (entry.movedSettings) diagnostics.record("MODULE_SETTING_MOVED", { module: entry.id });
+    // The chat bridge is late-bound: modules start before the application exists and lose it once stopping begins.
     const host = createModuleHost({ entries, core: createCoreOffer(config, speechGate),
-      runtimeDataPath: config.config.runtimeDataPath, diagnostics });
+      runtimeDataPath: config.config.runtimeDataPath, diagnostics,
+      chat: () => closing || !chatReady ? undefined : application?.moduleChat });
     modules = host;
     // Resolved before the engines so their tool sets can include the declared module abilities.
     await host.resolve();
@@ -104,6 +107,7 @@ export async function startService(config: LoadedConfig, options: { shutdownTime
     application = createApplication({ config, store, runtime, media, delivery: telegram.transport, diagnostics,
       modules: host });
     await application.start(recovery);
+    chatReady = true;
     const app = application;
     notices = startModuleNotices({
       host, runtimeDataPath: config.config.runtimeDataPath, diagnostics,

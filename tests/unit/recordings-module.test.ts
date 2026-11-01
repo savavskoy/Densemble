@@ -6,7 +6,8 @@ import { createModuleHost, instructionsReader } from "../../src/modules/host.js"
 import { adoptLegacyData, module } from "../../src/modules/recordings/index.js";
 import { RECORDING_DEFAULTS, type RecordingSettings } from "../../src/modules/recordings/settings.js";
 import { createRecordingWorker } from "../../src/modules/recordings/worker.js";
-import { entry, fakeCore } from "../fixtures/modules/index.js";
+import type { RecordingsApi } from "../../src/modules/recordings/api.js";
+import { entry, fakeCore, fakeLoader, fakeModule } from "../fixtures/modules/index.js";
 
 let tmp: string;
 let runtime: string;
@@ -95,6 +96,30 @@ describe("recordings module lifecycle", () => {
       userId: 1, owner: true, workspace: tmp, signal: new AbortController().signal });
     expect(result).toMatchObject({ ok: true, current: null, queue: [], waiting: [], conflicts: [], failed: [], recent: [] });
     expect(modules.report()[0]?.status).toMatch(/у черзі: 0/);
+    expect((await modules.stop()).incomplete).toEqual([]);
+  });
+  it("provides transcribeMedia to dependents: fixed RECORDING_* codes, and an aborted caller is released at once", async () => {
+    const header = Buffer.alloc(48);
+    [0x67676d6c, 51866, 1500, 1280, 20, 32, 448, 1280, 20, 4, 128, 1].forEach((value, index) => header.writeInt32LE(value, index * 4));
+    writeFileSync(join(tmp, "model.bin"), header);
+    writeFileSync(join(tmp, "vad.bin"), Buffer.from([0x6c, 0x6d, 0x67, 0x67, 0]));
+    let api: RecordingsApi | undefined;
+    const dependent = fakeModule("dep", { requires: ["recordings"], start: async (ctx) => {
+      api = ctx.require<RecordingsApi>("recordings"); return { stop: async () => undefined }; } });
+    const modules = createModuleHost({
+      entries: [entry("recordings", { settings: { ...settings(), modelPath: join(tmp, "model.bin"), vadModelPath: join(tmp, "vad.bin"),
+        speakers: { enabled: false } } }), entry("dep")],
+      loader: fakeLoader([module as never, dependent]),
+      core: fakeCore({ ownerWorkspaces: [join(tmp, "workspace")] }), runtimeDataPath: runtime, diagnostics: diagnostics() });
+    await modules.start();
+    expect(modules.health("dep")?.state).toBe("ready");
+    const out = join(tmp, "out");
+    mkdirSync(out);
+    const request = { media: join(tmp, "missing.mp4"), outputDirectory: out, key: "transcript", durationSeconds: 10 };
+    await expect(api!.transcribeMedia({ ...request, signal: new AbortController().signal })).rejects.toMatchObject({ code: "RECORDING_DECODE_FAILED" });
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(api!.transcribeMedia({ ...request, signal: aborted.signal })).rejects.toMatchObject({ code: "MEDIA_ABORTED" });
     expect((await modules.stop()).incomplete).toEqual([]);
   });
   it("is unavailable, not a config error, for a folder outside owner workspaces", async () => {

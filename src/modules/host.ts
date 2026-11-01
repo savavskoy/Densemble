@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url";
 import type { DiagnosticSink } from "../ports.js";
 import {
   errorCode, FIXED_CODE, MODULE_ID, ModuleError,
-  type AbilityCall, type AbilityResult, type AbilitySpec, type CoreOffer, type ModuleContext, type ModuleDefinition,
+  type AbilityCall, type AbilityResult, type AbilitySpec, type CoreOffer, type ModuleChat, type ModuleChatBridge,
+  type ModuleContext, type ModuleDefinition,
   type ModuleEntry, type ModuleHealth, type ModuleInstance, type ModuleReason, type ModuleState, type ModuleStateReport,
 } from "./contract.js";
 import { loadModule, type ModuleLoader } from "./loader.js";
@@ -38,6 +39,8 @@ export interface ModuleHostOptions {
   diagnostics: DiagnosticSink;
   /** Returns a module's `INSTRUCTIONS.md`, undefined when missing or unreadable. */
   readInstructions?: (id: string) => Promise<string | undefined>;
+  /** Late-bound chat bridge: undefined until the application is ready and once the service stops. */
+  chat?: () => ModuleChatBridge | undefined;
   stopTimeoutMs?: number;
   now?: () => number;
 }
@@ -287,6 +290,30 @@ export function createModuleHost(options: ModuleHostOptions): ModuleHost {
     }
   }
 
+  /** `ModuleChat` of one module: false without a bridge, after its stop, or when the bridge throws. */
+  function moduleChat(slot: Slot, signal: AbortSignal): ModuleChat {
+    const caller = { id: slot.entry.id, agents: slot.entry.agents };
+    const bridge = () => signal.aborted || stopping ? undefined : options.chat?.();
+    const failed = () => { sink.record("MODULE_CHAT_FAILED", { module: caller.id }); return false; };
+    return {
+      send(scope, text, dedupKey) {
+        const target = bridge();
+        if (!target) return false;
+        try { return target.send(caller, scope, text, dedupKey); } catch { return failed(); }
+      },
+      async sendFile(scope, path, sendOptions) {
+        const target = bridge();
+        if (!target) return false;
+        try { return await target.sendFile(caller, scope, path, sendOptions); } catch { return failed(); }
+      },
+      async wake(scope, note, dedupKey) {
+        const target = bridge();
+        if (!target) return false;
+        try { return await target.wake(caller, scope, note, dedupKey); } catch { return failed(); }
+      },
+    };
+  }
+
   async function startOne(slot: Slot): Promise<void> {
     const definition = slot.definition;
     if (!definition) return;
@@ -318,6 +345,7 @@ export function createModuleHost(options: ModuleHostOptions): ModuleHost {
         if (!controller.signal.aborted && !stopping && slot.health.state === "failed") set(slot, "ready", "MODULE_READY");
       },
       signal: controller.signal,
+      chat: moduleChat(slot, controller.signal),
     };
     let instance: ModuleInstance;
     try {

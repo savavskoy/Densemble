@@ -5,6 +5,7 @@ import { classify, dayFolder, isMediaName, parseDayFolder, parseReviewLog, PARTI
   transcriptKey, type DayMedia } from "./contract.js";
 import { fileRecording, isFinished, repairInterruptedFiling, type FinishedCheckOptions } from "./filing.js";
 import { acquireLegacyLock, legacyJobInstalled } from "./legacy.js";
+import { createLane, type Lane } from "./lane.js";
 import { createNotifier, type RecordingNotifier } from "./notify.js";
 import type { RecordingSettings } from "./settings.js";
 import { describeSilences, type SilenceSpan } from "./silence.js";
@@ -21,6 +22,8 @@ export interface RecordingWorkerOptions {
   now?: () => number;
   notifier?: RecordingNotifier;
   legacy?: { plist?: string; lock?: string };
+  /** Shared with `transcribeMedia`, so only one transcription runs at a time. */
+  lane?: Lane;
   /** Module health: a pass that cannot read the watched folder fails it; the next good pass recovers it. */
   health?: { fail(code: string): void; recovered(): void };
 }
@@ -44,6 +47,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
   const runner = options.runner ?? runManagedProcess;
   const now = options.now ?? Date.now;
   const gate = options.gate ?? new SpeechGate();
+  const lane = options.lane ?? createLane();
   const controller = new AbortController();
   const signal = controller.signal;
   const notifier = options.notifier ?? createNotifier({ runner, enabled: settings.notifications, diagnostics, signal });
@@ -240,9 +244,11 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
       status.waiting.push(`${job.dayRel}/${job.file}`);
       return;
     }
-    await gate.waitUntilIdle(signal);
-    await withLegacyLock(async () => {
-      if (await stillPending(job)) await run(job, failureKey, finished.durationSeconds!);
+    await lane(async () => {
+      await gate.waitUntilIdle(signal);
+      await withLegacyLock(async () => {
+        if (await stillPending(job)) await run(job, failureKey, finished.durationSeconds!);
+      });
     });
   }
 
@@ -273,7 +279,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
     await publishStatus();
     try {
       const date = parseDayFolder(job.dayRel)!;
-      const { transcript, silences } = await transcribeRecording({
+      const { transcript, silences, speakers } = await transcribeRecording({
         recording: job.path, dayDirectory: join(root, job.dayRel), key: transcriptKey(date, job.file), durationSeconds, mode: job.mode,
       }, {
         settings, runner, workRoot, signal,
@@ -297,6 +303,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
         },
       });
       if (!silences) diagnostics.record("RECORDING_SILENCE_CHECK_FAILED");
+      if (speakers === "unavailable") diagnostics.record("RECORDING_SPEAKERS_UNAVAILABLE");
       diagnostics.record("RECORDING_DONE");
       status.recent = [{ file, transcript: rel(transcript), at: new Date(now()).toISOString(),
         ...(silences?.length ? { silences } : {}) }, ...status.recent].slice(0, RECENT_LIMIT);

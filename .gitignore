@@ -50,3 +50,5 @@ coverage/
 
 # Speech models are provisioned explicitly (README) and never tracked (GitHub rejects files over 100 MB)
 /models/*
+/.reels-scratch/
+/.scratch-diar/

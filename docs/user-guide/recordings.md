@@ -147,11 +147,13 @@ recordings/
     └── 10/
         └── 29/
             ├── 2026-10-29 15-13-24.mkv
-            └── transcript_2026-10-29_2026-10-29_15-13-24.txt
+            ├── transcript_2026-10-29_2026-10-29_15-13-24.txt
+            └── transcript_2026-10-29_2026-10-29_15-13-24.words.json
 ```
 
 The transcript is named `transcript_<day>_<recording name>.txt`; spaces in the
-recording name become `_`.
+recording name become `_`. The `.words.json` file next to it holds the same text with
+the timing of every word (for tools and agents; you can ignore it).
 
 ### How long it takes
 
@@ -216,7 +218,19 @@ For scripts: `node dist/main.js recordings-status --json --config config.local.j
 
 ## Reading a transcript
 
-- Plain UTF-8 text, one phrase per line, without timestamps.
+- Plain UTF-8 text, one phrase per line: when it started and who said it, for example
+
+  ```text
+  [00:12:31] Oleh: Добре, тоді почнемо з плану.
+  [00:12:40] Speaker 2: Так, я підготувала таблицю.
+  ```
+
+- Speakers are told apart by voice, on this Mac. With a [sample of your voice](#speakers)
+  your phrases carry your name; other people are `Speaker 2`, `Speaker 3`, … in the order
+  they first speak (from `Speaker 1` without the sample). The numbers are consistent within
+  one transcript only. Where people talk over each other a label can be wrong. If voices
+  could not be separated (models missing), every phrase is labelled `Speaker`.
+- A new phrase starts when the speaker changes or after a pause.
 - Silence, music and noise are left out; so are lines like `[Music]` or
   `(applause)`.
 - If the same line, sentence or phrase repeats three or more times in a row (a typical
@@ -358,8 +372,30 @@ required. Run `make restart` after any change.
 | `suppressNonSpeech`, `maxContext` | `false`, `0` | Recognition flags (`-sns`, `-mc`). `maxContext` 0 recognises each part on its own and prevents repeated-phrase loops. |
 | `retry.vadThreshold`, `retry.vadMinSpeechMs`, `retry.suppressNonSpeech`, `retry.maxContext` | as the first attempt | Different settings for repeated attempts only. |
 | `silence` | `thresholdDb` −80, `minSeconds` 60 | What counts as a stretch [without audio signal](#checking-progress): quieter than −80 dB for at least 60 s. |
+| `speakers.enabled` | `true` | `false` turns speaker separation off (every phrase is `Speaker`). |
+| `speakers.ownerName` | `"Oleh"` | Your label when your voice is recognised. |
+| `speakers.ownerSamplePath` | none | A short recording of only your voice ([Speakers](#speakers)). |
+| `speakers.segmentationModelPath`, `speakers.embeddingModelPath`, `speakers.verificationModelPath` | `./models/speaker-segmentation.onnx`, `./models/speaker-embedding.onnx`, `./models/speaker-verification.onnx` | Speaker models; the last one only compares voices with your sample. |
+| `speakers.clusterThreshold`, `speakers.ownerThreshold` | `0.7`, `0.5` | How different two voices must be to count as two people, and how close a voice must be to your sample. Leave as is unless labels are clearly wrong. |
 
 `config.example.json` shows every setting with its default.
+
+## Speakers
+
+Speaker separation needs two small models in `models/` (about 32 MB, not part of git):
+
+```sh
+curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar -xjO sherpa-onnx-pyannote-segmentation-3-0/model.onnx > models/speaker-segmentation.onnx
+curl -fL -o models/speaker-embedding.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
+# only for naming you by your voice sample (about 28 MB):
+curl -fL -o models/speaker-verification.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+```
+
+To be named in transcripts, record 30–60 seconds of only your own voice (any format,
+for example a voice memo), put it inside your workspace and set
+`"speakers": { "ownerSamplePath": "./path/to/my-voice.m4a" }` in
+`modules.recordings.settings`, then `make restart`. `make doctor` shows
+`recordings-speakers`. Separation adds about 2 minutes per hour of recording.
 
 ## Asking an agent
 

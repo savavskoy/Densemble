@@ -35,6 +35,20 @@ interface Fake {
   runner: ProcessRunner;
 }
 
+/** whisper.cpp `-oj -ojf` output: one segment per line, 2 s apart, one token per word (times in VAD time = original). */
+function whisperJson(text: string): string {
+  const lines = text.split("\n").filter((line) => line.trim());
+  return JSON.stringify({ result: { language: "uk" }, transcription: lines.map((line, index) => ({
+    offsets: { from: index * 2000, to: index * 2000 + 1500 },
+    tokens: [{ text: "[_BEG_]", offsets: { from: index * 2000, to: index * 2000 }, t_dtw: -1 },
+      ...line.trim().split(/\s+/).map((word, at) => ({ text: ` ${word}`, offsets: { from: index * 2000 + at * 100, to: index * 2000 + at * 100 + 90 }, t_dtw: -1 }))],
+  })) });
+}
+/** The readable transcript of `whisperJson` lines kept by the filter: `[time, text]` pairs, unlabelled speakers. */
+function timed(...lines: [number, string][]): string {
+  return lines.map(([seconds, text]) => `[00:00:${String(seconds).padStart(2, "0")}] Speaker: ${text}\n`).join("");
+}
+
 function makeFake(): Fake {
   const fake: Fake = {
     calls: [], open: new Set(), inputs: [], silence: [],
@@ -58,7 +72,7 @@ function makeFake(): Fake {
         case "whisper-cli": {
           const prefix = args[args.indexOf("-of") + 1]!;
           const text = await fake.whisper({ args, options, recording: fake.inputs.at(-1) });
-          if (text !== undefined) writeFileSync(`${prefix}.txt`, text);
+          if (text !== undefined) writeFileSync(`${prefix}.json`, whisperJson(text));
           return ok();
         }
         case "osascript":
@@ -196,7 +210,7 @@ describe("recording worker: filing and transcription", () => {
     const day = join(root, "2026", "10", "29");
     expect(existsSync(source)).toBe(false);
     expect(readFileSync(join(day, OBS), "utf8")).toBe("data");
-    expect(readFileSync(join(day, `${OBS_KEY}.txt`), "utf8")).toBe("Привіт\nрядок\nкінець\n");
+    expect(readFileSync(join(day, `${OBS_KEY}.txt`), "utf8")).toBe(timed([0, "Привіт"], [10, "рядок"], [12, "кінець"]));
     expect(partials(day)).toEqual([]);
     expect(readdirSync(workRoot())).toEqual([]);
     expect(during?.current).toMatchObject({ file: `2026/10/29/${OBS}`, mode: "first", percent: 50, etaSeconds: 10, paused: false });
@@ -232,7 +246,7 @@ describe("recording worker: filing and transcription", () => {
   it("files a non-OBS name by its local mtime date", async () => {
     media("meeting.m4a", "m", new Date(2026, 8, 3, 12, 0, 0));
     await worker().pass();
-    expect(readFileSync(join(root, "2026", "09", "03", "transcript_2026-09-03_meeting.txt"), "utf8")).toBe("Привіт\n");
+    expect(readFileSync(join(root, "2026", "09", "03", "transcript_2026-09-03_meeting.txt"), "utf8")).toBe(timed([0, "Привіт"]));
     expect(existsSync(join(root, "meeting.m4a"))).toBe(false);
   });
 
@@ -297,7 +311,7 @@ describe("recording worker: filing and transcription", () => {
     expect([flag("-vt"), flag("-vspd"), flag("-vsd"), flag("-vp"), flag("-mc")]).toEqual(["0.35", "250", "500", "200", "0"]);
     expect(mode).toBe("retry");
     expect(diagnostics.record).toHaveBeenCalledWith("RECORDING_STARTED", { attempt: 2 });
-    expect(readFileSync(join(day, "transcript_2026-10-29_x.txt"), "utf8")).toBe("краще\n");
+    expect(readFileSync(join(day, "transcript_2026-10-29_x.txt"), "utf8")).toBe(timed([0, "краще"]));
     expect(readFileSync(join(day, "transcript_2026-10-29_x.attempt-1.txt"), "utf8")).toBe("bad attempt");
 
     await worker().pass();
@@ -395,7 +409,7 @@ describe("recording worker: filing and transcription", () => {
     utimesSync(recording, newer, newer);
     await w.pass();
     expect(executables().filter((name) => name === "whisper-cli")).toHaveLength(2);
-    expect(readFileSync(join(day, "transcript_2026-10-29_a.txt"), "utf8")).toBe("вдалося\n");
+    expect(readFileSync(join(day, "transcript_2026-10-29_a.txt"), "utf8")).toBe(timed([0, "вдалося"]));
   });
 
   it("clears the failed entry once the changed file transcribes successfully", async () => {
@@ -541,7 +555,7 @@ describe("recording worker: voice first", () => {
 
     finish.resolve();
     await running;
-    expect(readFileSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"), "utf8")).toBe("готово\n");
+    expect(readFileSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"), "utf8")).toBe(timed([0, "готово"]));
     // Unregistered after the job: later voice messages do not touch the finished process.
     gate.enterVoice()();
     expect(control.pause).toHaveBeenCalledTimes(1);

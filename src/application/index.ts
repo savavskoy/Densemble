@@ -23,12 +23,15 @@ import { handleProactiveCommand } from "./proactive-commands.js";
 import { handleProactivityRequest } from "./proactive-tool.js";
 import { defaultSessionWorkspace, parseWorkspaceCommand, workspaceListText, workspaceRequiredText } from "./workspace-commands.js";
 import type { ProactivityGuardrails } from "./proactive-tool.js";
-import type { ModuleStateReport } from "../modules/contract.js";
+import { createHash } from "node:crypto";
+import type { ModuleChatBridge, ModuleChatCaller, ModuleStateReport } from "../modules/contract.js";
 import { formatModulesSection } from "../modules/state.js";
 
 export interface ApplicationMedia extends MediaPreparation {
   releaseRun(identity: RunIdentity): void;
   removeArtifacts(artifacts: Attachment[]): Promise<void>;
+  /** Module file export (spec 006); without it `moduleChat.sendFile` refuses. */
+  exportModuleFile?(scope: Scope, sessionId: string, path: string, signal: AbortSignal): Promise<{ attachment: Attachment; release(): void }>;
 }
 
 export interface ApplicationOptions {
@@ -56,6 +59,8 @@ export interface Application extends IngressHandler {
    * coordinator chat exists or the application is stopping.
    */
   notifyCoordinator(text: string, dedupKey: string): boolean;
+  /** Core side of `ModuleContext.chat` (spec 006); refuses once the application stops. */
+  moduleChat: ModuleChatBridge;
   shutdown(): Promise<void>;
   /** Wait for admitted work; useful for shutdown/tests, never the polling loop. */
   drain(): Promise<void>;
@@ -141,6 +146,8 @@ export function createApplication(options: ApplicationOptions): Application {
   let shutdownPromise: Promise<void> | undefined;
   let started = false;
   let ticker: NodeJS.Timeout | undefined;
+  /** Module wakes waiting for an idle chat: each runs as its own turn, never steered into an active run. */
+  const deferredWakes = new Map<string, { scope: Scope; text: string; updateId: number }[]>();
 
   function launch(work: Promise<unknown>, context?: Context): void {
     const guarded = work.catch(() => diagnostics.record("APPLICATION_BACKGROUND_FAILED"));
@@ -822,6 +829,100 @@ export function createApplication(options: ApplicationOptions): Application {
       return false;
     }
   }
+  /** The current session of an owner binding served by one of the module's agents; null on any refusal. */
+  function moduleSession(caller: ModuleChatCaller, scope: Scope): Session | null {
+    if (stopped || closing) return null;
+    const binding = config.config.bindings.find((entry) => entry.botId === scope.botId && entry.chatId === scope.chatId &&
+      entry.topicId === scope.topicId);
+    const bot = config.config.bots.find((entry) => entry.id === scope.botId);
+    if (!binding || !bot || scope.ownerId !== config.config.ownerId || scopeOwnerId(config.config, binding) !== scope.ownerId ||
+        !caller.agents.includes(bot.agentId)) {
+      diagnostics.record("MODULE_CHAT_REFUSED", { module: caller.id });
+      return null;
+    }
+    const session = current(scope);
+    if (!workspaceAuthorized(session.scope, session.workspace)) {
+      diagnostics.record("MODULE_CHAT_REFUSED", { module: caller.id });
+      return null;
+    }
+    return session;
+  }
+  function moduleKey(caller: ModuleChatCaller, dedupKey: string): string | null {
+    return dedupKey.trim() ? `module:${caller.id}:${dedupKey}` : null;
+  }
+  function queued(scope: Scope, key: string): boolean {
+    return store.outbox.list(scope).some((item) => item.dedupKey === key);
+  }
+  /** A stable negative id per wake key, above the proactive range (occurrence rowids), so a repeat is a duplicate. */
+  function wakeId(key: string): number {
+    const hash = createHash("sha256").update(key).digest().readUIntBE(0, 6);
+    return -(2 ** 51 + hash);
+  }
+  function admitWake(scope: Scope, value: string, updateId: number): boolean {
+    const key = scopeKey(scope);
+    if (stopped || closing) return false;
+    if (barriers.has(key) || held.has(key) || store.runs.active(scope) || store.inbox.queued(scope).length) return false;
+    const session = current(scope);
+    const binding = config.config.bindings.find((entry) => entry.botId === scope.botId && entry.chatId === scope.chatId &&
+      entry.topicId === scope.topicId);
+    const message: IncomingMessage = { kind: "message", scope, chatKind: binding?.kind ?? "private", updateId,
+      messageId: updateId, receivedAt: Date.now(), text: value, attachments: [] };
+    store.inbox.admit(message, { sessionId: session.id, reserveRun: false });
+    pump(scope);
+    return true;
+  }
+  /** Each waiting wake on its own: one that throws is dropped (`MODULE_CHAT_FAILED`) and never blocks the others. */
+  function flushWakes(): void {
+    for (const [key, waiting] of deferredWakes) {
+      while (waiting.length) {
+        const next = waiting[0]!;
+        try { if (!admitWake(next.scope, next.text, next.updateId)) break; }
+        catch { diagnostics.record("MODULE_CHAT_FAILED"); }
+        waiting.shift();
+      }
+      if (!waiting.length) deferredWakes.delete(key);
+    }
+  }
+  const moduleChat: ModuleChatBridge = {
+    send(caller, scope, value, dedupKey) {
+      const key = moduleKey(caller, dedupKey);
+      if (!key || !value.trim()) return false;
+      const session = moduleSession(caller, scope);
+      if (!session) return false;
+      if (!queued(scope, key)) text(session, value, key);
+      return true;
+    },
+    async sendFile(caller, scope, path, sendOptions) {
+      const key = moduleKey(caller, sendOptions.dedupKey);
+      if (!key || !isAbsolute(path) || !media.exportModuleFile) return false;
+      const session = moduleSession(caller, scope);
+      if (!session) return false;
+      if (queued(scope, key)) return true;
+      const exported = await media.exportModuleFile(scope, session.id, path, AbortSignal.timeout(120_000));
+      try {
+        if (stopped || closing || store.sessions.current(scope)?.id !== session.id) return false;
+        if (!queued(scope, key)) {
+          store.outbox.enqueue({ scope, sessionId: session.id, dedupKey: key,
+            payload: { kind: "file", attachmentId: exported.attachment.id,
+              ...(sendOptions.caption?.trim() ? { caption: sendOptions.caption } : {}) } });
+        }
+        return true;
+      } finally { exported.release(); }
+    },
+    async wake(caller, scope, note, dedupKey) {
+      const key = moduleKey(caller, dedupKey);
+      if (!key || !note.trim()) return false;
+      if (!moduleSession(caller, scope)) return false;
+      const updateId = wakeId(`${scopeKey(scope)}:${key}`);
+      const value = `[Densemble module ${caller.id}] ${note}`;
+      const waiting = deferredWakes.get(scopeKey(scope)) ?? [];
+      if (waiting.some((entry) => entry.updateId === updateId)) return true;
+      if (!waiting.length && admitWake(scope, value, updateId)) return true;
+      waiting.push({ scope, text: value, updateId });
+      deferredWakes.set(scopeKey(scope), waiting);
+      return true;
+    },
+  };
   async function finishDeletion(intent: DeletionIntent): Promise<void> {
     if (store.sessions.get(intent.scope, intent.sessionId)) {
       // A pre-delete crash has not passed the transactional busy guards.
@@ -1036,7 +1137,10 @@ export function createApplication(options: ApplicationOptions): Application {
       app.recover(recovery ?? store.recover());
       for (const intent of await deletionJournal.pending()) await finishDeletion(intent);
       await media.cleanup();
-      ticker = setInterval(() => { store.requests.expire(); }, 500);
+      ticker = setInterval(() => {
+        store.requests.expire();
+        flushWakes();
+      }, 500);
       ticker.unref();
     },
     recover(recovery) {
@@ -1071,11 +1175,13 @@ export function createApplication(options: ApplicationOptions): Application {
     },
     triggerProactive,
     notifyCoordinator,
+    moduleChat,
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
       closing = true;
       shutdownPromise = (async () => {
         clearInterval(ticker);
+        deferredWakes.clear();
         for (const timer of [...timers.values(), ...idleTimers.values()]) clearTimeout(timer);
         for (const barrier of barriers.values()) barrier.controller.abort();
         const stops = [...contexts.values()].map((context) => stopRun(context.run));

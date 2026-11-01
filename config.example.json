@@ -136,7 +136,28 @@
           "thresholdDb": -80,
           "minSeconds": 60
         },
-        "notifications": true
+        "notifications": true,
+        "speakers": {
+          "enabled": true,
+          "ownerName": "Oleh",
+          "segmentationModelPath": "./models/speaker-segmentation.onnx",
+          "embeddingModelPath": "./models/speaker-embedding.onnx",
+          "verificationModelPath": "./models/speaker-verification.onnx",
+          "clusterThreshold": 0.7,
+          "ownerThreshold": 0.5
+        }
+      }
+    },
+    "reels": {
+      "enabled": true,
+      "agents": [
+        "example-agent"
+      ],
+      "settings": {
+        "folder": "/absolute/path/to/workspace/raw/reels",
+        "ytDlpPath": "/opt/homebrew/bin/yt-dlp",
+        "maxVideoMinutes": 180,
+        "maxHeight": 1080
       }
     }
   }

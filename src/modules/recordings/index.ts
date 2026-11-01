@@ -1,13 +1,16 @@
-import { lstat, rename } from "node:fs/promises";
+import { lstat, mkdir, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import {
-  checkVadModel, checkWhisperModel, ModuleError,
+  checkVadModel, checkWhisperModel, MediaError, ModuleError, runManagedProcess,
   type AbilityResult, type DiagnosticSink, type Json, type ModuleContext, type ModuleDefinition, type ModuleInstance,
 } from "../core-api.js";
+import type { RecordingsApi, TranscribeMediaRequest, TranscribeMediaResult } from "./api.js";
 import { recordingDoctor } from "./doctor.js";
+import { createLane } from "./lane.js";
 import { prepareRecordings, recordingSettings, recordingsSchema, type RecordingsConfig } from "./settings.js";
 import { writeStatus, type RecordingStatus } from "./status.js";
+import { RecordingError, transcribeRecording, type TranscriptionContext } from "./transcribe.js";
 import { createRecordingWorker, type RecordingWorker } from "./worker.js";
 
 const MODEL_CODES = {
@@ -19,9 +22,9 @@ const MODEL_CODES = {
 const settingsFix = "Виправте modules.recordings.settings.path у config.local.json і виконайте make restart.";
 
 /** Recording transcription (spec 004) as a module: watches one folder inside an owner workspace. */
-export const module: ModuleDefinition<RecordingsConfig> = {
+export const module: ModuleDefinition<RecordingsConfig, RecordingsApi> = {
   id: "recordings",
-  version: "1.0.0",
+  version: "1.1.0",
   settings: recordingsSchema,
   abilities: [{
     name: "recordings_status",
@@ -58,7 +61,7 @@ export const module: ModuleDefinition<RecordingsConfig> = {
  * Starts the worker when its models are usable. A bad model keeps the module unavailable (with a disabled
  * status for `recordings-status`) without affecting the text and voice service.
  */
-async function startRecordings(ctx: ModuleContext<RecordingsConfig>): Promise<ModuleInstance> {
+async function startRecordings(ctx: ModuleContext<RecordingsConfig>): Promise<ModuleInstance<RecordingsApi>> {
   const { diagnostics } = ctx;
   const settings = recordingSettings(ctx.settings, ctx.core.audio);
   await adoptLegacyData(ctx.dataPath, diagnostics);
@@ -77,14 +80,49 @@ async function startRecordings(ctx: ModuleContext<RecordingsConfig>): Promise<Mo
   if (settings.retry.modelPath !== settings.modelPath && await checkWhisperModel(settings.retry.modelPath) !== "MEDIA_AUDIO_READY") {
     diagnostics.record("RECORDING_RETRY_MODEL_UNAVAILABLE");
   }
-  const worker = createRecordingWorker({ settings, dataPath: ctx.dataPath, diagnostics, gate: ctx.core.speechGate,
+  const lane = createLane();
+  const gate = ctx.core.speechGate;
+  const worker = createRecordingWorker({ settings, dataPath: ctx.dataPath, diagnostics, gate, lane,
     health: { fail: (code) => { ctx.fail(code); }, recovered: () => { ctx.recovered(); } } });
+  // Work files of `transcribeMedia`, apart from the worker's (which it empties at start).
+  const mediaWork = join(ctx.dataPath, "media-work");
+  await rm(mediaWork, { recursive: true, force: true });
+  await mkdir(mediaWork, { recursive: true, mode: 0o700 });
+  const transcribeMedia = (request: TranscribeMediaRequest): Promise<TranscribeMediaResult> => {
+    const signal = AbortSignal.any([request.signal, ctx.signal]);
+    const queued = lane(async () => {
+      if (ctx.signal.aborted) throw new ModuleError("RECORDINGS_STOPPED");
+      if (signal.aborted) throw new MediaError("MEDIA_ABORTED");
+      await gate.waitUntilIdle(signal);
+      request.onStart?.();
+      let unregister: (() => void) | undefined;
+      const context: TranscriptionContext = { settings, runner: runManagedProcess, workRoot: mediaWork, signal,
+        onSpawn: (control) => { unregister?.(); unregister = gate.registerBackground(control); },
+        ...(request.onProgress ? { onProgress: request.onProgress } : {}) };
+      try {
+        const result = await transcribeRecording({ recording: request.media, dayDirectory: request.outputDirectory, key: request.key,
+          durationSeconds: request.durationSeconds, mode: "first", replace: true }, context);
+        if (result.speakers === "unavailable") diagnostics.record("RECORDING_SPEAKERS_UNAVAILABLE");
+        // Dependents cut by word times: without the words file the result is not usable.
+        if (!result.words) throw new RecordingError("OUTPUT_INVALID");
+        return { transcript: result.transcript, words: result.words, speakers: result.speakers };
+      } finally { unregister?.(); }
+    });
+    // A caller stopped while still queued behind a long recording is released at once; its turn is then skipped.
+    return new Promise<TranscribeMediaResult>((resolve, reject) => {
+      const abort = () => reject(new MediaError("MEDIA_ABORTED"));
+      if (signal.aborted) abort();
+      signal.addEventListener("abort", abort, { once: true });
+      queued.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+    });
+  };
   try { await worker.start(); }
   catch {
     await worker.stop().catch(() => undefined);
     throw new ModuleError("RECORDINGS_START_FAILED");
   }
   return {
+    provides: { transcribeMedia },
     invoke: async (name) => name === "recordings_status" ? statusResult(worker)
       : { ok: false, code: "RECORDINGS_ABILITY_UNKNOWN", message: "Unknown recordings ability." },
     status: () => statusLine(worker.snapshot()),

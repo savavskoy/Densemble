@@ -272,7 +272,7 @@ after seven days unless retained for active work/delivery. See the
 A **module** is an optional feature that plugs into the core without core edits:
 one folder `src/modules/<id>/` with its own settings, health, owner docs and,
 optionally, abilities (tools) for agents. Absent `modules` (or `{}`) means core
-only. Recording transcription is the first module. Contract, folder layout and
+only. Modules: recording transcription (`recordings`) and reels (`reels`). Contract, folder layout and
 rules for module authors: [`src/modules/README.md`](src/modules/README.md);
 config keys, health codes and files:
 [contracts → Modules](docs/contracts.md#modules).
@@ -311,6 +311,18 @@ config keys, health codes and files:
   each module with enabled/state, cause, fix and its status line; the owner's
   `/status` in Telegram has a «Модулі» section; `make doctor` adds a
   `module:<id>` line (and the module's own checks only when it is enabled).
+
+## Reels (optional)
+
+The `reels` [module](#modules) (spec 006, requires `recordings`): allowed agents prepare a
+YouTube video or a workspace video file (download + transcript with timecodes and speakers),
+read its transcript and cut exactly the reels they are given into 9:16 videos with karaoke
+subtitles and a title, delivered to the chat and saved under `<workspace>/raw/reels/`.
+Settings, prerequisites (`brew install yt-dlp`) and files:
+[`src/modules/reels/README.md`](src/modules/reels/README.md); agent reference:
+[`INSTRUCTIONS.md`](src/modules/reels/INSTRUCTIONS.md); contract:
+[contracts → Reels](docs/contracts.md#reels). Modules talk back to the chat through
+`ModuleContext.chat` ([contracts → Module chat](docs/contracts.md#module-chat)).
 
 ## Recording transcription (optional)
 
