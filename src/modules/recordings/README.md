@@ -46,7 +46,8 @@ error (`MODULE_SETTINGS_DUPLICATED`).
 
 ## Prerequisites
 
-- FFmpeg/ffprobe and whisper.cpp (paths shared with `audio`).
+- FFmpeg/ffprobe and whisper.cpp (paths shared with `audio`), including its
+  `whisper-vad-speech-segments` tool next to `whisper-cli` (Homebrew and source builds ship both).
 - A multilingual whisper.cpp GGML model (`modelPath`) and the Silero VAD model
   (`vadModelPath`); optionally a stronger `retry.modelPath`. No automatic download.
 - The folder must be an existing, non-symlink directory inside `workspacePath` or an
@@ -59,6 +60,14 @@ error (`MODULE_SETTINGS_DUPLICATED`).
 `make doctor` (service stopped) shows `module:recordings` plus `recordings-folder`,
 `recordings-model`, `recordings-retry-model`, `recordings-vad`, `recordings-speakers` and
 `recordings-legacy-job`.
+
+## Recognition
+
+VAD runs first, on its own (`whisper-vad-speech-segments`, `-vmsd 25`); speech is cut into chunks of at
+most 25 s (`chunks.ts`), and one `whisper-cli` run decodes every chunk as its own file, loading the model
+once. Decoding the whole recording in one input dropped text: whisper.cpp reads it in 30 s windows and, on
+repeated takes, jumps to the window end (2026-11-05: a 44-min recording lost whole sentences, ~31% of its
+words). Cost: ~3–4 min per hour of audio instead of ~1.
 
 ## Transcripts
 
