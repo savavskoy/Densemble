@@ -1,16 +1,16 @@
 import { constants } from "node:fs";
 import { link, mkdir, open, rename, rm, statfs, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   MediaError, readBounded, checkVadModel, checkWhisperModel, vocabularyPrompt, whisperArgs, whisperDtwPreset,
   type ProcessControl, type ProcessRunner,
 } from "../core-api.js";
+import { CHUNK_MAX_SECONDS, parseSpeechSegments, speechChunks, writeWavChunks } from "./chunks.js";
 import type { RecordingSettings } from "./settings.js";
 import { detectSilences, type SilenceSpan } from "./silence.js";
 import { diarize, type DiarizationResult } from "./speakers/index.js";
-import { buildPhrases, collapseRuns, filterSegments, formatTranscript, NO_SPEECH, parseVadLine, vadTimeMapper, whisperSegments,
-  type VadSpan } from "./timed.js";
+import { buildPhrases, collapseRuns, filterSegments, formatTranscript, NO_SPEECH, whisperSegments, type TimedSegment } from "./timed.js";
 
 export { NO_SPEECH };
 
@@ -63,7 +63,8 @@ export interface TranscriptionResult {
 
 const MAX_JSON_BYTES = 512_000_000;
 const WAV_BYTES_PER_SECOND = 32_000;
-const PROGRESS = /progress\s*=\s*(\d+)%/;
+/** whisper-cli's line as it starts each input file: chunks done = progress. */
+const PROCESSING = /^main: processing '/;
 /** Share of the progress bar taken by recognition when speakers are separated after it. */
 const RECOGNITION_SHARE = 85;
 
@@ -104,8 +105,9 @@ export async function transcribeRecording(job: TranscriptionJob, context: Transc
   const spawn = context.onSpawn ? { onSpawn: context.onSpawn } : {};
   try {
     const wav = join(work, "audio.wav");
-    // A 4-hour recording decodes to ~460 MB; refuse early rather than fill the disk midway.
-    if (await freeBytes(context.workRoot) < job.durationSeconds * WAV_BYTES_PER_SECOND * 1.1 + 64_000_000) {
+    // A 4-hour recording decodes to ~460 MB, and its speech chunks take as much again; refuse early rather than fill
+    // the disk midway.
+    if (await freeBytes(context.workRoot) < job.durationSeconds * WAV_BYTES_PER_SECOND * 2.2 + 64_000_000) {
       throw new RecordingError("DISK_FULL");
     }
     await run(() => runner(settings.ffmpegPath, ["-nostdin", "-v", "error", "-xerror", "-threads", "1", "-protocol_whitelist", "file", "-i", job.recording,
@@ -115,34 +117,50 @@ export async function transcribeRecording(job: TranscriptionJob, context: Transc
     const silences = await findSilences(wav, job, context);
     if (silences) context.onSilences?.(silences);
     const share = settings.speakers ? RECOGNITION_SHARE : 100;
-    const prefix = join(work, "transcript");
-    const spans: VadSpan[] = [];
-    await run(async () => runner(settings.whisperPath, whisperArgs({
-      model: pass.modelPath, wav, outputPrefix: prefix, language: settings.language, threads: settings.threads,
-      prompt: vocabularyPrompt(settings.vocabulary), progress: true, json: true, dtw: await whisperDtwPreset(pass.modelPath),
-      vad: { modelPath: settings.vadModelPath, ...pass.vad },
-      suppressNonSpeech: pass.suppressNonSpeech, maxContext: pass.maxContext,
-    }), {
-      signal, timeoutMs: Math.max(30 * 60_000, job.durationSeconds * 1_500), discardStdout: true, cwd: work,
-      onStderrLine: (line) => {
-        const span = parseVadLine(line);
-        if (span) { spans.push(span); return; }
-        const match = PROGRESS.exec(line);
-        if (match) context.onProgress?.(Math.floor(Math.min(100, Number(match[1])) * share / 100));
-      },
-      ...spawn,
-    }), "ASR_FAILED");
-    let segments;
+    let chunks: { start: number; end: number }[] = [];
+    await run(async () => {
+      const { stdout } = await runner(vadToolPath(settings.whisperPath), ["-vm", settings.vadModelPath, "-f", wav,
+        "-t", String(Math.max(1, Math.min(8, Math.floor(settings.threads)))), "-vt", String(pass.vad.threshold),
+        "-vspd", String(pass.vad.minSpeechMs), "-vsd", String(pass.vad.minSilenceMs), "-vp", String(pass.vad.padMs),
+        "-vmsd", String(CHUNK_MAX_SECONDS), "-np"], {
+        // ~60 bytes of stdout per span; the Metal/ggml log on stderr is noise.
+        signal, timeoutMs: Math.max(10 * 60_000, job.durationSeconds * 250), maxOutputBytes: 16_000_000, onStderrLine: () => {},
+        ...spawn,
+      });
+      chunks = speechChunks(parseSpeechSegments(stdout));
+    }, "ASR_FAILED");
+    const names = chunks.map((_, index) => `chunk-${String(index).padStart(5, "0")}`);
+    await run(() => writeWavChunks(wav, chunks, names.map((name) => join(work, `${name}.wav`))), "DECODE_FAILED");
+    if (names.length) {
+      let done = 0;
+      const [first, ...rest] = names.map((name) => ({ wav: `${name}.wav`, outputPrefix: name }));
+      await run(async () => runner(settings.whisperPath, whisperArgs({
+        model: pass.modelPath, wav: first!.wav, outputPrefix: first!.outputPrefix, moreInputs: rest, language: settings.language,
+        threads: settings.threads, prompt: vocabularyPrompt(settings.vocabulary), json: true, dtw: await whisperDtwPreset(pass.modelPath),
+        suppressNonSpeech: pass.suppressNonSpeech, maxContext: pass.maxContext,
+      }), {
+        signal, timeoutMs: Math.max(30 * 60_000, job.durationSeconds * 1_500), discardStdout: true, cwd: work,
+        onStderrLine: (line) => {
+          if (PROCESSING.test(line)) context.onProgress?.(Math.floor(done++ / names.length * share));
+        },
+        ...spawn,
+      }), "ASR_FAILED");
+      context.onProgress?.(share);
+    }
+    const segments: TimedSegment[] = [];
     try {
-      const text = new TextDecoder("utf-8").decode(await readBounded(`${prefix}.json`, MAX_JSON_BYTES));
-      if (text.includes("\0")) throw new RecordingError("OUTPUT_INVALID");
-      segments = filterSegments(whisperSegments(JSON.parse(text), vadTimeMapper(spans)).segments);
+      for (const [index, name] of names.entries()) {
+        const text = new TextDecoder("utf-8").decode(await readBounded(join(work, `${name}.json`), MAX_JSON_BYTES));
+        if (text.includes("\0")) throw new RecordingError("OUTPUT_INVALID");
+        segments.push(...whisperSegments(JSON.parse(text), chunks[index]!.start).segments);
+      }
     } catch { throw new RecordingError("OUTPUT_INVALID"); }
+    const kept = filterSegments(segments);
     let diarization: DiarizationResult | undefined;
     let speakers: SpeakerOutcome = "off";
     if (settings.speakers) {
       speakers = "unavailable";
-      if (segments.length) {
+      if (kept.length) {
         try {
           diarization = await diarize(wav, settings.speakers, { runner, signal, workDir: work, ffmpegPath: settings.ffmpegPath,
             timeoutMs: Math.max(30 * 60_000, job.durationSeconds * 1_000), ...spawn,
@@ -153,7 +171,7 @@ export async function transcribeRecording(job: TranscriptionJob, context: Transc
         }
       } else speakers = "separated";
     }
-    const timed = buildPhrases(segments, diarization, settings.speakers?.ownerName ?? "");
+    const timed = buildPhrases(kept, diarization, settings.speakers?.ownerName ?? "");
     const published = await publish(job, formatTranscript(timed), `${JSON.stringify(timed)}\n`);
     return { ...published, silences, speakers };
   } finally {
@@ -170,6 +188,12 @@ async function findSilences(wav: string, job: TranscriptionJob, context: Transcr
     if (error instanceof MediaError && error.code === "MEDIA_ABORTED") throw error;
     return undefined;
   }
+}
+
+/** `whisper-vad-speech-segments` ships with whisper.cpp next to `whisper-cli` (Homebrew and source builds alike). */
+function vadToolPath(whisperPath: string): string {
+  const tool = "whisper-vad-speech-segments";
+  return basename(whisperPath) === whisperPath ? tool : join(dirname(whisperPath), tool);
 }
 
 async function run(action: () => Promise<unknown>, failure: RecordingFailure): Promise<void> {

@@ -35,6 +35,17 @@ interface Fake {
   runner: ProcessRunner;
 }
 
+/** A silent 16 kHz mono 16-bit PCM WAV of `seconds`. */
+function pcmWav(seconds: number): Buffer {
+  const body = Buffer.alloc(seconds * 32_000);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "latin1"); header.writeUInt32LE(36 + body.length, 4); header.write("WAVEfmt ", 8, "latin1");
+  header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22); header.writeUInt32LE(16_000, 24);
+  header.writeUInt32LE(32_000, 28); header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write("data", 36, "latin1"); header.writeUInt32LE(body.length, 40);
+  return Buffer.concat([header, body]);
+}
+
 /** whisper.cpp `-oj -ojf` output: one segment per line, 2 s apart, one token per word (times in VAD time = original). */
 function whisperJson(text: string): string {
   const lines = text.split("\n").filter((line) => line.trim());
@@ -67,12 +78,14 @@ function makeFake(): Fake {
             return ok();
           }
           fake.inputs.push(args[args.indexOf("-i") + 1]!);
-          writeFileSync(args.at(-1)!, "RIFF....WAVE");
+          writeFileSync(args.at(-1)!, pcmWav(12.5));
           return ok();
+        case "whisper-vad-speech-segments": // Two chunks: 0–6.2 s (holds all the fake text) and 9.8–12.2 s (silent).
+          return ok("Detected 2 speech segments:\nSpeech segment 0: start = 0.00, end = 600.00\nSpeech segment 1: start = 1000.00, end = 1200.00\n");
         case "whisper-cli": {
-          const prefix = args[args.indexOf("-of") + 1]!;
+          const prefixes = args.flatMap((arg, index) => args[index - 1] === "-of" ? [join(options.cwd!, arg)] : []);
           const text = await fake.whisper({ args, options, recording: fake.inputs.at(-1) });
-          if (text !== undefined) writeFileSync(`${prefix}.json`, whisperJson(text));
+          if (text !== undefined) prefixes.forEach((prefix, index) => writeFileSync(`${prefix}.json`, whisperJson(index ? "" : text)));
           return ok();
         }
         case "osascript":
@@ -200,7 +213,8 @@ describe("recording worker: filing and transcription", () => {
     let during: RecordingStatus | undefined;
     fake.whisper = async ({ options }) => {
       clock += 10_000;
-      options.onStderrLine?.("whisper_print_progress_callback: progress =  50%");
+      options.onStderrLine?.("main: processing 'chunk-00000.wav' (99200 samples, 6.2 sec), 4 threads, 1 processors");
+      options.onStderrLine?.("main: processing 'chunk-00001.wav' (38400 samples, 2.4 sec), 4 threads, 1 processors");
       await waitFor(async () => (await readStatus(statusPath()))?.current?.percent === 50);
       during = await status();
       return "Привіт\n[музика]\nрядок\nрядок\nрядок\nрядок\nкінець\n";
@@ -218,11 +232,15 @@ describe("recording worker: filing and transcription", () => {
     const lsof = fake.calls.find((call) => basename(call.executable) === "sh");
     expect(lsof?.args.slice(2)).toEqual(["/usr/sbin/lsof", source]);
     const whisper = fake.calls.find((call) => basename(call.executable) === "whisper-cli")!;
-    const flag = (name: string) => whisper.args[whisper.args.indexOf(name) + 1];
-    // First pass = benchmark config E: sensitive VAD, long pads, no carried context, -sns off.
-    expect([flag("-m"), flag("-vt"), flag("-vspd"), flag("-vsd"), flag("-vp"), flag("-mc")])
-      .toEqual([join(tmp, "models", "model.bin"), "0.35", "250", "500", "200", "0"]);
-    expect(whisper.args).toContain("-pp");
+    const vad = fake.calls.find((call) => call.executable === "/x/whisper-vad-speech-segments")!;
+    const flag = (call: Call, name: string) => call.args[call.args.indexOf(name) + 1];
+    // First pass = benchmark config E: sensitive VAD, long pads, no carried context, -sns off. VAD runs on its own and
+    // splits speech into chunks of at most 25 s; each chunk is its own whisper input (2026-11-05: no dropped windows).
+    expect([flag(vad, "-vm"), flag(vad, "-vt"), flag(vad, "-vspd"), flag(vad, "-vsd"), flag(vad, "-vp"), flag(vad, "-vmsd")])
+      .toEqual([join(tmp, "models", "vad.bin"), "0.35", "250", "500", "200", "25"]);
+    expect([flag(whisper, "-m"), flag(whisper, "-mc")]).toEqual([join(tmp, "models", "model.bin"), "0"]);
+    expect(whisper.args.filter((_, index) => whisper.args[index - 1] === "-f")).toEqual(["chunk-00000.wav", "chunk-00001.wav"]);
+    expect(whisper.args).not.toContain("--vad");
     expect(whisper.args).not.toContain("-sns");
     expect(fake.inputs).toEqual([join(day, OBS)]);
     const silence = fake.calls.find((call) => call.args.some((arg) => arg.startsWith("silencedetect=")))!;
@@ -305,10 +323,11 @@ describe("recording worker: filing and transcription", () => {
     const base = settings();
     await worker({ settings: { ...base, retry: { ...base.retry, modelPath: large } } }).pass();
     const whisper = fake.calls.find((call) => basename(call.executable) === "whisper-cli")!;
-    const flag = (name: string) => whisper.args[whisper.args.indexOf(name) + 1];
+    const vad = fake.calls.find((call) => basename(call.executable) === "whisper-vad-speech-segments")!;
+    const flag = (call: Call, name: string) => call.args[call.args.indexOf(name) + 1];
     // Stronger model, same VAD as the first pass: stricter VAD dropped real speech in the benchmark (FR-029).
-    expect(flag("-m")).toBe(large);
-    expect([flag("-vt"), flag("-vspd"), flag("-vsd"), flag("-vp"), flag("-mc")]).toEqual(["0.35", "250", "500", "200", "0"]);
+    expect([flag(whisper, "-m"), flag(whisper, "-mc")]).toEqual([large, "0"]);
+    expect([flag(vad, "-vt"), flag(vad, "-vspd"), flag(vad, "-vsd"), flag(vad, "-vp")]).toEqual(["0.35", "250", "500", "200"]);
     expect(mode).toBe("retry");
     expect(diagnostics.record).toHaveBeenCalledWith("RECORDING_STARTED", { attempt: 2 });
     expect(readFileSync(join(day, "transcript_2026-10-29_x.txt"), "utf8")).toBe(timed([0, "краще"]));

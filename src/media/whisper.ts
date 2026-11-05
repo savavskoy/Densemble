@@ -85,6 +85,8 @@ export interface WhisperRunOptions {
   json?: boolean | undefined;
   /** `-dtw <preset>` token timestamps (needs `-nfa`); see `whisperDtwPreset`. */
   dtw?: string | undefined;
+  /** More files decoded in the same run (the model loads once); whisper-cli pairs each `-f` with `-of` by position. */
+  moreInputs?: readonly { wav: string; outputPrefix: string }[] | undefined;
 }
 
 export function whisperArgs(options: WhisperRunOptions): string[] {
@@ -109,6 +111,7 @@ export function whisperArgs(options: WhisperRunOptions): string[] {
     args.push("-mc", String(options.maxContext));
   }
   if (options.progress) args.push("-pp");
+  for (const input of options.moreInputs ?? []) args.push("-f", input.wav, "-of", input.outputPrefix);
   return args;
 }
 

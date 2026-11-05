@@ -9,7 +9,7 @@ import { readTimedTranscript } from "../../src/modules/recordings/api.js";
 import { RECORDING_DEFAULTS, type RecordingSettings } from "../../src/modules/recordings/settings.js";
 import { checkSpeakerModels, diarize, type SpeakerSettings } from "../../src/modules/recordings/speakers/index.js";
 import {
-  assignSpeakers, buildPhrases, smoothSpeakers, filterSegments, formatTranscript, parseVadLine, timecode, vadTimeMapper, whisperSegments,
+  assignSpeakers, buildPhrases, smoothSpeakers, filterSegments, formatTranscript, timecode, whisperSegments,
   type TimedSegment,
 } from "../../src/modules/recordings/timed.js";
 import { transcribeRecording } from "../../src/modules/recordings/transcribe.js";
@@ -18,27 +18,24 @@ let tmp: string;
 beforeEach(() => { tmp = resolve(".cache", `recordings-timed-${randomUUID()}`); mkdirSync(tmp, { recursive: true }); });
 afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
 
+/** A silent 16 kHz mono 16-bit PCM WAV of `seconds`. */
+function pcmWav(seconds: number): Buffer {
+  const body = Buffer.alloc(seconds * 32_000);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "latin1"); header.writeUInt32LE(36 + body.length, 4); header.write("WAVEfmt ", 8, "latin1");
+  header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22); header.writeUInt32LE(16_000, 24);
+  header.writeUInt32LE(32_000, 28); header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write("data", 36, "latin1"); header.writeUInt32LE(body.length, 40);
+  return Buffer.concat([header, body]);
+}
+
 const word = (start: number, end: number, text: string) => ({ start, end, text });
 const segment = (...words: ReturnType<typeof word>[]): TimedSegment => ({ start: words[0]!.start, end: words.at(-1)!.end, words });
 
 describe("whisper JSON → timed words (spec 006, FR-004)", () => {
-  it("maps VAD-processed times back with whisper's layout: span + 0.1 s overlap + 0.1 s silence", () => {
-    const lines = ["whisper_vad_segments_from_probs: VAD segment 0: start = 0.00, end = 3.08 (duration: 3.08)",
-      "VAD segment 1: start = 6.94, end = 9.90 (duration: 2.96)", "progress = 10%"];
-    const spans = lines.map(parseVadLine).filter((span) => span !== undefined);
-    expect(spans).toEqual([{ start: 0, end: 3.08 }, { start: 6.94, end: 9.9 }]);
-    const map = vadTimeMapper(spans);
-    expect(map(1)).toBeCloseTo(1);
-    expect(map(3.15)).toBeCloseTo(3.15);
-    // Second span starts at 3.08 + 0.1 + 0.1 = 3.28 processed seconds.
-    expect(map(3.28)).toBeCloseTo(6.94);
-    expect(map(5)).toBeCloseTo(8.66);
-    expect(vadTimeMapper([])(12.5)).toBe(12.5);
-  });
-
-  it("builds words from tokens, preferring DTW times and skipping special tokens", () => {
+  it("builds words from tokens, preferring DTW times and skipping special tokens, shifted by the chunk start", () => {
     const json = { result: { language: "uk" }, transcription: [{
-      offsets: { from: 46_960, to: 52_000 },
+      offsets: { from: 29_960, to: 35_000 },
       tokens: [
         { text: "[_BEG_]", offsets: { from: 0, to: 0 }, t_dtw: -1 },
         { text: " Д", offsets: { from: 30_000, to: 30_390 }, t_dtw: 3150 },
@@ -49,12 +46,12 @@ describe("whisper JSON → timed words (spec 006, FR-004)", () => {
         { text: "[_TT_150]", offsets: { from: 34_590, to: 34_590 }, t_dtw: -1 },
       ],
     }] };
-    const { language, segments } = whisperSegments(json, (seconds) => seconds + 17);
+    const { language, segments } = whisperSegments(json, 17);
     expect(language).toBe("uk");
     expect(segments).toEqual([{ start: 46.96, end: 52, words: [
       { start: 48.5, end: 49.6, text: "Добре," }, { start: 49.6, end: 50.2, text: "уяви" },
     ] }]);
-    expect(() => whisperSegments({}, (seconds) => seconds)).toThrow();
+    expect(() => whisperSegments({}, 0)).toThrow();
   });
 
   it("applies spec 004's filter to timed segments", () => {
@@ -185,17 +182,18 @@ describe("transcribeRecording with speakers", () => {
     let whisperArgsSeen: string[] = [];
     const runner: ProcessRunner = async (executable, args, options) => {
       const name = basename(executable);
+      if (name === "whisper-vad-speech-segments") return { stdout: "Detected 1 speech segments:\nSpeech segment 0: start = 520.00, end = 780.00\n", stderr: "" };
       if (name === "whisper-cli") {
         whisperArgsSeen = args;
-        options.onStderrLine?.("VAD segment 0: start = 5.00, end = 8.00 (duration: 3.00)");
-        options.onStderrLine?.("progress = 100%");
-        writeFileSync(`${args[args.indexOf("-of") + 1]}.json`, JSON.stringify({ transcription: [{ offsets: { from: 5_000, to: 8_000 },
+        options.onStderrLine?.("main: processing 'chunk-00000.wav' (48000 samples, 3.0 sec), 4 threads, 1 processors");
+        // Times relative to the chunk, which starts at 5.00 (VAD 5.20 minus the 0.2 s pad).
+        writeFileSync(join(options.cwd!, `${args[args.indexOf("-of") + 1]}.json`), JSON.stringify({ transcription: [{ offsets: { from: 0, to: 3_000 },
           tokens: [{ text: " Привіт", offsets: { from: 0, to: 500 }, t_dtw: 20 }, { text: " всім.", offsets: { from: 600, to: 1_000 }, t_dtw: 120 }] }] }));
       } else if (name.startsWith("node")) {
         if (!diarizationOk) throw new MediaError("MEDIA_AUDIO_FAILED");
         const request = JSON.parse(readFileSync(args.at(-1)!, "utf8")) as { output: string };
         writeFileSync(request.output, JSON.stringify({ turns: [{ start: 5, end: 8, speaker: 0 }], ownerSpeaker: 0 }));
-      } else if (!args.some((arg) => arg.startsWith("silencedetect="))) writeFileSync(args.at(-1)!, "RIFF");
+      } else if (!args.some((arg) => arg.startsWith("silencedetect="))) writeFileSync(args.at(-1)!, pcmWav(10));
       return { stdout: "", stderr: "" };
     };
     const progress: number[] = [];
@@ -205,6 +203,7 @@ describe("transcribeRecording with speakers", () => {
     expect(result.speakers).toBe("separated");
     expect(whisperArgsSeen).toEqual(expect.arrayContaining(["-oj", "-ojf", "-dtw", "large.v3.turbo", "-nfa"]));
     expect(whisperArgsSeen).not.toContain("-np");
+    expect(whisperArgsSeen).not.toContain("--vad");
     expect(readFileSync(result.transcript, "utf8")).toBe("[00:00:05] Oleh: Привіт всім.\n");
     const words = await readTimedTranscript(result.words!);
     expect(words?.phrases[0]?.words).toEqual([{ start: 5.2, end: 6.2, text: "Привіт" }, { start: 6.2, end: 6.5, text: "всім." }]);

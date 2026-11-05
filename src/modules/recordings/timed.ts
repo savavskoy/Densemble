@@ -14,10 +14,6 @@ export const NO_SPEECH = "[no speech detected]";
 /** Label of every phrase when speakers could not be separated (plan D3). */
 export const UNSEPARATED = "Speaker";
 
-const VAD_LINE = /VAD segment \d+: start = (\d+(?:\.\d+)?), end = (\d+(?:\.\d+)?)/;
-/** whisper.cpp (1.7.6+) joins speech segments with `-vo` seconds of real audio and then 0.1 s of silence. */
-const VAD_OVERLAP_SECONDS = 0.1;
-const VAD_SILENCE_SECONDS = 0.1;
 /** A word's end when nothing follows it closely: its last token time plus this. */
 const WORD_TAIL_SECONDS = 0.3;
 const MAX_WORD_GAP_SECONDS = 1;
@@ -27,39 +23,6 @@ const ISLAND_SECONDS = 1;
 /** A pause that starts a new phrase of the same speaker: after a sentence end, or any pause this long. */
 const SENTENCE_PAUSE_SECONDS = 1.5;
 const PAUSE_SECONDS = 3;
-
-export interface VadSpan { start: number; end: number }
-
-/** whisper.cpp's "VAD segment N: start = S, end = E" stderr lines (seconds of the original audio). */
-export function parseVadLine(line: string): VadSpan | undefined {
-  const match = VAD_LINE.exec(line);
-  if (!match) return undefined;
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  return Number.isFinite(start) && Number.isFinite(end) && end >= start ? { start, end } : undefined;
-}
-
-/**
- * Maps a time of the VAD-processed audio (what whisper's token times use) back to the original audio. Segment
- * times in the JSON are already mapped by whisper; token and DTW times are not. Identity without VAD spans.
- */
-export function vadTimeMapper(spans: readonly VadSpan[]): (seconds: number) => number {
-  if (!spans.length) return (seconds) => seconds;
-  const table: { from: number; to: number; original: number }[] = [];
-  let cursor = 0;
-  spans.forEach((span, index) => {
-    const last = index === spans.length - 1;
-    const length = span.end - span.start + (last ? 0 : VAD_OVERLAP_SECONDS);
-    table.push({ from: cursor, to: cursor + length, original: span.start });
-    cursor += length + (last ? 0 : VAD_SILENCE_SECONDS);
-  });
-  return (seconds) => {
-    // Inside the inserted silence: the end of the span before it.
-    for (const entry of table) if (seconds <= entry.to) return entry.original + Math.max(0, seconds - entry.from);
-    const last = table.at(-1)!;
-    return last.original + seconds - last.from;
-  };
-}
 
 interface WhisperToken { text?: unknown; offsets?: { from?: unknown; to?: unknown }; t_dtw?: unknown }
 interface WhisperSegment { offsets?: { from?: unknown; to?: unknown }; tokens?: unknown }
@@ -71,9 +34,10 @@ const finite = (value: unknown): value is number => typeof value === "number" &&
 /**
  * Words from whisper.cpp `-oj -ojf` output. A token starting with a space starts a word; special tokens
  * (`[_BEG_]`, `[_TT_…]`, `<|…|>`) are skipped. A word starts at its first token's DTW time (`t_dtw`,
- * centiseconds) when present, else at the token offset (ms); both are VAD-processed times, mapped with `map`.
+ * centiseconds) when present, else at the token offset (ms). All times are relative to the decoded chunk,
+ * which starts `offset` seconds into the recording.
  */
-export function whisperSegments(json: unknown, map: (seconds: number) => number): { language?: string; segments: TimedSegment[] } {
+export function whisperSegments(json: unknown, offset: number): { language?: string; segments: TimedSegment[] } {
   const root = (json ?? {}) as { result?: { language?: unknown }; transcription?: unknown };
   if (!Array.isArray(root.transcription)) throw new Error("OUTPUT_INVALID");
   const segments: TimedSegment[] = [];
@@ -81,15 +45,15 @@ export function whisperSegments(json: unknown, map: (seconds: number) => number)
     const from = raw.offsets?.from;
     const to = raw.offsets?.to;
     if (!finite(from) || !finite(to) || !Array.isArray(raw.tokens)) throw new Error("OUTPUT_INVALID");
-    const segmentStart = from / 1000;
-    const segmentEnd = Math.max(segmentStart, to / 1000);
+    const segmentStart = offset + from / 1000;
+    const segmentEnd = Math.max(segmentStart, offset + to / 1000);
     const pieces: { text: string; first: number; last: number }[] = [];
     for (const token of raw.tokens as WhisperToken[]) {
       if (typeof token.text !== "string" || /^\s*(?:\[_|<\|)/u.test(token.text)) continue;
       const time = finite(token.t_dtw) && token.t_dtw >= 0 ? token.t_dtw / 100
         : finite(token.offsets?.from) ? token.offsets.from / 1000 : undefined;
       if (time === undefined) continue;
-      const at = Math.min(segmentEnd, Math.max(segmentStart, map(time)));
+      const at = Math.min(segmentEnd, Math.max(segmentStart, offset + time));
       const current = pieces.at(-1);
       if (!current || /^\s/u.test(token.text)) pieces.push({ text: token.text, first: at, last: at });
       else { current.text += token.text; current.last = at; }
