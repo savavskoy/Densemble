@@ -8,7 +8,7 @@ import type {
   SDKControlInitializeResponse, SDKMessage, SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, type AgentDefinition, type LoadedConfig } from "../config/index.js";
+import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, ownerLabel, type AgentDefinition, type LoadedConfig } from "../config/index.js";
 import type { ModelInfo, RequestAnswer, RequestPayload, RunIdentity, RuntimeCommand, RuntimeEvent, Scope, Session } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type { DiagnosticSink } from "../ports.js";
@@ -356,6 +356,8 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
     const owner = user === config.config.ownerId;
     const match = authorizedWorkspace(config.config, user, session.scope.botId, session.workspace);
     if (!match) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
+    // Members of a shared workspace get the same MCP servers as the owner.
+    const mcpAccess = owner || match !== DEFAULT_WORKSPACE_ID;
     const agents = match === DEFAULT_WORKSPACE_ID ? config.agents : config.agents.filter((agent) => match.agentIds.includes(agent.id));
     const main = agents.find((agent) => agent.id === session.agentId);
     if (!main) throw new RuntimeError("RUNTIME_AGENT_MISSING");
@@ -392,8 +394,8 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
       },
     };
     const telegram = owner
-      ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
-        "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
+      ? `You are chatting with ${ownerLabel(config.config)} in Telegram. Do not use structured question forms. ` +
+        "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply."
       : `You are chatting with ${userLabel(config.config.users?.find((entry) => entry.telegramUserId === user)?.displayName)} in Telegram. ` +
         "Do not use structured question forms. " +
         "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply. " +
@@ -427,7 +429,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
       }
       const name = input.tool_name === "Task" ? "Agent" : input.tool_name;
       const known = tools.includes(name) || name === exportTool || name === proactivityTool || moduleTools.has(name) ||
-        (owner && allowedMcp.has(name));
+        (mcpAccess && allowedMcp.has(name));
       if (!known) return deny("TOOL_EXCLUDED_REJECTED", "Цей інструмент вимкнений у керованому сервісі.");
       if (name === "Agent") {
         const type = (input.tool_input as { subagent_type?: unknown } | null)?.subagent_type;
@@ -486,7 +488,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
           return result({ status: "prepared_for_delivery", fileName: attachment.fileName });
         }),
       tool("densemble_manage_proactivity",
-        "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to Oleh.",
+        "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to the user.",
         { action: z.enum(["schedule", "list", "cancel", "pause", "resume"]), kind: z.enum(["oneoff", "recurring", "silent"]).optional(),
           schedule: scheduleShape.optional(), purpose: z.string().min(1).optional(), id: z.string().min(1).optional() },
         async (args) => {
@@ -522,7 +524,7 @@ export function createClaudeRuntime(options: ClaudeRuntimeOptions): ControlledRu
         plugins: service.plugin ? [{ type: "local", path: service.plugin, skipMcpDiscovery: true }] : [], skills: expected,
         tools, disallowedTools, agents: subagents, model: session.appliedModel,
         systemPrompt: { type: "preset", preset: "claude_code", append },
-        mcpServers: { densemble, ...(owner ? mcpServers : {}) },
+        mcpServers: { densemble, ...(mcpAccess ? mcpServers : {}) },
         permissionMode: "default", permissionPrompts: "host", canUseTool, hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
         includePartialMessages: true, persistSession: true, env: claudeEnvironment(config), stderr: () => undefined,
         ...(resume ? { resume: session.id } : { sessionId: session.id }),

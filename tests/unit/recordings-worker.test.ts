@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import { MediaError } from "../../src/media/errors.js";
 import type { ProcessControl, ProcessOptions, ProcessRunner } from "../../src/media/process.js";
 import { SpeechGate } from "../../src/media/speech-gate.js";
-import { acquireLegacyLock, legacyJobInstalled } from "../../src/modules/recordings/legacy.js";
 import type { DiagnosticSink } from "../../src/ports.js";
 import { createNotifier, type RecordingNotifier } from "../../src/modules/recordings/notify.js";
 import { RECORDING_DEFAULTS, type RecordingSettings } from "../../src/modules/recordings/settings.js";
@@ -35,6 +34,31 @@ interface Fake {
   runner: ProcessRunner;
 }
 
+/** A silent 16 kHz mono 16-bit PCM WAV of `seconds`. */
+function pcmWav(seconds: number): Buffer {
+  const body = Buffer.alloc(seconds * 32_000);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "latin1"); header.writeUInt32LE(36 + body.length, 4); header.write("WAVEfmt ", 8, "latin1");
+  header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20); header.writeUInt16LE(1, 22); header.writeUInt32LE(16_000, 24);
+  header.writeUInt32LE(32_000, 28); header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+  header.write("data", 36, "latin1"); header.writeUInt32LE(body.length, 40);
+  return Buffer.concat([header, body]);
+}
+
+/** whisper.cpp `-oj -ojf` output: one segment per line, 2 s apart, one token per word (times in VAD time = original). */
+function whisperJson(text: string): string {
+  const lines = text.split("\n").filter((line) => line.trim());
+  return JSON.stringify({ result: { language: "uk" }, transcription: lines.map((line, index) => ({
+    offsets: { from: index * 2000, to: index * 2000 + 1500 },
+    tokens: [{ text: "[_BEG_]", offsets: { from: index * 2000, to: index * 2000 }, t_dtw: -1 },
+      ...line.trim().split(/\s+/).map((word, at) => ({ text: ` ${word}`, offsets: { from: index * 2000 + at * 100, to: index * 2000 + at * 100 + 90 }, t_dtw: -1 }))],
+  })) });
+}
+/** The readable transcript of `whisperJson` lines kept by the filter: `[time, text]` pairs, unlabelled speakers. */
+function timed(...lines: [number, string][]): string {
+  return lines.map(([seconds, text]) => `[00:00:${String(seconds).padStart(2, "0")}] Speaker: ${text}\n`).join("");
+}
+
 function makeFake(): Fake {
   const fake: Fake = {
     calls: [], open: new Set(), inputs: [], silence: [],
@@ -53,12 +77,14 @@ function makeFake(): Fake {
             return ok();
           }
           fake.inputs.push(args[args.indexOf("-i") + 1]!);
-          writeFileSync(args.at(-1)!, "RIFF....WAVE");
+          writeFileSync(args.at(-1)!, pcmWav(12.5));
           return ok();
+        case "whisper-vad-speech-segments": // Two chunks: 0–6.2 s (holds all the fake text) and 9.8–12.2 s (silent).
+          return ok("Detected 2 speech segments:\nSpeech segment 0: start = 0.00, end = 600.00\nSpeech segment 1: start = 1000.00, end = 1200.00\n");
         case "whisper-cli": {
-          const prefix = args[args.indexOf("-of") + 1]!;
+          const prefixes = args.flatMap((arg, index) => args[index - 1] === "-of" ? [join(options.cwd!, arg)] : []);
           const text = await fake.whisper({ args, options, recording: fake.inputs.at(-1) });
-          if (text !== undefined) writeFileSync(`${prefix}.txt`, text);
+          if (text !== undefined) prefixes.forEach((prefix, index) => writeFileSync(`${prefix}.json`, whisperJson(index ? "" : text)));
           return ok();
         }
         case "osascript":
@@ -92,13 +118,10 @@ function settings(overrides: Partial<RecordingSettings> = {}): RecordingSettings
   };
 }
 
-const legacyPlist = () => join(tmp, "legacy.plist");
-const legacyLock = () => join(tmp, "legacy.lock");
-
 function worker(extra: Partial<RecordingWorkerOptions> = {}) {
   return createRecordingWorker({
     settings: settings(), dataPath: join(runtime, "recordings"), diagnostics, runner: fake.runner, now: () => clock, notifier,
-    legacy: { plist: legacyPlist(), lock: legacyLock() }, ...extra,
+    ...extra,
   });
 }
 
@@ -186,7 +209,8 @@ describe("recording worker: filing and transcription", () => {
     let during: RecordingStatus | undefined;
     fake.whisper = async ({ options }) => {
       clock += 10_000;
-      options.onStderrLine?.("whisper_print_progress_callback: progress =  50%");
+      options.onStderrLine?.("main: processing 'chunk-00000.wav' (99200 samples, 6.2 sec), 4 threads, 1 processors");
+      options.onStderrLine?.("main: processing 'chunk-00001.wav' (38400 samples, 2.4 sec), 4 threads, 1 processors");
       await waitFor(async () => (await readStatus(statusPath()))?.current?.percent === 50);
       during = await status();
       return "Привіт\n[музика]\nрядок\nрядок\nрядок\nрядок\nкінець\n";
@@ -196,7 +220,7 @@ describe("recording worker: filing and transcription", () => {
     const day = join(root, "2026", "10", "29");
     expect(existsSync(source)).toBe(false);
     expect(readFileSync(join(day, OBS), "utf8")).toBe("data");
-    expect(readFileSync(join(day, `${OBS_KEY}.txt`), "utf8")).toBe("Привіт\nрядок\nкінець\n");
+    expect(readFileSync(join(day, `${OBS_KEY}.txt`), "utf8")).toBe(timed([0, "Привіт"], [10, "рядок"], [12, "кінець"]));
     expect(partials(day)).toEqual([]);
     expect(readdirSync(workRoot())).toEqual([]);
     expect(during?.current).toMatchObject({ file: `2026/10/29/${OBS}`, mode: "first", percent: 50, etaSeconds: 10, paused: false });
@@ -204,11 +228,15 @@ describe("recording worker: filing and transcription", () => {
     const lsof = fake.calls.find((call) => basename(call.executable) === "sh");
     expect(lsof?.args.slice(2)).toEqual(["/usr/sbin/lsof", source]);
     const whisper = fake.calls.find((call) => basename(call.executable) === "whisper-cli")!;
-    const flag = (name: string) => whisper.args[whisper.args.indexOf(name) + 1];
-    // First pass = benchmark config E: sensitive VAD, long pads, no carried context, -sns off.
-    expect([flag("-m"), flag("-vt"), flag("-vspd"), flag("-vsd"), flag("-vp"), flag("-mc")])
-      .toEqual([join(tmp, "models", "model.bin"), "0.35", "250", "500", "200", "0"]);
-    expect(whisper.args).toContain("-pp");
+    const vad = fake.calls.find((call) => call.executable === "/x/whisper-vad-speech-segments")!;
+    const flag = (call: Call, name: string) => call.args[call.args.indexOf(name) + 1];
+    // First pass = benchmark config E: sensitive VAD, long pads, no carried context, -sns off. VAD runs on its own and
+    // splits speech into chunks of at most 25 s; each chunk is its own whisper input (2026-11-05: no dropped windows).
+    expect([flag(vad, "-vm"), flag(vad, "-vt"), flag(vad, "-vspd"), flag(vad, "-vsd"), flag(vad, "-vp"), flag(vad, "-vmsd")])
+      .toEqual([join(tmp, "models", "vad.bin"), "0.35", "250", "500", "200", "25"]);
+    expect([flag(whisper, "-m"), flag(whisper, "-mc")]).toEqual([join(tmp, "models", "model.bin"), "0"]);
+    expect(whisper.args.filter((_, index) => whisper.args[index - 1] === "-f")).toEqual(["chunk-00000.wav", "chunk-00001.wav"]);
+    expect(whisper.args).not.toContain("--vad");
     expect(whisper.args).not.toContain("-sns");
     expect(fake.inputs).toEqual([join(day, OBS)]);
     const silence = fake.calls.find((call) => call.args.some((arg) => arg.startsWith("silencedetect=")))!;
@@ -232,7 +260,7 @@ describe("recording worker: filing and transcription", () => {
   it("files a non-OBS name by its local mtime date", async () => {
     media("meeting.m4a", "m", new Date(2026, 8, 3, 12, 0, 0));
     await worker().pass();
-    expect(readFileSync(join(root, "2026", "09", "03", "transcript_2026-09-03_meeting.txt"), "utf8")).toBe("Привіт\n");
+    expect(readFileSync(join(root, "2026", "09", "03", "transcript_2026-09-03_meeting.txt"), "utf8")).toBe(timed([0, "Привіт"]));
     expect(existsSync(join(root, "meeting.m4a"))).toBe(false);
   });
 
@@ -291,13 +319,14 @@ describe("recording worker: filing and transcription", () => {
     const base = settings();
     await worker({ settings: { ...base, retry: { ...base.retry, modelPath: large } } }).pass();
     const whisper = fake.calls.find((call) => basename(call.executable) === "whisper-cli")!;
-    const flag = (name: string) => whisper.args[whisper.args.indexOf(name) + 1];
+    const vad = fake.calls.find((call) => basename(call.executable) === "whisper-vad-speech-segments")!;
+    const flag = (call: Call, name: string) => call.args[call.args.indexOf(name) + 1];
     // Stronger model, same VAD as the first pass: stricter VAD dropped real speech in the benchmark (FR-029).
-    expect(flag("-m")).toBe(large);
-    expect([flag("-vt"), flag("-vspd"), flag("-vsd"), flag("-vp"), flag("-mc")]).toEqual(["0.35", "250", "500", "200", "0"]);
+    expect([flag(whisper, "-m"), flag(whisper, "-mc")]).toEqual([large, "0"]);
+    expect([flag(vad, "-vt"), flag(vad, "-vspd"), flag(vad, "-vsd"), flag(vad, "-vp")]).toEqual(["0.35", "250", "500", "200"]);
     expect(mode).toBe("retry");
     expect(diagnostics.record).toHaveBeenCalledWith("RECORDING_STARTED", { attempt: 2 });
-    expect(readFileSync(join(day, "transcript_2026-10-29_x.txt"), "utf8")).toBe("краще\n");
+    expect(readFileSync(join(day, "transcript_2026-10-29_x.txt"), "utf8")).toBe(timed([0, "краще"]));
     expect(readFileSync(join(day, "transcript_2026-10-29_x.attempt-1.txt"), "utf8")).toBe("bad attempt");
 
     await worker().pass();
@@ -395,7 +424,7 @@ describe("recording worker: filing and transcription", () => {
     utimesSync(recording, newer, newer);
     await w.pass();
     expect(executables().filter((name) => name === "whisper-cli")).toHaveLength(2);
-    expect(readFileSync(join(day, "transcript_2026-10-29_a.txt"), "utf8")).toBe("вдалося\n");
+    expect(readFileSync(join(day, "transcript_2026-10-29_a.txt"), "utf8")).toBe(timed([0, "вдалося"]));
   });
 
   it("clears the failed entry once the changed file transcribes successfully", async () => {
@@ -442,7 +471,7 @@ describe("recording worker: filing and transcription", () => {
   it("notifies through osascript when no notifier is injected", async () => {
     media("2026/10/29/a.mp4");
     await createRecordingWorker({ settings: settings({ notifications: true }), dataPath: join(runtime, "recordings"), diagnostics,
-      runner: fake.runner, now: () => clock, legacy: { plist: legacyPlist(), lock: legacyLock() } }).pass();
+      runner: fake.runner, now: () => clock }).pass();
     const osascript = fake.calls.filter((call) => basename(call.executable) === "osascript");
     expect(osascript).toHaveLength(1);
     expect(osascript[0]!.args.slice(-2)).toEqual(["Transcription ready", "a.mp4"]);
@@ -503,7 +532,6 @@ describe("recording worker: lifecycle", () => {
     expect(existsSync(staleWork)).toBe(false);
     expect(fake.inputs).toEqual([join(day, OBS)]);
     expect(codes()).toContain("RECORDINGS_STARTED");
-    expect(codes()).not.toContain("RECORDINGS_LEGACY_JOB_INSTALLED");
   });
 });
 
@@ -541,7 +569,7 @@ describe("recording worker: voice first", () => {
 
     finish.resolve();
     await running;
-    expect(readFileSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"), "utf8")).toBe("готово\n");
+    expect(readFileSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"), "utf8")).toBe(timed([0, "готово"]));
     // Unregistered after the job: later voice messages do not touch the finished process.
     gate.enterVoice()();
     expect(control.pause).toHaveBeenCalledTimes(1);
@@ -560,78 +588,6 @@ describe("recording worker: voice first", () => {
     await running;
     expect(executables()).toContain("whisper-cli");
     expect(existsSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"))).toBe(true);
-  });
-});
-
-describe("recording worker: legacy launchd job", () => {
-  it("skips transcription and leaves a foreign lock alone", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    mkdirSync(legacyLock());
-    media("2026/10/29/a.mp4");
-    await worker().pass();
-    expect(executables()).not.toContain("whisper-cli");
-    expect(codes()).toContain("RECORDINGS_LEGACY_LOCK_BUSY");
-    expect(statSync(legacyLock()).isDirectory()).toBe(true);
-    expect(existsSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"))).toBe(false);
-  });
-
-  it("holds the shared lock while transcribing and removes it afterwards", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    media("2026/10/29/a.mp4");
-    let held: boolean | undefined;
-    fake.whisper = async () => { held = existsSync(legacyLock()); return "x\n"; };
-    await worker().pass();
-    expect(held).toBe(true);
-    expect(existsSync(legacyLock())).toBe(false);
-  });
-
-  it("releases the lock after a failed job too", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    media("2026/10/29/a.mp4");
-    fake.whisper = async () => { throw new MediaError("MEDIA_AUDIO_FAILED"); };
-    await worker().pass();
-    expect(existsSync(legacyLock())).toBe(false);
-  });
-
-  it("creates no lock when the legacy job is not installed", async () => {
-    media("2026/10/29/a.mp4");
-    let held: boolean | undefined;
-    fake.whisper = async () => { held = existsSync(legacyLock()); return "x\n"; };
-    await worker().pass();
-    expect(held).toBe(false);
-    expect(existsSync(legacyLock())).toBe(false);
-  });
-
-  it("start() reports an installed legacy job", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    const w = worker();
-    await w.start();
-    await w.stop();
-    expect(codes()).toContain("RECORDINGS_LEGACY_JOB_INSTALLED");
-  });
-});
-
-describe("legacy helpers", () => {
-  it("detects the plist", async () => {
-    expect(await legacyJobInstalled(join(tmp, "missing.plist"))).toBe(false);
-    writeFileSync(legacyPlist(), "<plist/>");
-    expect(await legacyJobInstalled(legacyPlist())).toBe(true);
-  });
-
-  it("acquires once, refuses while held, releases idempotently", async () => {
-    const release = await acquireLegacyLock(legacyLock());
-    expect(release).toBeDefined();
-    expect(statSync(legacyLock()).mode & 0o777).toBe(0o700);
-    expect(await acquireLegacyLock(legacyLock())).toBeUndefined();
-    await release!();
-    expect(existsSync(legacyLock())).toBe(false);
-    mkdirSync(legacyLock());
-    await release!();
-    expect(existsSync(legacyLock())).toBe(true);
-  });
-
-  it("propagates errors other than EEXIST", async () => {
-    await expect(acquireLegacyLock(join(tmp, "missing", "lock"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -688,7 +644,7 @@ describe("createNotifier", () => {
     media("2026/10/28/meeting.m4a");
     media("2026/10/29/meeting.m4a");
     await createRecordingWorker({ settings: settings({ notifications: true }), dataPath: join(runtime, "recordings"), diagnostics,
-      runner: fake.runner, now: () => clock, legacy: { plist: legacyPlist(), lock: legacyLock() } }).pass();
+      runner: fake.runner, now: () => clock }).pass();
     expect(fake.calls.filter((call) => basename(call.executable) === "osascript")).toHaveLength(2);
   });
 });
@@ -730,16 +686,7 @@ describe("recording worker: resilience (review fixes)", () => {
     expect(readdirSync(join(tmp, "outside"))).toEqual([]);
     expect((await status()).conflicts).toContainEqual({ file: OBS, reason: "TARGET_UNSAFE" });
   });
-  it("never removes a legacy lock that replaced its own", async () => {
-    const release = (await acquireLegacyLock(legacyLock()))!;
-    rmSync(legacyLock(), { recursive: true });
-    mkdirSync(legacyLock());
-    await release();
-    expect(existsSync(legacyLock())).toBe(true);
-  });
-  it("keeps the status lists free of duplicates while the legacy lock is busy", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    mkdirSync(legacyLock());
+  it("keeps the status lists free of duplicates across passes", async () => {
     media("2026/10/29/a.mp4");
     media("2026/10/29/a.m4a", "data", new Date(OLD.getTime() + 1000));
     const instance = worker();

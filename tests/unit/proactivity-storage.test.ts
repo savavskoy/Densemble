@@ -54,7 +54,7 @@ describe("proactivity storage", () => {
       kind: "silent",
       schedule: monthly,
       purpose: "Silent oversight",
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: 120,
       now: 11,
     });
@@ -63,7 +63,7 @@ describe("proactivity storage", () => {
       kind: "oneoff",
       schedule: { type: "once", at: 90 },
       purpose: "Other scope reminder",
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: 90,
       now: 12,
     });
@@ -84,7 +84,7 @@ describe("proactivity storage", () => {
       kind: "oneoff",
       schedule: { type: "once", at: 500 },
       purpose: "First reminder",
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: 500,
       now: 10,
     });
@@ -132,7 +132,7 @@ describe("proactivity storage", () => {
       kind: "oneoff",
       schedule: { type: "once", at: 200 },
       purpose: "Reminder",
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: 200,
       now: 10,
     });

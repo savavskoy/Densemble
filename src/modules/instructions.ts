@@ -28,7 +28,7 @@ export interface SessionModulesOptions {
 }
 
 const FALLBACK_CORE = "Call `densemble_state` to see Densemble's module state. You cannot enable, disable, restart or " +
-  "reconfigure modules: tell Oleh the `modules.<id>` key to change in config.local.json and to run `make restart`.";
+  "reconfigure modules: tell the owner the `modules.<id>` key to change in config.local.json and to run `make restart`.";
 
 /** Reads `src/modules/INSTRUCTIONS.md` under the code root (same root from `src/` and `dist/`). */
 export function coreInstructionsReader(codeRoot = fileURLToPath(new URL("../../", import.meta.url))): () => Promise<string> {

@@ -1,5 +1,5 @@
 // Pure file contract of the watched recordings folder, shared with the
-// meeting-transcriber bash tool (transcribe-new-recordings.sh, review.sh):
+// meeting-transcriber review tool (review.sh):
 //   <root>/review-log.tsv                          time \t verdict \t transcript_rel \t recording_rel \t reason
 //   <root>/<recording>.<ext>                       filed into a day folder once finished
 //   <root>/YYYY/MM/DD/<name>.<ext>

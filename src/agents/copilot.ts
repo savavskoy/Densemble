@@ -7,7 +7,7 @@ import type {
   CopilotClientOptions, CopilotSession, MCPServerConfig,
   ModelInfo as SdkModel, PermissionRequest, ResumeSessionConfig, SessionConfig, SessionEvent,
 } from "@github/copilot-sdk";
-import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, type LoadedConfig } from "../config/index.js";
+import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, ownerLabel, type LoadedConfig } from "../config/index.js";
 import type { ModelInfo, RequestAnswer, RequestPayload, RunIdentity, RuntimeCommand, Scope } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type { DiagnosticSink } from "../ports.js";
@@ -419,6 +419,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
     const owner = user === config.config.ownerId;
     const match = authorizedWorkspace(config.config, user, session.scope.botId, session.workspace);
     if (!match) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
+    // Members of a shared workspace get the same MCP servers as the owner.
+    const mcpAccess = owner || match !== DEFAULT_WORKSPACE_ID;
     // Non-owner sessions see only the agents their workspace permits.
     const agents = match === DEFAULT_WORKSPACE_ID ? config.agents : config.agents.filter((agent) => match.agentIds.includes(agent.id));
     const forbiddenRoots = owner ? [] : [
@@ -462,7 +464,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       workingDirectory: session.workspace, configDirectory: config.config.runtimeHomePath,
       enableConfigDiscovery: false, skipCustomInstructions: false,
       instructionDirectories: [session.workspace], skillDirectories: owner ? config.config.skillDirectories : [], enableSkills: owner,
-      pluginDirectories: [], includedBuiltinSkills: [], mcpServers: owner ? mcpServers : {},
+      pluginDirectories: [], includedBuiltinSkills: [], mcpServers: mcpAccess ? mcpServers : {},
       excludedBuiltinAgents: ["explore", "task", "general-purpose", "code-review", "research", "security-review"],
       enableFileHooks: false, enableHostGitOperations: false, enableOnDemandInstructionDiscovery: false,
       enableSessionStore: false, memory: { enabled: false }, skipEmbeddingRetrieval: true,
@@ -471,8 +473,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       availableTools: tools, excludedTools,
       // No user-input/elicitation handlers: do not advertise either SDK capability.
       systemMessage: { mode: "append", content: (owner
-        ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
-          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
+        ? `You are chatting with ${ownerLabel(config.config)} in Telegram. Do not use structured question forms. ` +
+          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply."
         : `You are chatting with ${userLabel(config.config.users?.find((entry) => entry.telegramUserId === user)?.displayName)} in Telegram. ` +
           "Do not use structured question forms. " +
           "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply. " +
@@ -544,7 +546,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
           },
         }),
         defineTool("densemble_manage_proactivity", {
-          description: "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to Oleh.",
+          description: "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to the user.",
           skipPermission: true,
           parameters: {
             type: "object",

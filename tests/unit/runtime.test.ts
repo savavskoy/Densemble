@@ -118,8 +118,8 @@ describe("pinned Copilot runtime adapter", () => {
     expect((settings.availableTools as ToolSet).toArray()).not.toContain("builtin:ask_user");
     expect(settings.customAgents?.map((agent) => agent.tools)).toEqual([["view"], ["view"]]);
     expect(settings.systemMessage).toEqual({ mode: "append", content:
-      "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
-      "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply." });
+      "You are chatting with the service owner in Telegram. Do not use structured question forms. " +
+      "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply." });
     expect(settings.onPermissionRequest).toBeTypeOf("function");
     await f.send();
     expect(await settings.hooks!.onPreToolUse!({ sessionId: f.native.sessionId, timestamp: new Date(),
@@ -128,11 +128,11 @@ describe("pinned Copilot runtime adapter", () => {
     expect(f.events.some((event) => event.kind === "request")).toBe(false);
   });
   it.each([
-    ["Sonya", "You are chatting with Sonya (a configured user) in Telegram."],
-    ["  Sonya\n Savenko ", "You are chatting with Sonya Savenko (a configured user) in Telegram."],
+    ["Alex", "You are chatting with Alex (a configured user) in Telegram."],
+    ["  Alex\n Morgan ", "You are chatting with Alex Morgan (a configured user) in Telegram."],
     [undefined, "You are chatting with a user in Telegram."],
   ])("names a non-owner by configured displayName %j in the session instruction", async (displayName, expected) => {
-    const f = setup();
+    const f = setup(); f.config.config.ownerName = "Robin";
     const user = scope.ownerId + 1;
     f.config.config.users = [{ telegramUserId: user, allowedBotIds: [scope.botId], ...(displayName ? { displayName } : {}) }];
     f.config.config.workspaces = [{ id: "notes", name: "Notes", access: "private", ownerUserId: user,
@@ -142,7 +142,12 @@ describe("pinned Copilot runtime adapter", () => {
     await f.open();
     const content = (f.settings().systemMessage as { content: string }).content;
     expect(content).toContain(expected);
-    expect(content).not.toContain("Oleh");
+    expect(content).not.toContain("Robin");
+  });
+  it("addresses the owner by the configured ownerName", async () => {
+    const f = setup(); f.config.config.ownerName = "Robin";
+    await f.open();
+    expect((f.settings().systemMessage as { content: string }).content).toContain("You are chatting with Robin in Telegram.");
   });
   it("completes a plain-text clarification and accepts the next ordinary message without a form", async () => {
     const f = setup(); await f.open(); await f.send();

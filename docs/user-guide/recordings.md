@@ -18,7 +18,6 @@ sent anywhere.
 - [All settings](#all-settings)
 - [Asking an agent](#asking-an-agent)
 - [Turning it off](#turning-it-off)
-- [Moving from the standalone transcriber](#moving-from-the-standalone-transcriber)
 
 ## What it does
 
@@ -58,7 +57,10 @@ curl -fL -o models/ggml-silero-v5.1.2.bin https://huggingface.co/ggml-org/whispe
 ```
 
 The first is the speech model; the second detects where speech is, so silence and
-music are skipped.
+music are skipped. Densemble cuts the speech into pieces of up to 25 seconds and
+recognises each piece separately, so no sentence is skipped; this takes about
+3–4 minutes per hour of recording. It needs `whisper-vad-speech-segments`, which
+comes with whisper.cpp next to `whisper-cli` (`brew install whisper-cpp` installs both).
 
 Optional, for [new transcripts](#asking-for-a-new-transcript): the full
 `ggml-large-v3` model (about 3 GB more). It is slower but more accurate, and is
@@ -147,11 +149,13 @@ recordings/
     └── 10/
         └── 29/
             ├── 2026-10-29 15-13-24.mkv
-            └── transcript_2026-10-29_2026-10-29_15-13-24.txt
+            ├── transcript_2026-10-29_2026-10-29_15-13-24.txt
+            └── transcript_2026-10-29_2026-10-29_15-13-24.words.json
 ```
 
 The transcript is named `transcript_<day>_<recording name>.txt`; spaces in the
-recording name become `_`.
+recording name become `_`. The `.words.json` file next to it holds the same text with
+the timing of every word (for tools and agents; you can ignore it).
 
 ### How long it takes
 
@@ -216,7 +220,19 @@ For scripts: `node dist/main.js recordings-status --json --config config.local.j
 
 ## Reading a transcript
 
-- Plain UTF-8 text, one phrase per line, without timestamps.
+- Plain UTF-8 text, one phrase per line: when it started and who said it, for example
+
+  ```text
+  [00:12:31] Owner: Добре, тоді почнемо з плану.
+  [00:12:40] Speaker 2: Так, я підготувала таблицю.
+  ```
+
+- Speakers are told apart by voice, on this Mac. With a [sample of your voice](#speakers)
+  your phrases carry your name; other people are `Speaker 2`, `Speaker 3`, … in the order
+  they first speak (from `Speaker 1` without the sample). The numbers are consistent within
+  one transcript only. Where people talk over each other a label can be wrong. If voices
+  could not be separated (models missing), every phrase is labelled `Speaker`.
+- A new phrase starts when the speaker changes or after a pause.
 - Silence, music and noise are left out; so are lines like `[Music]` or
   `(applause)`.
 - If the same line, sentence or phrase repeats three or more times in a row (a typical
@@ -334,7 +350,6 @@ Run it with the service stopped (`make stop` first).
 | `recordings-model` | `…MODEL_MISSING`: download the model. `…ENGLISH_ONLY`: you used a `.en` model; use the multilingual one. `…UNSUPPORTED`: not a whisper.cpp model file. |
 | `recordings-retry-model` | The same for `retry.modelPath` (or the main model when it is not set). New first attempts still work; only repeated attempts fail with `MODEL_UNAVAILABLE`. |
 | `recordings-vad` | The Silero file is missing or wrong; download it again. |
-| `recordings-legacy-job` | An older standalone transcriber is still installed on this Mac. Densemble and it take turns safely, but remove the old one; see [Moving from the standalone transcriber](#moving-from-the-standalone-transcriber). |
 
 ## All settings
 
@@ -358,8 +373,30 @@ required. Run `make restart` after any change.
 | `suppressNonSpeech`, `maxContext` | `false`, `0` | Recognition flags (`-sns`, `-mc`). `maxContext` 0 recognises each part on its own and prevents repeated-phrase loops. |
 | `retry.vadThreshold`, `retry.vadMinSpeechMs`, `retry.suppressNonSpeech`, `retry.maxContext` | as the first attempt | Different settings for repeated attempts only. |
 | `silence` | `thresholdDb` −80, `minSeconds` 60 | What counts as a stretch [without audio signal](#checking-progress): quieter than −80 dB for at least 60 s. |
+| `speakers.enabled` | `true` | `false` turns speaker separation off (every phrase is `Speaker`). |
+| `speakers.ownerName` | top-level `ownerName`, else `"Owner"` | Your label when your voice is recognised. |
+| `speakers.ownerSamplePath` | none | A short recording of only your voice ([Speakers](#speakers)). |
+| `speakers.segmentationModelPath`, `speakers.embeddingModelPath`, `speakers.verificationModelPath` | `./models/speaker-segmentation.onnx`, `./models/speaker-embedding.onnx`, `./models/speaker-verification.onnx` | Speaker models; the last one only compares voices with your sample. |
+| `speakers.clusterThreshold`, `speakers.ownerThreshold` | `0.7`, `0.5` | How different two voices must be to count as two people, and how close a voice must be to your sample. Leave as is unless labels are clearly wrong. |
 
 `config.example.json` shows every setting with its default.
+
+## Speakers
+
+Speaker separation needs two small models in `models/` (about 32 MB, not part of git):
+
+```sh
+curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 | tar -xjO sherpa-onnx-pyannote-segmentation-3-0/model.onnx > models/speaker-segmentation.onnx
+curl -fL -o models/speaker-embedding.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx
+# only for naming you by your voice sample (about 28 MB):
+curl -fL -o models/speaker-verification.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+```
+
+To be named in transcripts, record 30–60 seconds of only your own voice (any format,
+for example a voice memo), put it inside your workspace and set
+`"speakers": { "ownerSamplePath": "./path/to/my-voice.m4a" }` in
+`modules.recordings.settings`, then `make restart`. `make doctor` shows
+`recordings-speakers`. Separation adds about 2 minutes per hour of recording.
 
 ## Asking an agent
 
@@ -378,23 +415,3 @@ do, and the coordinator agent (`coordinatorAgentId`) tells you once in its chat.
 Set `"enabled": false` in `modules.recordings` (the settings stay for later) or
 remove `modules.recordings` from `config.local.json`, then run `make restart`.
 Your recordings and transcripts stay where they are.
-
-## Moving from the standalone transcriber
-
-Only for Macs that used the older standalone transcriber
-(`com.openclaw-jazz.transcribe-recordings` launchd job). Do it once, in this
-order; at no point are files transcribed twice:
-
-1. Set up recordings in Densemble as [above](#set-up-once) and `make restart`.
-   While the old job is installed, `make doctor` reports `recordings-legacy-job`
-   not ready, and the two take turns through the old job's lock.
-2. Check `make transcribe-status`, then remove the old job:
-
-   ```sh
-   launchctl bootout gui/$(id -u)/com.openclaw-jazz.transcribe-recordings
-   mv ~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist \
-      ~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist.retired
-   ```
-
-3. `make restart`. The warning is gone. Existing transcripts, `review-log.tsv`
-   and review tools keep working: the file layout is the same.

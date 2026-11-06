@@ -7,6 +7,9 @@ persona, one binding per group/topic, and separate conversation histories.
 TypeScript/Node, grammY, SQLite and the Copilot SDK form a modular monolith;
 there is no HTTP server or hosted control plane.
 
+Start here: [what Densemble does](docs/overview.md) and
+[how it is built](docs/concepts.md) (terms, message flow, rights, storage).
+
 **Deployment acceptance is pending:** the authenticated synthetic SDK gate
 passed, but real Telegram accounts/tokens and a provisioned whisper.cpp model
 are required to complete Telegram/voice acceptance. Offline tests do not prove
@@ -81,7 +84,8 @@ commit safeguard, not access control; review staged changes before committing.
 2. Create a bot for each desired persona through BotFather. Store its token only
    in the existing external canonical `secrets.local.json`; set `tokenRef` to
    that key. Never paste tokens into command-line arguments, commits or logs.
-3. Set your numeric Telegram `ownerId` and explicit `bindings`. To add a person,
+3. Set your numeric Telegram `ownerId`, the optional `ownerName` agents use to
+   address you, and explicit `bindings`. To add a person,
    add their numeric Telegram ID to `users`, grant only the required bot IDs in
    `allowedBotIds`, and add a private binding using that person's ID as `chatId`.
    Send `/start` to the bot from each account. Groups use a negative chat ID;
@@ -173,7 +177,7 @@ guardrails (`minIntervalMs`, default 30 minutes; `maxActiveItemsPerAgent`, defau
 No proactive message is sent during quiet hours; accumulated items fire once,
 batched, right after the window ends or on restart.
 
-Oleh oversees and overrides proactivity per chat with `/proactive`:
+The owner oversees and overrides proactivity per chat with `/proactive`:
 `/proactive` or `/proactive list` shows that agent's active/paused items and
 next due times; `/proactive pause [id]` / `/proactive resume [id]` / `/proactive
 cancel <id>` act on one item, or on the whole agent's proactivity when no id is
@@ -272,7 +276,7 @@ after seven days unless retained for active work/delivery. See the
 A **module** is an optional feature that plugs into the core without core edits:
 one folder `src/modules/<id>/` with its own settings, health, owner docs and,
 optionally, abilities (tools) for agents. Absent `modules` (or `{}`) means core
-only. Recording transcription is the first module. Contract, folder layout and
+only. Modules: recording transcription (`recordings`) and reels (`reels`). Contract, folder layout and
 rules for module authors: [`src/modules/README.md`](src/modules/README.md);
 config keys, health codes and files:
 [contracts → Modules](docs/contracts.md#modules).
@@ -312,6 +316,18 @@ config keys, health codes and files:
   `/status` in Telegram has a «Модулі» section; `make doctor` adds a
   `module:<id>` line (and the module's own checks only when it is enabled).
 
+## Reels (optional)
+
+The `reels` [module](#modules) (spec 006, requires `recordings`): allowed agents prepare a
+YouTube video or a workspace video file (download + transcript with timecodes and speakers),
+read its transcript and cut exactly the reels they are given into 9:16 videos with karaoke
+subtitles and a title, delivered to the chat and saved under `<workspace>/raw/reels/`.
+Settings, prerequisites (`brew install yt-dlp`) and files:
+[`src/modules/reels/README.md`](src/modules/reels/README.md); agent reference:
+[`INSTRUCTIONS.md`](src/modules/reels/INSTRUCTIONS.md); contract:
+[contracts → Reels](docs/contracts.md#reels). Modules talk back to the chat through
+`ModuleContext.chat` ([contracts → Module chat](docs/contracts.md#module-chat)).
+
 ## Recording transcription (optional)
 
 The `recordings` [module](#modules). User-facing setup, everyday use and
@@ -327,7 +343,7 @@ and in `make modules-status`); both at once is a config error
 to `runtimeDataPath/modules/recordings/` (renamed once at the first start).
 
 Implementation: `src/modules/recordings/` (worker, filing, transcription, status,
-notifications, legacy-lock interop), started by the module host in
+notifications), started by the module host in
 `src/service.ts` after media cleanup and stopped first on shutdown. Voice messages and recordings share one
 `SpeechGate` (`src/media/speech-gate.ts`): a voice message SIGSTOPs the
 recording's process group and SIGCONTs it afterwards (`src/media/process.ts`).
@@ -498,8 +514,9 @@ Readiness-only remains a separate **zero-inference** path.
 | Resume without replay | PASS: synthetic local side effect committed before lost handler acknowledgment; `continuePendingWork: false` prevented automatic model/tool replay; subsequent explicit turn did not duplicate it |
 | Cleanup | PASS: registered gate sessions deleted, owned processes exited, owned run directories removed; service login retained |
 
-The metadata reader defaults to sibling `../openclaw-jazz`; set
-`DENSEMBLE_GATE_AGENT_WORKSPACE` to an explicitly chosen workspace if different.
+The metadata reader needs `DENSEMBLE_GATE_AGENT_WORKSPACE` set to an explicitly
+chosen agent workspace; optionally set `DENSEMBLE_GATE_WORKER_ID` to a worker
+(subagent) id there to check that it is not offered as a persona.
 It validates references in place and returns only identifiers/model IDs/counts.
 **No real persona, skill body, secret, personal prompt, or document is copied
 into Densemble or sent in the inference probes.** All tool writes are synthetic

@@ -432,14 +432,14 @@ describe("agent self-service proactivity tool wiring", () => {
     expect(hook.proactivity).toBeTypeOf("function");
 
     const scheduled = await hook.proactivity!(scope, "synthetic-agent", {
-      action: "schedule", kind: "oneoff", schedule: { type: "once", at: Date.now() + 3_600_000 }, purpose: "ping Oleh",
+      action: "schedule", kind: "oneoff", schedule: { type: "once", at: Date.now() + 3_600_000 }, purpose: "ping the owner",
     });
     expect(scheduled).toMatchObject({ ok: true, action: "schedule" });
-    expect(scheduled.ok && scheduled.action === "schedule" ? scheduled.item.purpose : null).toBe("ping Oleh");
+    expect(scheduled.ok && scheduled.action === "schedule" ? scheduled.item.purpose : null).toBe("ping the owner");
     expect(f.store.proactivity.listForScope(scope)).toHaveLength(1);
 
     const listed = await hook.proactivity!(scope, "synthetic-agent", { action: "list" });
-    expect(listed).toMatchObject({ ok: true, action: "list", items: [{ purpose: "ping Oleh" }] });
+    expect(listed).toMatchObject({ ok: true, action: "list", items: [{ purpose: "ping the owner" }] });
 
     const id = f.store.proactivity.listForScope(scope)[0]!.id;
     const cancelled = await hook.proactivity!(scope, "synthetic-agent", { action: "cancel", id });

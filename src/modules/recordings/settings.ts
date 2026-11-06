@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { assertDisjoint, checkedPath, isWithin, type CoreOffer, type PrepareResult, type VadSettings } from "../core-api.js";
+import type { SpeakerSettings } from "./speakers/index.js";
 
 /** Decoding flags of one pass: `-sns` and `-mc` (0 = no carried text context, the loop-resistant setting). */
 export interface RecordingDecodingSettings { suppressNonSpeech: boolean; maxContext: number }
@@ -23,7 +24,17 @@ export interface RecordingSettings extends RecordingDecodingSettings {
   retry: RecordingRetrySettings;
   silence: RecordingSilenceSettings;
   notifications: boolean;
+  /** Speaker separation (spec 006); undefined when turned off. */
+  speakers?: SpeakerSettings | undefined;
 }
+
+/** Speaker models (relative to the config file) and the owner's label when neither `speakers` nor `ownerName` sets one. */
+export const SPEAKER_SETTING_DEFAULTS = Object.freeze({
+  segmentationModelPath: "./models/speaker-segmentation.onnx",
+  embeddingModelPath: "./models/speaker-embedding.onnx",
+  verificationModelPath: "./models/speaker-verification.onnx",
+  ownerName: "Owner",
+});
 
 /**
  * First pass = best configuration of the 2026-10-30 benchmark ("E": sensitive VAD with long pads, no carried
@@ -76,6 +87,17 @@ export const recordingsSchema = z.object({
     thresholdDb: z.number().int().min(-120).max(-30).optional(), minSeconds: z.number().int().min(10).max(3_600).optional(),
   }).strict().optional(),
   notifications: z.boolean().optional(),
+  /** Speaker separation (spec 006): on by default with the models in `SPEAKER_SETTING_DEFAULTS`. */
+  speakers: z.object({
+    enabled: z.boolean().optional(),
+    segmentationModelPath: nonempty.optional(),
+    embeddingModelPath: nonempty.optional(),
+    verificationModelPath: nonempty.optional(),
+    ownerName: z.string().trim().min(1).max(40).regex(/^[^\p{Cc}:\[\]]+$/u).optional(),
+    ownerSamplePath: nonempty.optional(),
+    clusterThreshold: z.number().min(0.1).max(2).optional(),
+    ownerThreshold: z.number().min(0).max(1).optional(),
+  }).strict().optional(),
 }).strict();
 export type RecordingsConfig = z.infer<typeof recordingsSchema>;
 
@@ -87,6 +109,14 @@ export type RecordingsConfig = z.infer<typeof recordingsSchema>;
 export function prepareRecordings(raw: RecordingsConfig, core: CoreOffer): PrepareResult<RecordingsConfig> {
   const settings: RecordingsConfig = { ...raw, modelPath: core.resolveFromConfig(raw.modelPath),
     vadModelPath: core.resolveFromConfig(raw.vadModelPath) };
+  if (raw.speakers?.enabled !== false) {
+    const speakers = raw.speakers ?? {};
+    settings.speakers = { ...speakers,
+      segmentationModelPath: core.resolveFromConfig(speakers.segmentationModelPath ?? SPEAKER_SETTING_DEFAULTS.segmentationModelPath),
+      embeddingModelPath: core.resolveFromConfig(speakers.embeddingModelPath ?? SPEAKER_SETTING_DEFAULTS.embeddingModelPath),
+      verificationModelPath: core.resolveFromConfig(speakers.verificationModelPath ?? SPEAKER_SETTING_DEFAULTS.verificationModelPath),
+      ...(speakers.ownerSamplePath ? { ownerSamplePath: core.resolveFromConfig(speakers.ownerSamplePath) } : {}) };
+  }
   if (raw.retry) {
     settings.retry = { ...raw.retry };
     if (raw.retry.modelPath) settings.retry.modelPath = core.resolveFromConfig(raw.retry.modelPath);
@@ -102,7 +132,7 @@ export function prepareRecordings(raw: RecordingsConfig, core: CoreOffer): Prepa
  * Full recording settings from prepared module settings; tools (and vocabulary, unless set here) are shared
  * with voice. A retry inherits the first pass (VAD, flags, model) and overrides only what `retry` sets.
  */
-export function recordingSettings(recordings: RecordingsConfig, audio: CoreOffer["audio"]): RecordingSettings {
+export function recordingSettings(recordings: RecordingsConfig, audio: CoreOffer["audio"], ownerName?: string): RecordingSettings {
   const vad = defined(RECORDING_DEFAULTS.vad, recordings.vad);
   const suppressNonSpeech = recordings.suppressNonSpeech ?? RECORDING_DEFAULTS.decoding.suppressNonSpeech;
   const maxContext = recordings.maxContext ?? RECORDING_DEFAULTS.decoding.maxContext;
@@ -130,6 +160,21 @@ export function recordingSettings(recordings: RecordingsConfig, audio: CoreOffer
     },
     silence: defined(RECORDING_DEFAULTS.silence, recordings.silence),
     notifications: recordings.notifications ?? RECORDING_DEFAULTS.notifications,
+    speakers: speakerSettings(recordings.speakers, ownerName),
+  };
+}
+
+/** Prepared `speakers` (paths already resolved) → diarization settings; undefined when turned off. */
+function speakerSettings(speakers: RecordingsConfig["speakers"], ownerName: string | undefined): SpeakerSettings | undefined {
+  if (speakers?.enabled === false) return undefined;
+  return {
+    segmentationModelPath: speakers?.segmentationModelPath ?? SPEAKER_SETTING_DEFAULTS.segmentationModelPath,
+    embeddingModelPath: speakers?.embeddingModelPath ?? SPEAKER_SETTING_DEFAULTS.embeddingModelPath,
+    verificationModelPath: speakers?.verificationModelPath ?? SPEAKER_SETTING_DEFAULTS.verificationModelPath,
+    ownerName: speakers?.ownerName ?? ownerName ?? SPEAKER_SETTING_DEFAULTS.ownerName,
+    ownerSamplePath: speakers?.ownerSamplePath,
+    clusterThreshold: speakers?.clusterThreshold,
+    ownerThreshold: speakers?.ownerThreshold,
   };
 }
 

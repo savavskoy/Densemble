@@ -58,7 +58,7 @@ describe("handleProactiveCommand", () => {
       kind: "oneoff",
       schedule: { type: "once", at: Date.UTC(2026, 9, 5, 10, 0, 0) },
       purpose: longPurpose,
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: Date.UTC(2026, 9, 5, 10, 0, 0),
       now: 10,
     });
@@ -80,7 +80,7 @@ describe("handleProactiveCommand", () => {
     expect(result.text).toContain("ID | Тип | Мета | Ініціатор | Стан | Наступне спрацювання");
     expect(result.text).toContain(active.id);
     expect(result.text).toContain("одноразове");
-    expect(result.text).toContain("Олег");
+    expect(result.text).toContain("власник");
     expect(result.text).toContain("активне");
     expect(result.text).toContain("Дуже довга мета нагадування");
     expect(result.text).toContain("…");
@@ -162,7 +162,7 @@ describe("handleProactiveCommand", () => {
       kind: "recurring",
       schedule: { type: "interval", everyMs: 7_200_000 },
       purpose: "Призупинений окремий елемент",
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: pauseAt + 120_000,
       now: 11,
     });

@@ -34,6 +34,9 @@ explicitly if launched from elsewhere.
   Legacy configurations without `users` remain restricted to `ownerId`. A
   configured `users` entry grants only its listed bots, and only a matching
   explicitly bound private chat; group and forum bindings remain owner-only.
+- Optional `ownerName` (1–40 characters, no control characters, `:`, `[` or `]`)
+  is how agents address the owner and the owner's default speaker label in
+  transcripts; without it agents address "the service owner".
 - Optional `users` entries contain `telegramUserId`, optional `displayName`, and
   a nonempty unique list of configured `allowedBotIds`. The owner is implicit
   and must not also appear in `users`.
@@ -338,6 +341,23 @@ runtimeDataPath/modules/notices.json { version: 1, modules: { <id>: { notified: 
   Purpose, Inputs, Returns, Limits, Errors). Densemble never reads or writes the workspace
   for this.
 
+### Module chat
+
+- `ctx.chat` lets a module's background work answer the chat where one of its abilities was
+  called (`AbilityCall.scope`): `send(scope, text, dedupKey)` (outbox text),
+  `sendFile(scope, path, { caption?, dedupKey })` (a regular file inside the workspace of the
+  scope's current session, copied by the media pipeline like `exportFile`, ≤ 50 MB, sent as a
+  document) and `wake(scope, note, dedupKey)` (a synthetic inbound message
+  `[Densemble module <id>] <note>` that runs as the agent's own turn; while a run is active,
+  queued input waits or another control blocks the chat, the wake waits in memory and is
+  admitted when the chat is idle — it is not kept across restarts).
+- Every call rechecks that the scope is a configured binding of the owner whose bot's persona
+  is in `modules.<id>.agents` and whose current session workspace is authorised; otherwise it
+  returns `false` (`MODULE_CHAT_REFUSED`). A repeated `dedupKey` is a no-op (outbox key
+  `module:<id>:<dedupKey>`; a wake's synthetic update id is derived from it). Before the
+  application is ready, while stopping, after the module stops, or when the bridge throws
+  (`MODULE_CHAT_FAILED`) it returns `false`.
+
 ### Coordinator notices
 
 - With `coordinatorAgentId`, Densemble sends a fixed (non-LLM) text to that persona's owner
@@ -385,14 +405,39 @@ folder; its file contract is shared with the owner's review tooling and does not
   Two media files with the same key in one day: the oldest is transcribed, the
   others are reported as `SAME_KEY` conflicts.
 - Densemble's only mutations: filing, creating a `<key>.txt` that did not exist
-  (temp → `fsync` → exclusive `link()`), and creating/removing its own
+  (temp → `fsync` → exclusive `link()`), then writing `<key>.words.json` next to it
+  (temp → `fsync` → `rename()`), and creating/removing its own
   `.densemble-*.partial`. Nothing is renamed, emptied or deleted otherwise.
 - Recognition: whisper.cpp with Silero VAD, vocabulary prompt, language detected
-  from speech, `-mc 0` (no carried text context) on the first pass; transcripts
-  are post-filtered (tag-only lines dropped, runs of ≥ 3 identical lines or of
-  ≥ 3 identical consecutive clauses — split at `, . ! ? …` — within a line kept
-  once; empty →
-  `[no speech detected]`).
+  from speech, `-mc 0` (no carried text context) on the first pass, full JSON output
+  (`-oj -ojf`) with DTW token times (`-nfa -dtw <preset from the model header>`). Token
+  times are in VAD-processed time; they are mapped back with the "VAD segment N: start,
+  end" lines whisper prints (segments joined with 0.1 s of overlap and 0.1 s of silence).
+  Words are rebuilt from tokens. The post-filter works per whisper segment: tag-only
+  segments dropped, runs of ≥ 3 identical segments or of ≥ 3 identical consecutive
+  clauses — split at `, . ! ? …` — kept once.
+- Transcript format (spec 006): `<key>.txt` has one line per phrase,
+  `[HH:MM:SS] Label: text` (start time, floor to the second), or `[no speech detected]`.
+  A phrase is a whisper segment split at speaker changes and at pauses (≥ 1.5 s after a
+  sentence end, ≥ 3 s otherwise). `<key>.words.json` is
+  `{ version: 1, speakers: string[], phrases: [{ start, end, speaker, text, words: [{ start, end, text }] }] }`
+  in seconds of the original media, same text and labels.
+- Speakers: sherpa-onnx (pyannote segmentation 3.0 + wespeaker ResNet34 embeddings,
+  clustering threshold 0.7) in a child Node process on the decoded WAV, after recognition.
+  Each word takes the speaker turn it overlaps most (else one within 1 s, else the previous
+  word's); a 1–2 word run under 1 s inside a segment takes its neighbour's speaker. Labels:
+  the cluster matching `speakers.ownerSamplePath` (cosine of CAM++ embeddings,
+  `speakers.verificationModelPath`, ≥ `ownerThreshold`, default 0.5)
+  → `speakers.ownerName` (default: top-level `ownerName`, else `Owner`); other clusters `Speaker N` by first appearance,
+  from 2 when the owner matched, else from 1. Without models, with `speakers.enabled: false`
+  or when separation fails every phrase is `Speaker`; a separation failure never fails the
+  transcript (`RECORDING_SPEAKERS_UNAVAILABLE`). Doctor: `recordings-speakers`
+  (`SPEAKERS_READY|MODEL_MISSING|RUNTIME_MISSING|DISABLED`).
+- `provides` (`recordings/api.ts`): `transcribeMedia({ media, outputDirectory, key,
+  durationSeconds, signal, onProgress?, onStart? })` → `{ transcript, words, speakers }` with
+  the same pipeline (first-pass settings) writing `<key>.txt`/`<key>.words.json`, replacing
+  earlier ones. It shares one lane with the folder worker (one transcription at a time) and
+  the `SpeechGate`; errors carry `RECORDING_<reason>` codes.
 - Digital silence: after decoding, FFmpeg `silencedetect`
   (`noise=<thresholdDb>dB:d=<minSeconds>`) runs over the WAV; spans
   `{ startSeconds, durationSeconds, toEnd? }` go to `status.json` (`current.silences`,
@@ -412,16 +457,64 @@ folder; its file contract is shared with the owner's review tooling and does not
   directory once at the first start); stale after 3 × poll
   interval → "service not running". macOS notifications "Transcription ready" /
   "Transcription failed" go once per outcome per file per run.
-- Legacy launchd job: while `~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist`
-  exists, Densemble warns (`RECORDINGS_LEGACY_JOB_INSTALLED`) and holds the old
-  script's lock dir `/tmp/transcribe-new-recordings.lock` around each recording;
-  a foreign lock means skip (`RECORDINGS_LEGACY_LOCK_BUSY`). The lock's mtime is
-  refreshed every 10 minutes (the old script treats 6 h as stale) and only the
-  same directory Densemble created is removed.
-- Diagnostics (codes only): `RECORDINGS_STARTED|DISABLED|START_FAILED|PASS_FAILED|STATUS_FAILED|FOLDER_UNREADABLE|LEGACY_LOCK_BUSY`,
-  `RECORDING_FILED|WAITING|CONFLICT|STARTED|PAUSED|RESUMED|DONE|FAILED|INTERRUPTED|NOTIFY_FAILED|ORPHAN_ENDED`,
+- Diagnostics (codes only): `RECORDINGS_STARTED|DISABLED|START_FAILED|PASS_FAILED|STATUS_FAILED|FOLDER_UNREADABLE`,
+  `RECORDING_FILED|WAITING|CONFLICT|STARTED|PAUSED|RESUMED|DONE|FAILED|INTERRUPTED|NOTIFY_FAILED|ORPHAN_ENDED|SPEAKERS_UNAVAILABLE`,
   `RECORDING_MODEL_MISSING|ENGLISH_ONLY|UNSUPPORTED`; failure `reason` is one of
   `DECODE_FAILED ASR_FAILED TIMEOUT DISK_FULL TARGET_EXISTS MODEL_UNAVAILABLE OUTPUT_INVALID`.
+
+## Reels
+
+The `reels` module (spec 006; settings `modules.reels.settings`, `requires: ["recordings"]`,
+data `runtimeDataPath/modules/reels/`; owner docs
+[`src/modules/reels/README.md`](../src/modules/reels/README.md), agent reference
+[`INSTRUCTIONS.md`](../src/modules/reels/INSTRUCTIONS.md)) is a toolbox with four abilities:
+`reels_prepare { source, fresh? }`, `reels_transcript { video, from?, to? }` (read-only),
+`reels_cut { video, reels: [{ start, end, title, subtitles?, showTitle? }] }` and
+`reels_status { video? }` (read-only).
+
+```text
+<folder>/<video id>/video.json                { version: 1, id, title, durationSeconds, source, media, preparedAt, speakers }
+<folder>/<video id>/source.<ext>              yt-dlp download (≤ maxHeight, H.264 preferred, merged to MP4); removed after each cut
+<folder>/<video id>/transcript.txt            same format as recordings
+<folder>/<video id>/transcript.words.json
+<folder>/<video id>/cuts.md                   appended per cut request
+<folder>/<video id>/reels/NN-<slug>.mp4       exclusive link(); numbering continues
+runtimeDataPath/modules/reels/jobs.json       20 newest jobs; running at restart → REELS_INTERRUPTED
+runtimeDataPath/modules/reels/work/           overlay PNGs, removed at start and after each job
+```
+
+- `folder` defaults to `<workspacePath>/raw/reels`, must be inside an owner workspace and
+  disjoint from managed paths (`REELS_FOLDER_OUTSIDE_WORKSPACE`, `UNSAFE_PATH_OVERLAP`); it is
+  created at start (`REELS_FOLDER_UNAVAILABLE`). Video ids: `yt-<11-char id>` for YouTube
+  links (watch, youtu.be, shorts, live, embed), `file-<12 hex of sha256(relative path, size,
+  mtime)>` for workspace files, which are read in place and checked unchanged before cutting
+  (`REELS_SOURCE_CHANGED`).
+- Hard limits in code: every ability refuses a non-owner (`REELS_OWNER_ONLY`) and a session
+  workspace that does not contain the folder (`REELS_WORKSPACE_DENIED`); nothing is
+  published; the only network access is yt-dlp; cutting only reads a workspace source and the
+  transcript; existing reels are never replaced (`REELS_TARGET_EXISTS`). A YouTube download is
+  removed after a successful cut (`REELS_SOURCE_REMOVE_FAILED` when that fails) and a later cut
+  fetches it again first (`fetching` stage of the cut job; `REELS_SOURCE_MISSING` internally).
+- Jobs run one at a time (FIFO): prepare = `fetching` (yt-dlp `--dump-single-json` first:
+  live → `REELS_VIDEO_LIVE`, > `maxVideoMinutes` → `REELS_VIDEO_TOO_LONG`, then the download)
+  → ffprobe → `transcribing` (`RecordingsApi.transcribeMedia`); cut = `cutting`. Progress,
+  ETA and failures are in `reels_status` and the module's `/status` line; tool processes are
+  registered with the `SpeechGate`. A finished prepare/cut wakes the agent in the requesting
+  chat; each reel is sent there with `ctx.chat.sendFile`.
+- Cut lists: 1–20 entries, each 5 s – 3 min, inside the video, non-overlapping, title 1–120
+  characters without control characters; the whole list is rejected
+  (`REELS_CUTS_REJECTED`, message `reel N: CODE; …`) before anything is cut. Boundaries snap
+  onto whole words with a 0.15 s pad that never reaches a neighbouring word.
+- Rendering: FFmpeg `-ss/-t` on the source, `scale … force_original_aspect_ratio=increase,
+  crop=1080:1920`, 30 fps, overlay of one concat-demuxer PNG stream (title during the first
+  3 s, subtitle cards of ≤ 2 lines within one phrase, current word in yellow) drawn with
+  sharp; libx264 `-crf 21` with `-maxrate` so the file stays under 45 MB (≤ 8 Mbit/s), AAC
+  128 kbit/s; temp file → exclusive `link()`. Render codes: `REELS_RENDER_FAILED`,
+  `REELS_OVERLAY_FAILED`, `REELS_OUTPUT_INVALID`, `REELS_DISK_FULL`, `REELS_TIMEOUT`,
+  `REELS_TOOLS_MISSING`, `REELS_TARGET_EXISTS`.
+- Diagnostics: `REELS_VIDEO_PREPARED`, `REELS_PREPARE_FAILED` (`code`), `REELS_CUT_DONE`
+  (`count`), `REELS_CUT_FAILED` (`code`), `REELS_JOBS_WRITE_FAILED`. Doctor: `reels-folder`,
+  `reels-yt-dlp`.
 
 ## Remaining adapter responsibilities
 

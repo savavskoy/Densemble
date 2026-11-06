@@ -50,6 +50,8 @@ export const configSchema = z.object({
   interactiveHomePath: nonempty.optional(),
   skillDirectories: z.array(nonempty).min(1),
   ownerId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  /** How agents address the owner; also the owner's speaker label in transcripts. */
+  ownerName: z.string().trim().min(1).max(40).regex(/^[^\p{Cc}:\[\]]+$/u).optional(),
   users: z.array(userSchema).optional(),
   workspaces: z.array(workspaceSchema).optional(),
   permissionMode: z.enum(["manual", "autopilot"]).optional(),
@@ -97,6 +99,10 @@ export type ServiceConfig = z.infer<typeof configSchema>;
 export type BotConfig = ServiceConfig["bots"][number];
 export type ChatBinding = ServiceConfig["bindings"][number];
 export type McpDeclaration = z.infer<typeof mcpSchema>;
+/** The owner's configured name, or a neutral fallback. */
+export function ownerLabel(config: ServiceConfig): string {
+  return config.ownerName ?? "the service owner";
+}
 export const defaultQuietHours = Object.freeze({
   start: "01:00",
   end: "09:30",

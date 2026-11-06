@@ -12,7 +12,7 @@ const kindLabels: Record<ProactiveItem["kind"], string> = {
 };
 
 const initiatorLabels: Record<ProactiveItem["initiator"], string> = {
-  oleh: "Олег",
+  owner: "власник",
   agent: "агент",
 };
 

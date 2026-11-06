@@ -92,7 +92,7 @@ export interface Session {
 
 export type ProactiveKind = "oneoff" | "recurring" | "silent";
 export type ProactiveStatus = "active" | "paused" | "cancelled" | "done";
-export type ProactiveInitiator = "oleh" | "agent";
+export type ProactiveInitiator = "owner" | "agent";
 export type ProactiveOccurrenceOutcome = "pending" | "sent" | "nothing" | "late" | "failed" | "uncertain";
 export type ProactiveSchedule =
   | { type: "once"; at: number }

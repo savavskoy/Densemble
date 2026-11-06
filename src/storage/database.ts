@@ -111,7 +111,7 @@ CREATE TABLE proactive_items (
  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
  agent_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('oneoff','recurring','silent')),
  schedule TEXT NOT NULL, purpose TEXT NOT NULL,
- initiator TEXT NOT NULL CHECK(initiator IN ('oleh','agent')),
+ initiator TEXT NOT NULL CHECK(initiator IN ('owner','agent')),
  status TEXT NOT NULL CHECK(status IN ('active','paused','cancelled','done')),
  next_due_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
@@ -130,6 +130,26 @@ CREATE TABLE proactivity_state (
 );
 `, `
 ALTER TABLE sessions ADD COLUMN engine TEXT NOT NULL DEFAULT 'copilot' CHECK(engine IN ('copilot','claude-code'));
+`, `
+-- Rebuild proactive_items with the owner initiator spelled 'owner'. Migrations run with foreign keys on,
+-- so dropping the table cascades to occurrences: keep them aside and restore them afterwards.
+CREATE TEMP TABLE proactive_occurrences_keep AS SELECT * FROM proactive_occurrences;
+CREATE TABLE proactive_items_next (
+ id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ agent_id TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('oneoff','recurring','silent')),
+ schedule TEXT NOT NULL, purpose TEXT NOT NULL,
+ initiator TEXT NOT NULL CHECK(initiator IN ('owner','agent')),
+ status TEXT NOT NULL CHECK(status IN ('active','paused','cancelled','done')),
+ next_due_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+INSERT INTO proactive_items_next SELECT id,conversation_id,agent_id,kind,schedule,purpose,
+ CASE initiator WHEN 'agent' THEN 'agent' ELSE 'owner' END,status,next_due_at,created_at,updated_at FROM proactive_items;
+DROP TABLE proactive_items;
+ALTER TABLE proactive_items_next RENAME TO proactive_items;
+CREATE INDEX proactive_items_due ON proactive_items(status,next_due_at);
+CREATE INDEX proactive_items_conversation ON proactive_items(conversation_id,status);
+INSERT INTO proactive_occurrences SELECT * FROM proactive_occurrences_keep;
+DROP TABLE proactive_occurrences_keep;
 `];
 
 export class Connection {

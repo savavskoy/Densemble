@@ -95,7 +95,7 @@ export function proactivityStore(db: Connection): ProactivityStore {
       assertKind(options.kind);
       assertSchedule(options.schedule);
       assertText(options.purpose, "INVALID_PROACTIVE_PURPOSE");
-      if (!["oleh", "agent"].includes(options.initiator)) throw new StateError("INVALID_PROACTIVE_INITIATOR");
+      if (!["owner", "agent"].includes(options.initiator)) throw new StateError("INVALID_PROACTIVE_INITIATOR");
       assertTimestamp(options.nextDueAt, "INVALID_PROACTIVE_NEXT_DUE");
       return db.atomic(() => {
         const now = options.now ?? Date.now();
