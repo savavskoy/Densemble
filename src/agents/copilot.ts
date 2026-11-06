@@ -7,7 +7,7 @@ import type {
   CopilotClientOptions, CopilotSession, MCPServerConfig,
   ModelInfo as SdkModel, PermissionRequest, ResumeSessionConfig, SessionConfig, SessionEvent,
 } from "@github/copilot-sdk";
-import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, type LoadedConfig } from "../config/index.js";
+import { authorizedWorkspace, DEFAULT_WORKSPACE_ID, ownerLabel, type LoadedConfig } from "../config/index.js";
 import type { ModelInfo, RequestAnswer, RequestPayload, RunIdentity, RuntimeCommand, Scope } from "../domain.js";
 import { scopeKey } from "../domain.js";
 import type { DiagnosticSink } from "../ports.js";
@@ -471,8 +471,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       availableTools: tools, excludedTools,
       // No user-input/elicitation handlers: do not advertise either SDK capability.
       systemMessage: { mode: "append", content: (owner
-        ? "You are chatting with Oleh in Telegram. Do not use structured question forms. " +
-          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for his reply."
+        ? `You are chatting with ${ownerLabel(config.config)} in Telegram. Do not use structured question forms. ` +
+          "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply."
         : `You are chatting with ${userLabel(config.config.users?.find((entry) => entry.telegramUserId === user)?.displayName)} in Telegram. ` +
           "Do not use structured question forms. " +
           "If you need clarification, ask in plain text, one question at a time, then end your turn and wait for their reply. " +
@@ -544,7 +544,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
           },
         }),
         defineTool("densemble_manage_proactivity", {
-          description: "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to Oleh.",
+          description: "Manage this agent's own proactive reminders and check-ins for the current chat scope. Returns a result object with `ok`, `code`, and `message`; if `ok` is false, relay the `message` to the user.",
           skipPermission: true,
           parameters: {
             type: "object",

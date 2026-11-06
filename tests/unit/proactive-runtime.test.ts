@@ -30,7 +30,7 @@ function createItem(f: ReturnType<typeof fixture>, options: Partial<Pick<Proacti
     kind: options.kind ?? "oneoff",
     schedule: options.schedule ?? { type: "once", at: nextDueAt },
     purpose: options.purpose ?? "Нагадати про синтетичну задачу",
-    initiator: "oleh",
+    initiator: "owner",
     nextDueAt,
     now: nextDueAt,
   });

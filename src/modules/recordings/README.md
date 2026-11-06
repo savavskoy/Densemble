@@ -77,9 +77,9 @@ Transcripts made before spec 006 stay plain text; ask for a new transcript to up
 
 ## Speakers
 
-`settings.speakers` (all optional): `enabled` (default `true`), `ownerName` (default
-`"Oleh"`), `ownerSamplePath` (a 30–60 s recording of only the owner's voice; any FFmpeg
-format), `segmentationModelPath` / `embeddingModelPath` / `verificationModelPath` (default
+`settings.speakers` (all optional): `enabled` (default `true`), `ownerName` (default: the
+top-level `ownerName`, else `"Owner"`), `ownerSamplePath` (a 30–60 s recording of only the
+owner's voice; any FFmpeg format), `segmentationModelPath` / `embeddingModelPath` / `verificationModelPath` (default
 `./models/speaker-segmentation.onnx` / `./models/speaker-embedding.onnx` /
 `./models/speaker-verification.onnx`, the last one needed only with `ownerSamplePath`),
 `clusterThreshold` (default `0.7`) and `ownerThreshold` (default `0.5`).

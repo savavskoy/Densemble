@@ -1,10 +1,10 @@
-Reels: short vertical videos (9:16) cut from Oleh's long videos. Four abilities, usable in any
+Reels: short vertical videos (9:16) cut from the owner's long videos. Four abilities, usable in any
 order. Videos are identified by a `video` id returned by `reels_prepare` and listed by
 `reels_status`: `yt-<YouTube id>` for links, `file-<hash>` for workspace files.
 
 Times are accepted as `HH:MM:SS`, `MM:SS`, `SS` (fractions with `.` or `,` allowed, e.g.
 `12:31.5`) or a number of seconds. Transcript lines use `[HH:MM:SS] Label: text`; a label is
-Oleh's name when his voice was recognised, `Speaker N` for other voices (numbered by first
+the owner's name when their voice was recognised, `Speaker N` for other voices (numbered by first
 appearance), or `Speaker` when voices could not be separated.
 
 Background notes arrive as your own new turn starting with `[Densemble module reels]`.
@@ -14,13 +14,13 @@ Background notes arrive as your own new turn starting with `[Densemble module re
 ### Purpose
 
 Gets a video ready for reading and cutting: downloads it from YouTube (or takes a video file
-from Oleh's workspace) and transcribes it with timecodes and speakers, in the background.
+from the owner's workspace) and transcribes it with timecodes and speakers, in the background.
 
 ### Inputs
 
 - `source` (required): a YouTube link (`youtube.com/watch?v=…`, `youtu.be/…`, `/shorts/…`,
   `/live/…`) or a path to a video file (`.mp4`, `.mov`, `.m4v`, `.mkv`, `.webm`, `.avi`) inside
-  Oleh's workspace, absolute or relative to it.
+  the owner's workspace, absolute or relative to it.
 - `fresh` (optional, default `false`): `true` downloads and transcribes again even when the
   video was prepared before. Reels already cut stay.
 
@@ -42,13 +42,13 @@ from Oleh's workspace) and transcribes it with timecodes and speakers, in the ba
   Nothing is uploaded or published anywhere.
 - A workspace file is read in place and never changed, moved or copied.
 - One job runs at a time; others wait in order. A 1-hour video usually takes 10–30 minutes.
-- Works only for Oleh, in the workspace that holds the reels folder.
+- Works only for the owner, in the workspace that holds the reels folder.
 
 ### Errors
 
 - `REELS_SOURCE_INVALID`: not a YouTube link and not a video file inside the workspace.
 - `REELS_OWNER_ONLY`, `REELS_WORKSPACE_DENIED`: wrong user or workspace; final.
-- In the failure note: `REELS_YTDLP_MISSING` (Oleh must run `brew install yt-dlp`),
+- In the failure note: `REELS_YTDLP_MISSING` (the owner must run `brew install yt-dlp`),
   `REELS_VIDEO_UNAVAILABLE` (private, removed or restricted), `REELS_FETCH_FAILED`,
   `REELS_VIDEO_TOO_LONG`, `REELS_VIDEO_LIVE`, `REELS_SOURCE_INVALID` (no video stream),
   `RECORDING_*` (transcription failed, e.g. `RECORDING_MODEL_UNAVAILABLE`,
@@ -90,7 +90,7 @@ people talk over each other. Music or silence has no lines; nothing is translate
 ### Purpose
 
 Cuts exactly the given reels from a prepared video into vertical videos and delivers them to
-this chat and to the video's folder in Oleh's workspace, together with a list of what was cut.
+this chat and to the video's folder in the owner's workspace, together with a list of what was cut.
 
 ### Inputs
 
@@ -167,7 +167,7 @@ Read-only. No paths and no transcript text.
 
 - `REELS_OWNER_ONLY`, `REELS_WORKSPACE_DENIED`: wrong user or workspace.
 - `MODULE_UNAVAILABLE`: the module is not running; call `densemble_state` with
-  `module: "reels"` and tell Oleh its cause and fix.
+  `module: "reels"` and tell the owner its cause and fix.
 
-Which moments to cut, and whether to ask Oleh first, is decided by the owner's skills and
+Which moments to cut, and whether to ask the owner first, is decided by the owner's skills and
 requests.

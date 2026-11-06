@@ -28,12 +28,12 @@ export interface RecordingSettings extends RecordingDecodingSettings {
   speakers?: SpeakerSettings | undefined;
 }
 
-/** Speaker models (relative to the config file) and the owner's label when `speakers` sets nothing else. */
+/** Speaker models (relative to the config file) and the owner's label when neither `speakers` nor `ownerName` sets one. */
 export const SPEAKER_SETTING_DEFAULTS = Object.freeze({
   segmentationModelPath: "./models/speaker-segmentation.onnx",
   embeddingModelPath: "./models/speaker-embedding.onnx",
   verificationModelPath: "./models/speaker-verification.onnx",
-  ownerName: "Oleh",
+  ownerName: "Owner",
 });
 
 /**
@@ -132,7 +132,7 @@ export function prepareRecordings(raw: RecordingsConfig, core: CoreOffer): Prepa
  * Full recording settings from prepared module settings; tools (and vocabulary, unless set here) are shared
  * with voice. A retry inherits the first pass (VAD, flags, model) and overrides only what `retry` sets.
  */
-export function recordingSettings(recordings: RecordingsConfig, audio: CoreOffer["audio"]): RecordingSettings {
+export function recordingSettings(recordings: RecordingsConfig, audio: CoreOffer["audio"], ownerName?: string): RecordingSettings {
   const vad = defined(RECORDING_DEFAULTS.vad, recordings.vad);
   const suppressNonSpeech = recordings.suppressNonSpeech ?? RECORDING_DEFAULTS.decoding.suppressNonSpeech;
   const maxContext = recordings.maxContext ?? RECORDING_DEFAULTS.decoding.maxContext;
@@ -160,18 +160,18 @@ export function recordingSettings(recordings: RecordingsConfig, audio: CoreOffer
     },
     silence: defined(RECORDING_DEFAULTS.silence, recordings.silence),
     notifications: recordings.notifications ?? RECORDING_DEFAULTS.notifications,
-    speakers: speakerSettings(recordings.speakers),
+    speakers: speakerSettings(recordings.speakers, ownerName),
   };
 }
 
 /** Prepared `speakers` (paths already resolved) → diarization settings; undefined when turned off. */
-function speakerSettings(speakers: RecordingsConfig["speakers"]): SpeakerSettings | undefined {
+function speakerSettings(speakers: RecordingsConfig["speakers"], ownerName: string | undefined): SpeakerSettings | undefined {
   if (speakers?.enabled === false) return undefined;
   return {
     segmentationModelPath: speakers?.segmentationModelPath ?? SPEAKER_SETTING_DEFAULTS.segmentationModelPath,
     embeddingModelPath: speakers?.embeddingModelPath ?? SPEAKER_SETTING_DEFAULTS.embeddingModelPath,
     verificationModelPath: speakers?.verificationModelPath ?? SPEAKER_SETTING_DEFAULTS.verificationModelPath,
-    ownerName: speakers?.ownerName ?? SPEAKER_SETTING_DEFAULTS.ownerName,
+    ownerName: speakers?.ownerName ?? ownerName ?? SPEAKER_SETTING_DEFAULTS.ownerName,
     ownerSamplePath: speakers?.ownerSamplePath,
     clusterThreshold: speakers?.clusterThreshold,
     ownerThreshold: speakers?.ownerThreshold,

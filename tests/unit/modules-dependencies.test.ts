@@ -90,7 +90,7 @@ describe("module dependencies (US5)", () => {
       await modules.start();
       expect(modules.health("a")?.state).toBe("ready");
       expect(modules.health("b")?.state).toBe("ready");
-      expect(await welcome(modules, "Oleh")).toEqual({ ok: true, message: "Hello, Oleh!" });
+      expect(await welcome(modules, "Owner")).toEqual({ ok: true, message: "Hello, Owner!" });
       expect(await welcome(modules, "Alfred")).toEqual({ ok: true, message: "Hello, Alfred!" });
       expect(modules.report().find((row) => row.id === "b")).toMatchObject({ requires: ["a"], status: "2 welcomed" });
       expect(await modules.stop()).toEqual({ incomplete: [] });

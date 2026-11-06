@@ -6,7 +6,7 @@ import {
 } from "../../src/modules/reels/render/index.js";
 
 const words = "Привіт друзі, це тестовий ролик. А тут друга фраза".split(" ")
-  .map((text, index) => ({ start: 10 + index * 0.5, end: 10.4 + index * 0.5, text, phrase: index < 5 ? 0 : 1, speaker: "Oleh" }));
+  .map((text, index) => ({ start: 10 + index * 0.5, end: 10.4 + index * 0.5, text, phrase: index < 5 ? 0 : 1, speaker: "Owner" }));
 
 describe("cut list validation (FR-012)", () => {
   it("rejects every bad entry with a fixed code before anything is cut", () => {

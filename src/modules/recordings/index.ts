@@ -53,7 +53,7 @@ export const module: ModuleDefinition<RecordingsConfig, RecordingsApi> = {
       fix: settingsFix },
   },
   prepare: (settings, core) => prepareRecordings(settings, core),
-  doctor: (settings, core) => recordingDoctor(recordingSettings(settings, core.audio)),
+  doctor: (settings, core) => recordingDoctor(recordingSettings(settings, core.audio, core.ownerName)),
   start: startRecordings,
 };
 
@@ -63,7 +63,7 @@ export const module: ModuleDefinition<RecordingsConfig, RecordingsApi> = {
  */
 async function startRecordings(ctx: ModuleContext<RecordingsConfig>): Promise<ModuleInstance<RecordingsApi>> {
   const { diagnostics } = ctx;
-  const settings = recordingSettings(ctx.settings, ctx.core.audio);
+  const settings = recordingSettings(ctx.settings, ctx.core.audio, ctx.core.ownerName);
   await adoptLegacyData(ctx.dataPath, diagnostics);
   const model = await checkWhisperModel(settings.modelPath);
   const vad = await checkVadModel(settings.vadModelPath);

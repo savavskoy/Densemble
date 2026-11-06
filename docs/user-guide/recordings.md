@@ -223,7 +223,7 @@ For scripts: `node dist/main.js recordings-status --json --config config.local.j
 - Plain UTF-8 text, one phrase per line: when it started and who said it, for example
 
   ```text
-  [00:12:31] Oleh: Добре, тоді почнемо з плану.
+  [00:12:31] Owner: Добре, тоді почнемо з плану.
   [00:12:40] Speaker 2: Так, я підготувала таблицю.
   ```
 
@@ -374,7 +374,7 @@ required. Run `make restart` after any change.
 | `retry.vadThreshold`, `retry.vadMinSpeechMs`, `retry.suppressNonSpeech`, `retry.maxContext` | as the first attempt | Different settings for repeated attempts only. |
 | `silence` | `thresholdDb` −80, `minSeconds` 60 | What counts as a stretch [without audio signal](#checking-progress): quieter than −80 dB for at least 60 s. |
 | `speakers.enabled` | `true` | `false` turns speaker separation off (every phrase is `Speaker`). |
-| `speakers.ownerName` | `"Oleh"` | Your label when your voice is recognised. |
+| `speakers.ownerName` | top-level `ownerName`, else `"Owner"` | Your label when your voice is recognised. |
 | `speakers.ownerSamplePath` | none | A short recording of only your voice ([Speakers](#speakers)). |
 | `speakers.segmentationModelPath`, `speakers.embeddingModelPath`, `speakers.verificationModelPath` | `./models/speaker-segmentation.onnx`, `./models/speaker-embedding.onnx`, `./models/speaker-verification.onnx` | Speaker models; the last one only compares voices with your sample. |
 | `speakers.clusterThreshold`, `speakers.ownerThreshold` | `0.7`, `0.5` | How different two voices must be to count as two people, and how close a voice must be to your sample. Leave as is unless labels are clearly wrong. |

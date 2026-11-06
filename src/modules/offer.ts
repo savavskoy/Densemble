@@ -26,5 +26,6 @@ export function createCoreOffer(loaded: LoadedConfig, speechGate: SpeechGate): C
     ],
     resolveFromConfig: (path) => configDirectory === undefined ? resolve(path) : resolve(configDirectory, path),
     quietHours: config.quietHours ?? { ...defaultQuietHours },
+    ownerName: config.ownerName,
   };
 }

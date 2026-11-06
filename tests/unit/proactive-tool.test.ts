@@ -208,7 +208,7 @@ describe("handleProactivityRequest", () => {
       kind: "recurring",
       schedule: { type: "interval", everyMs: 60_000 },
       purpose: "Agent B",
-      initiator: "oleh",
+      initiator: "owner",
       nextDueAt: 120_000,
       now: 11,
     });

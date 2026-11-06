@@ -34,6 +34,9 @@ explicitly if launched from elsewhere.
   Legacy configurations without `users` remain restricted to `ownerId`. A
   configured `users` entry grants only its listed bots, and only a matching
   explicitly bound private chat; group and forum bindings remain owner-only.
+- Optional `ownerName` (1–40 characters, no control characters, `:`, `[` or `]`)
+  is how agents address the owner and the owner's default speaker label in
+  transcripts; without it agents address "the service owner".
 - Optional `users` entries contain `telegramUserId`, optional `displayName`, and
   a nonempty unique list of configured `allowedBotIds`. The owner is implicit
   and must not also appear in `users`.
@@ -425,7 +428,7 @@ folder; its file contract is shared with the owner's review tooling and does not
   word's); a 1–2 word run under 1 s inside a segment takes its neighbour's speaker. Labels:
   the cluster matching `speakers.ownerSamplePath` (cosine of CAM++ embeddings,
   `speakers.verificationModelPath`, ≥ `ownerThreshold`, default 0.5)
-  → `speakers.ownerName` (default `Oleh`); other clusters `Speaker N` by first appearance,
+  → `speakers.ownerName` (default: top-level `ownerName`, else `Owner`); other clusters `Speaker N` by first appearance,
   from 2 when the owner matched, else from 1. Without models, with `speakers.enabled: false`
   or when separation fails every phrase is `Speaker`; a separation failure never fails the
   transcript (`RECORDING_SPEAKERS_UNAVAILABLE`). Doctor: `recordings-speakers`

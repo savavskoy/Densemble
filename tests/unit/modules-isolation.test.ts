@@ -103,7 +103,7 @@ describe("module failure isolation (US7, SC-004)", () => {
       const now = Date.now();
       const item = f.store.proactivity.create(scope, {
         agentId: "synthetic-agent", kind: "oneoff", schedule: { type: "once", at: now },
-        purpose: "Нагадати про синтетичну задачу", initiator: "oleh", nextDueAt: now, now,
+        purpose: "Нагадати про синтетичну задачу", initiator: "owner", nextDueAt: now, now,
       });
       scheduler.start();
       await until(() => f.commands.filter((command) => command.kind === "send").length === 2);

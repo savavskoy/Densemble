@@ -360,7 +360,7 @@ describe("explicit private/group/forum bindings", () => {
     expect(load).toThrow("BINDING_UNKNOWN_BOT");
   });
   it("authorizes configured users only in explicitly bound private chats and permitted bots", () => {
-    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.users = [{ telegramUserId: 202, displayName: "Alex", allowedBotIds: ["bot-one"] }];
     config.bindings.push({ botId: "bot-one", chatId: 202, topicId: null, kind: "private" });
     const loaded = load().config;
     expect(authorizeScope(loaded, {
@@ -376,19 +376,19 @@ describe("explicit private/group/forum bindings", () => {
     const shared = join(root, "knowledge-shared");
     const personal = join(root, "knowledge-personal");
     for (const path of [shared, personal]) mkdirSync(path);
-    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.users = [{ telegramUserId: 202, displayName: "Alex", allowedBotIds: ["bot-one"] }];
     config.workspaces = [
       { id: "team", name: "Team", access: "shared", ownerUserId: 101, memberUserIds: [202],
         path: shared, agentIds: ["helper-one"] },
-      { id: "sonya-private", name: "Sonya private", access: "private", ownerUserId: 202,
+      { id: "alex-private", name: "Alex private", access: "private", ownerUserId: 202,
         path: personal, agentIds: ["helper-one"] },
     ];
     const loaded = load();
     expect(loaded.config.workspaces?.map(({ id, path }) => ({ id, path }))).toEqual([
-      { id: "team", path: shared }, { id: "sonya-private", path: personal },
+      { id: "team", path: shared }, { id: "alex-private", path: personal },
     ]);
     expect(workspacesFor(loaded.config, 202, "bot-one").map((workspace) => workspace.id))
-      .toEqual(["team", "sonya-private"]);
+      .toEqual(["team", "alex-private"]);
     expect(workspacesFor(loaded.config, 101, "bot-one").map((workspace) => workspace.id)).toEqual(["team"]);
 
     config.workspaces![1] = { ...config.workspaces![1]!, memberUserIds: [101] };
@@ -402,7 +402,7 @@ describe("explicit private/group/forum bindings", () => {
     const externalSecrets = join(root, "secrets.local.json");
     copyFileSync(join(source, "secrets.local.json"), externalSecrets);
     config.secretsPath = externalSecrets;
-    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.users = [{ telegramUserId: 202, displayName: "Alex", allowedBotIds: ["bot-one"] }];
     config.workspaces = [
       { id: "team", name: "Team", access: "shared", ownerUserId: 101, memberUserIds: [202],
         path: source, agentIds: ["helper-one"] },
@@ -419,7 +419,7 @@ describe("explicit private/group/forum bindings", () => {
     write(join(knowledge, "agent/agents/local-pm/AGENT.md"), "---\nname: local-pm\ndescription: Local\n---\n# Local PM");
     write(join(knowledge, ".github/agents/local-pm.agent.md"),
       "---\nname: local-pm\ndescription: Local\nmodel: synthetic-model\n---\nRead and follow `agent/agents/local-pm/AGENT.md`.");
-    config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.users = [{ telegramUserId: 202, displayName: "Alex", allowedBotIds: ["bot-one"] }];
     config.workspaces = [{ id: "kb", name: "KB", access: "shared", ownerUserId: 101, memberUserIds: [202],
       path: knowledge, agentIds: ["local-pm"], agentSource: true }];
     const ids = load().agents.map((agent) => agent.id);

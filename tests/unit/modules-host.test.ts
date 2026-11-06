@@ -229,7 +229,7 @@ describe("module host", () => {
     await modules.start();
     const abilities = modules.abilities();
     expect(abilities.map((ability) => `${ability.moduleId}/${ability.spec.name}`)).toEqual(["echo/echo_say", "echo/echo_crash"]);
-    expect(await abilities[0]!.invoke({ name: "Oleh" }, call)).toEqual({ ok: true, message: "Oleh" });
+    expect(await abilities[0]!.invoke({ name: "Owner" }, call)).toEqual({ ok: true, message: "Owner" });
     expect(await abilities[0]!.invoke({ name: 1 }, call)).toMatchObject({ ok: false, code: "MODULE_INPUT_INVALID" });
     expect(await abilities[1]!.invoke({ name: "x" }, call)).toMatchObject({ ok: false, code: "MODULE_FAILED" });
     expect(modules.get("echo")?.instructions).toBe("# instructions");

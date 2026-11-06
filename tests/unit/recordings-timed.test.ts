@@ -73,11 +73,11 @@ describe("speakers and phrases (spec 006, FR-002/FR-003)", () => {
   });
 
   it("labels the owner by name and others by first appearance, splitting phrases at speaker changes", () => {
-    const owned = buildPhrases(segments, { turns, ownerSpeaker: 0 }, "Oleh");
-    expect(owned.speakers).toEqual(["Speaker 2", "Oleh"]);
-    expect(formatTranscript(owned)).toBe("[00:00:00] Speaker 2: Привіт, як справи?\n[00:00:02] Oleh: Добре.\n[00:00:10] Speaker 2: Далі.\n");
-    expect(owned.phrases[1]).toEqual({ start: 2, end: 3.2, speaker: "Oleh", text: "Добре.", words: [word(2, 3.2, "Добре.")] });
-    expect(buildPhrases(segments, { turns }, "Oleh").speakers).toEqual(["Speaker 1", "Speaker 2"]);
+    const owned = buildPhrases(segments, { turns, ownerSpeaker: 0 }, "Owner");
+    expect(owned.speakers).toEqual(["Speaker 2", "Owner"]);
+    expect(formatTranscript(owned)).toBe("[00:00:00] Speaker 2: Привіт, як справи?\n[00:00:02] Owner: Добре.\n[00:00:10] Speaker 2: Далі.\n");
+    expect(owned.phrases[1]).toEqual({ start: 2, end: 3.2, speaker: "Owner", text: "Добре.", words: [word(2, 3.2, "Добре.")] });
+    expect(buildPhrases(segments, { turns }, "Owner").speakers).toEqual(["Speaker 1", "Speaker 2"]);
   });
 
   it("absorbs short speaker islands at segment edges and splits phrases at long pauses", () => {
@@ -85,13 +85,13 @@ describe("speakers and phrases (spec 006, FR-002/FR-003)", () => {
     expect(smoothSpeakers(words, [0, 0, 1, 1])).toEqual([1, 1, 1, 1]);
     expect(smoothSpeakers(words, [1, 0, 0, 0])).toEqual([0, 0, 0, 0]);
     expect(smoothSpeakers([...words, word(3, 5, "далі")], [0, 0, 0, 1, 1])).toEqual([0, 0, 0, 1, 1]);
-    const paused = buildPhrases([segment(word(0, 1, "Раз."), word(2.6, 3, "Два"), word(6.5, 7, "три"))], undefined, "Oleh");
+    const paused = buildPhrases([segment(word(0, 1, "Раз."), word(2.6, 3, "Два"), word(6.5, 7, "три"))], undefined, "Owner");
     expect(paused.phrases.map((phrase) => phrase.text)).toEqual(["Раз.", "Два", "три"]);
   });
 
   it("labels everything Speaker without diarization and marks no speech", () => {
-    expect(formatTranscript(buildPhrases(segments, undefined, "Oleh"))).toBe("[00:00:00] Speaker: Привіт, як справи? Добре.\n[00:00:10] Speaker: Далі.\n");
-    expect(formatTranscript(buildPhrases([], undefined, "Oleh"))).toBe("[no speech detected]\n");
+    expect(formatTranscript(buildPhrases(segments, undefined, "Owner"))).toBe("[00:00:00] Speaker: Привіт, як справи? Добре.\n[00:00:10] Speaker: Далі.\n");
+    expect(formatTranscript(buildPhrases([], undefined, "Owner"))).toBe("[no speech detected]\n");
     expect(timecode(3_725.9)).toBe("01:02:05");
   });
 });
@@ -121,7 +121,7 @@ describe("whisper flags", () => {
 describe("diarization runner contract", () => {
   function models(): SpeakerSettings {
     for (const name of ["seg.onnx", "emb.onnx"]) { writeFileSync(join(tmp, name), ""); truncateSync(join(tmp, name), 200_000); }
-    return { segmentationModelPath: join(tmp, "seg.onnx"), embeddingModelPath: join(tmp, "emb.onnx"), ownerName: "Oleh" };
+    return { segmentationModelPath: join(tmp, "seg.onnx"), embeddingModelPath: join(tmp, "emb.onnx"), ownerName: "Owner" };
   }
   const worker = (result: unknown): ProcessRunner => async (executable, args, options) => {
     if (basename(executable).startsWith("node")) {
@@ -170,7 +170,7 @@ describe("transcribeRecording with speakers", () => {
     const out = join(tmp, "out");
     const work = join(tmp, "work");
     mkdirSync(out); mkdirSync(work);
-    const speakers = { segmentationModelPath: join(tmp, "seg.onnx"), embeddingModelPath: join(tmp, "emb.onnx"), ownerName: "Oleh" };
+    const speakers = { segmentationModelPath: join(tmp, "seg.onnx"), embeddingModelPath: join(tmp, "emb.onnx"), ownerName: "Owner" };
     const settings: RecordingSettings = {
       path: tmp, modelPath: join(tmp, "model.bin"), vadModelPath: join(tmp, "vad.bin"), ffmpegPath: "/x/ffmpeg", ffprobePath: "/x/ffprobe",
       whisperPath: "/x/whisper-cli", language: "auto", threads: 4, vocabulary: [], quietMinutes: 2, pollIntervalMs: 60_000,
@@ -204,7 +204,7 @@ describe("transcribeRecording with speakers", () => {
     expect(whisperArgsSeen).toEqual(expect.arrayContaining(["-oj", "-ojf", "-dtw", "large.v3.turbo", "-nfa"]));
     expect(whisperArgsSeen).not.toContain("-np");
     expect(whisperArgsSeen).not.toContain("--vad");
-    expect(readFileSync(result.transcript, "utf8")).toBe("[00:00:05] Oleh: Привіт всім.\n");
+    expect(readFileSync(result.transcript, "utf8")).toBe("[00:00:05] Owner: Привіт всім.\n");
     const words = await readTimedTranscript(result.words!);
     expect(words?.phrases[0]?.words).toEqual([{ start: 5.2, end: 6.2, text: "Привіт" }, { start: 6.2, end: 6.5, text: "всім." }]);
     expect(progress).toContain(85);

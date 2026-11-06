@@ -46,7 +46,7 @@ describe("real SQLite migrations and scope isolation", () => {
     store.close();
     const raw = new Database(path);
     expect(raw.pragma("journal_mode", { simple: true })).toBe("wal");
-    expect(raw.pragma("user_version", { simple: true })).toBe(3);
+    expect(raw.pragma("user_version", { simple: true })).toBe(4);
     expect(raw.pragma("foreign_key_check")).toEqual([]);
     raw.close();
     store = openStore({ path });
@@ -509,5 +509,31 @@ describe("session engines", () => {
     const migrated = openStore({ path: legacyPath });
     try { expect(migrated.sessions.get(scope, created.id)?.engine).toBe("copilot"); }
     finally { migrated.close(); }
+  });
+  it("migrates an earlier owner initiator to 'owner' and keeps proactive occurrences", () => {
+    const legacyPath = join(root, "legacy-initiator.sqlite");
+    const legacy = openStore({ path: legacyPath });
+    const item = legacy.proactivity.create(scope, { agentId: "synthetic-agent", kind: "oneoff", schedule: { type: "once", at: 90 },
+      purpose: "Synthetic reminder", initiator: "owner", nextDueAt: 90, now: 10 });
+    const agentItem = legacy.proactivity.create(scope, { agentId: "synthetic-agent", kind: "oneoff", schedule: { type: "once", at: 95 },
+      purpose: "Synthetic agent reminder", initiator: "agent", nextDueAt: 95, now: 11 });
+    legacy.close();
+    const raw = new Database(legacyPath);
+    raw.pragma("ignore_check_constraints = ON");
+    raw.prepare("UPDATE proactive_items SET initiator='previous-owner' WHERE id=?").run(item.id);
+    raw.prepare("INSERT INTO proactive_occurrences(id,item_id,due_at,late,outcome,settled_at,created_at) VALUES(?,?,?,?,?,?,?)")
+      .run("occurrence-one", item.id, 90, 0, "sent", 91, 90);
+    raw.pragma("user_version = 3");
+    raw.close();
+    const migrated = openStore({ path: legacyPath });
+    try {
+      expect(migrated.proactivity.get(scope, item.id)?.initiator).toBe("owner");
+      expect(migrated.proactivity.get(scope, agentItem.id)?.initiator).toBe("agent");
+    } finally { migrated.close(); }
+    const check = new Database(legacyPath);
+    try {
+      expect(check.prepare("SELECT item_id FROM proactive_occurrences").all()).toEqual([{ item_id: item.id }]);
+      expect(check.pragma("foreign_key_check")).toEqual([]);
+    } finally { check.close(); }
   });
 });

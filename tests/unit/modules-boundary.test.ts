@@ -118,10 +118,10 @@ describe("a new module needs no core change (US8, SC-003)", () => {
     })]);
     expect(modules.get("greeter")?.instructions).toContain("## greeter_greet");
     const greet = modules.abilities().find((ability) => ability.spec.name === "greeter_greet");
-    expect(await greet?.invoke({ name: "Oleh" }, {
+    expect(await greet?.invoke({ name: "Owner" }, {
       scope: { ownerId: 1, botId: "bot", chatId: 1, topicId: null }, agentId: "alfred", userId: 1, owner: true,
       workspace: "/workspace", signal: new AbortController().signal,
-    })).toEqual({ ok: true, message: "Привіт, Oleh!" });
+    })).toEqual({ ok: true, message: "Привіт, Owner!" });
     await modules.stop();
 
     const off = createModuleHost({

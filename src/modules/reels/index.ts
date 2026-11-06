@@ -33,7 +33,7 @@ export const module: ModuleDefinition<ReelsConfig> = {
   requires: ["recordings"],
   settings: reelsSchema,
   abilities: [
-    { name: "reels_prepare", description: "Fetch a YouTube video or take a video file from Oleh's workspace and transcribe it " +
+    { name: "reels_prepare", description: "Fetch a YouTube video or take a video file from the owner's workspace and transcribe it " +
       "(timecodes, speakers) in the background; you are woken when it is ready or failed.",
     input: z.object({ source: z.string().trim().min(1).max(2_000), fresh: z.boolean().optional() }).strict() },
     { name: "reels_transcript", description: "Read a prepared video's transcript: `[HH:MM:SS] Speaker: text` lines, whole or for a time range.",
@@ -77,10 +77,10 @@ export async function reelsDoctor(settings: ReelsSettings): Promise<ModuleCheck[
 
 /** Ability errors: fixed code and an English message for the agent (no paths, no content). */
 const MESSAGES: Record<string, string> = {
-  REELS_OWNER_ONLY: "Reels work only for Oleh.",
-  REELS_WORKSPACE_DENIED: "Reels work only in Oleh's workspace that holds the reels folder.",
-  REELS_SOURCE_INVALID: "The source is neither a YouTube link nor a video file inside Oleh's workspace.",
-  REELS_YTDLP_MISSING: "yt-dlp is not installed; Oleh can install it with `brew install yt-dlp`. Workspace video files still work.",
+  REELS_OWNER_ONLY: "Reels work only for the owner.",
+  REELS_WORKSPACE_DENIED: "Reels work only in the owner's workspace that holds the reels folder.",
+  REELS_SOURCE_INVALID: "The source is neither a YouTube link nor a video file inside the owner's workspace.",
+  REELS_YTDLP_MISSING: "yt-dlp is not installed; the owner can install it with `brew install yt-dlp`. Workspace video files still work.",
   REELS_VIDEO_UNAVAILABLE: "YouTube refused the video (private, removed, age- or members-restricted).",
   REELS_FETCH_FAILED: "The video could not be downloaded.",
   REELS_VIDEO_TOO_LONG: "The video is longer than the limit (3 hours by default) and was not processed.",
@@ -289,7 +289,7 @@ async function startReels(ctx: ModuleContext<ReelsConfig>): Promise<ModuleInstan
     }
     let media: string | undefined;
     try {
-      // A YouTube download is removed after each cut (Oleh, 2026-10-31); the cut job fetches it again when missing.
+      // A YouTube download is removed after each cut to save disk; the cut job fetches it again when missing.
       media = await sourceMedia(settings.folder, video, settings.workspace).catch((error: unknown) => {
         if (video.source.kind === "youtube" && errorCode(error, "") === "REELS_SOURCE_MISSING") return undefined;
         throw error;

@@ -9,6 +9,7 @@
     "/absolute/path/to/agent-workspace/agent/skills"
   ],
   "ownerId": 1,
+  "ownerName": "Alex",
   "users": [
     {
       "telegramUserId": 2,
@@ -139,7 +140,6 @@
         "notifications": true,
         "speakers": {
           "enabled": true,
-          "ownerName": "Oleh",
           "segmentationModelPath": "./models/speaker-segmentation.onnx",
           "embeddingModelPath": "./models/speaker-embedding.onnx",
           "verificationModelPath": "./models/speaker-verification.onnx",

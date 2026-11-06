@@ -4,7 +4,7 @@
 
 Shows what recording transcription is doing now: the recording being transcribed, the queue,
 recordings that are still being written, conflicts, failures and recently finished transcripts.
-Use it when Oleh asks about his recordings or transcripts, or when an expected transcript has
+Use it when the owner asks about their recordings or transcripts, or when an expected transcript has
 not arrived.
 
 ### Inputs
@@ -20,7 +20,7 @@ None. Call it with an empty object `{}`.
   transcribed; `etaSeconds` may be `null`.
 - `queue`: recordings waiting to be transcribed, oldest first.
 - `waiting`: recordings that are still being written (not finished yet).
-- `conflicts`: `{ file, reason }` items that need Oleh (for example, `TARGET_EXISTS`).
+- `conflicts`: `{ file, reason }` items that need the owner (for example, `TARGET_EXISTS`).
 - `failed`: `{ file, code, at }` items; they are tried again after the next restart.
 - `recent`: up to 20 finished items `{ file, transcript, at, silences? }`, newest first.
 - `silences`: long stretches without an audio signal, `{ startSeconds, durationSeconds, toEnd? }`.
@@ -37,7 +37,7 @@ transcripts are never deleted, renamed, emptied or overwritten.
 ### Errors
 
 - `MODULE_UNAVAILABLE`: recording transcription is not running; call `densemble_state` with
-  `module: "recordings"` and tell Oleh its cause and fix.
+  `module: "recordings"` and tell the owner its cause and fix.
 - `MODULE_FAILED`: the module could not answer; the rest of Densemble keeps working.
 
 How abilities are combined is decided by the owner's skills and requests.

@@ -150,10 +150,10 @@ describe("normalization and sender/topic authorization boundary", () => {
     expect(normalizeUpdate(config.config, "bot-other", identity, input).kind).toBe("ignored");
   });
   it("routes a configured user to their own private conversation and rejects an unbound sender", () => {
-    config.config.users = [{ telegramUserId: 202, displayName: "Sonya", allowedBotIds: ["bot-one"] }];
+    config.config.users = [{ telegramUserId: 202, displayName: "Alex", allowedBotIds: ["bot-one"] }];
     config.config.bindings.push({ botId: "bot-one", chatId: 202, topicId: null, kind: "private" });
     expect(normalizeUpdate(config.config, "bot-one", identity, update(20, {
-      chat: { id: 202, type: "private" }, from: { id: 202, is_bot: false, first_name: "Sonya" },
+      chat: { id: 202, type: "private" }, from: { id: 202, is_bot: false, first_name: "Alex" },
     }))).toMatchObject({ kind: "ingress", ingress: { scope: { ownerId: 202, chatId: 202 } } });
     expect(normalizeUpdate(config.config, "bot-one", identity, update(21, {
       chat: { id: 203, type: "private" }, from: { id: 203, is_bot: false, first_name: "Unknown" },

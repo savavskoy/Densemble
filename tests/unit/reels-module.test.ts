@@ -35,15 +35,15 @@ function recordings(): ModuleDefinition<unknown, RecordingsApi> & { requests: un
       requests.push(request);
       request.onProgress?.(50);
       const phrases = [
-        { start: 1, end: 4, speaker: "Oleh", text: "Привіт усім, це перший шматок.", words: "Привіт усім, це перший шматок.".split(" ")
+        { start: 1, end: 4, speaker: "Owner", text: "Привіт усім, це перший шматок.", words: "Привіт усім, це перший шматок.".split(" ")
           .map((text, index) => ({ start: 1 + index * 0.6, end: 1.5 + index * 0.6, text })) },
         { start: 6, end: 9, speaker: "Speaker 2", text: "А це друга людина говорить.", words: "А це друга людина говорить.".split(" ")
           .map((text, index) => ({ start: 6 + index * 0.6, end: 6.5 + index * 0.6, text })) },
       ];
       const transcript = join(request.outputDirectory, `${request.key}.txt`);
       const words = join(request.outputDirectory, `${request.key}.words.json`);
-      writeFileSync(transcript, "[00:00:01] Oleh: Привіт усім, це перший шматок.\n[00:00:06] Speaker 2: А це друга людина говорить.\n");
-      writeFileSync(words, JSON.stringify({ version: 1, speakers: ["Oleh", "Speaker 2"], phrases }));
+      writeFileSync(transcript, "[00:00:01] Owner: Привіт усім, це перший шматок.\n[00:00:06] Speaker 2: А це друга людина говорить.\n");
+      writeFileSync(words, JSON.stringify({ version: 1, speakers: ["Owner", "Speaker 2"], phrases }));
       return { transcript, words, speakers: "separated" };
     } } }),
   });
@@ -111,11 +111,11 @@ describe("reels module abilities (spec 006)", () => {
     const video = (started as unknown as { video: string }).video;
     await until(() => wakes.length === 1);
     // The title stays out of the agent's turn.
-    expect(wakes[0]).toMatch(new RegExp(`^Video ${video} \\(00:00:12\\) is prepared: 2 phrases, speakers: Oleh, Speaker 2\\.`));
+    expect(wakes[0]).toMatch(new RegExp(`^Video ${video} \\(00:00:12\\) is prepared: 2 phrases, speakers: Owner, Speaker 2\\.`));
     expect(await ability("reels_prepare").invoke({ source: join(workspace, "talk.mp4") }, call())).toMatchObject({ state: "ready", video });
 
     expect(await ability("reels_transcript").invoke({ video, from: "00:05" }, call())).toMatchObject({ ok: true, durationSeconds: expect.any(Number),
-      speakers: ["Oleh", "Speaker 2"], text: "[00:00:06] Speaker 2: А це друга людина говорить." });
+      speakers: ["Owner", "Speaker 2"], text: "[00:00:06] Speaker 2: А це друга людина говорить." });
 
     const rejected = await ability("reels_cut").invoke({ video, reels: [{ start: "0:01", end: "0:03", title: "Коротко" },
       { start: "x", end: "0:09", title: "Погано" }] }, call());

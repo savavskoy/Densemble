@@ -104,7 +104,7 @@ describe("module abilities in the Copilot engine", () => {
     expect((f.settings.availableTools as ToolSet).toArray()).toEqual(expect.arrayContaining(
       ["custom:densemble_state", "custom:fixture_status", "custom:fixture_publish"]));
     const content = (f.settings.systemMessage as { content: string }).content;
-    expect(content).toContain("You are chatting with Oleh in Telegram.");
+    expect(content).toContain("You are chatting with the service owner in Telegram.");
     expect(content).toContain("# Densemble core\n");
     expect(content).toContain("# Module fixture v1.0.0\n## fixture_status\nFixture ability reference.");
     expect(f.tool("fixture_status")?.skipPermission).toBe(true);

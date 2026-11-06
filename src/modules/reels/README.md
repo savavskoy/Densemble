@@ -1,9 +1,9 @@
 # Reels module
 
 Cuts short vertical reels (9:16, subtitles with the spoken word highlighted, a title) from
-Oleh's long videos — YouTube links or video files in his workspace — on request of an allowed
+the owner's long videos — YouTube links or video files in their workspace — on request of an allowed
 agent in Telegram. A toolbox, not a workflow: choosing moments, asking for approval and learning
-Oleh's taste belong to the owner's own skills in the workspace (spec 006).
+the owner's taste belong to the owner's own skills in the workspace (spec 006).
 
 - Id: `reels`, version `1.0.0`; `requires`: `recordings` (transcription with timecodes and
   speakers, `RecordingsApi.transcribeMedia`); `provides`: none.
@@ -31,7 +31,7 @@ In `config.local.json`, then `make restart`:
 | `maxHeight` | `1080` | Highest downloaded resolution (`720`, `1080`, `1440`, `2160`). |
 
 FFmpeg/ffprobe paths are shared with `audio`. Transcription settings (models, language,
-vocabulary, speakers and Oleh's voice sample) are the recordings module's:
+vocabulary, speakers and the owner's voice sample) are the recordings module's:
 [recordings README → Speakers](../recordings/README.md#speakers).
 
 ## Prerequisites
@@ -62,11 +62,11 @@ A failed job (download, transcription, rendering) is reported to the agent and i
 was called: finished reels arrive there as files, and the agent is woken with a note
 (`[Densemble module reels] …`) when a video is ready, cut or failed.
 
-Hard limits, enforced in code (spec 006, FR-021): only Oleh, only in the workspace that holds
+Hard limits, enforced in code (spec 006, FR-021): only the owner, only in the workspace that holds
 the folder; nothing is published; only the YouTube download leaves the Mac; cutting never
 changes a workspace video or a transcript; existing reels are never replaced. A YouTube
-download is deleted once its reels are cut and fetched again before the next cut (Oleh's
-decision of 2026-10-31, to save disk).
+download is deleted once its reels are cut and fetched again before the next cut (to save
+disk).
 
 ## Files
 

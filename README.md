@@ -81,7 +81,8 @@ commit safeguard, not access control; review staged changes before committing.
 2. Create a bot for each desired persona through BotFather. Store its token only
    in the existing external canonical `secrets.local.json`; set `tokenRef` to
    that key. Never paste tokens into command-line arguments, commits or logs.
-3. Set your numeric Telegram `ownerId` and explicit `bindings`. To add a person,
+3. Set your numeric Telegram `ownerId`, the optional `ownerName` agents use to
+   address you, and explicit `bindings`. To add a person,
    add their numeric Telegram ID to `users`, grant only the required bot IDs in
    `allowedBotIds`, and add a private binding using that person's ID as `chatId`.
    Send `/start` to the bot from each account. Groups use a negative chat ID;
@@ -173,7 +174,7 @@ guardrails (`minIntervalMs`, default 30 minutes; `maxActiveItemsPerAgent`, defau
 No proactive message is sent during quiet hours; accumulated items fire once,
 batched, right after the window ends or on restart.
 
-Oleh oversees and overrides proactivity per chat with `/proactive`:
+The owner oversees and overrides proactivity per chat with `/proactive`:
 `/proactive` or `/proactive list` shows that agent's active/paused items and
 next due times; `/proactive pause [id]` / `/proactive resume [id]` / `/proactive
 cancel <id>` act on one item, or on the whole agent's proactivity when no id is

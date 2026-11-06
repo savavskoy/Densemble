@@ -39,6 +39,8 @@ export interface CoreOffer {
   /** Resolves a path relative to the config file's directory, as core settings do. */
   resolveFromConfig(path: string): string;
   quietHours: QuietHoursConfig;
+  /** The owner's configured name (`ownerName`); undefined when not set. */
+  ownerName?: string | undefined;
 }
 
 export interface ModuleReason { cause: string; fix: string; urgent?: boolean }
