@@ -5,6 +5,9 @@ feature, what to do every day, and what to do when something goes wrong. Develop
 details (architecture, file contracts, tests) live in the main [README](../../README.md)
 and [contracts](../contracts.md).
 
+For the big picture first, read [what Densemble does](../overview.md) and
+[how it is built](../concepts.md).
+
 ## Chapters
 
 - [Recording transcription](recordings.md): turn recorded calls, lectures and

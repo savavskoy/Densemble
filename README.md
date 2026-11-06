@@ -7,6 +7,9 @@ persona, one binding per group/topic, and separate conversation histories.
 TypeScript/Node, grammY, SQLite and the Copilot SDK form a modular monolith;
 there is no HTTP server or hosted control plane.
 
+Start here: [what Densemble does](docs/overview.md) and
+[how it is built](docs/concepts.md) (terms, message flow, rights, storage).
+
 **Deployment acceptance is pending:** the authenticated synthetic SDK gate
 passed, but real Telegram accounts/tokens and a provisioned whisper.cpp model
 are required to complete Telegram/voice acceptance. Offline tests do not prove
