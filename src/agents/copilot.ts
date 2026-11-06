@@ -419,6 +419,8 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
     const owner = user === config.config.ownerId;
     const match = authorizedWorkspace(config.config, user, session.scope.botId, session.workspace);
     if (!match) throw new RuntimeError("WORKSPACE_ACCESS_DENIED");
+    // Members of a shared workspace get the same MCP servers as the owner.
+    const mcpAccess = owner || match !== DEFAULT_WORKSPACE_ID;
     // Non-owner sessions see only the agents their workspace permits.
     const agents = match === DEFAULT_WORKSPACE_ID ? config.agents : config.agents.filter((agent) => match.agentIds.includes(agent.id));
     const forbiddenRoots = owner ? [] : [
@@ -462,7 +464,7 @@ export function createCopilotRuntime(options: CopilotRuntimeOptions): Controlled
       workingDirectory: session.workspace, configDirectory: config.config.runtimeHomePath,
       enableConfigDiscovery: false, skipCustomInstructions: false,
       instructionDirectories: [session.workspace], skillDirectories: owner ? config.config.skillDirectories : [], enableSkills: owner,
-      pluginDirectories: [], includedBuiltinSkills: [], mcpServers: owner ? mcpServers : {},
+      pluginDirectories: [], includedBuiltinSkills: [], mcpServers: mcpAccess ? mcpServers : {},
       excludedBuiltinAgents: ["explore", "task", "general-purpose", "code-review", "research", "security-review"],
       enableFileHooks: false, enableHostGitOperations: false, enableOnDemandInstructionDiscovery: false,
       enableSessionStore: false, memory: { enabled: false }, skipEmbeddingRetrieval: true,
