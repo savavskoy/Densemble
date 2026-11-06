@@ -184,9 +184,13 @@ export async function runBehavior(
 
   // Each contract is attempted once; corrections must be explicit changes, not hidden retries.
   await check("persona-discovery", async () => {
-    const metadata = discoverPersonaMetadata(process.env.DENSEMBLE_GATE_AGENT_WORKSPACE ?? resolve("../openclaw-jazz"));
+    const workspace = process.env.DENSEMBLE_GATE_AGENT_WORKSPACE;
+    requireEvidence(workspace !== undefined && workspace.trim() !== "", "GATE_AGENT_WORKSPACE_NOT_SET");
+    const metadata = discoverPersonaMetadata(resolve(workspace!));
     requireEvidence(metadata.length > 0 && metadata.some((p) => p.invocable), "NO_INVOCABLE_PERSONAS_DISCOVERED");
-    requireEvidence(metadata.find((p) => p.id === "terry-counter")?.invocable === false, "WORKER_NOT_EXCLUDED_FROM_PERSONAS");
+    // Optional: a worker (subagent) id in that workspace that must not be offered as a persona.
+    const worker = process.env.DENSEMBLE_GATE_WORKER_ID;
+    if (worker) requireEvidence(metadata.find((p) => p.id === worker)?.invocable === false, "WORKER_NOT_EXCLUDED_FROM_PERSONAS");
     const token = `PERSONA_${randomUUID()}`;
     const probe = await create({
       customAgents: [{

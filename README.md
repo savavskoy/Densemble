@@ -511,8 +511,9 @@ Readiness-only remains a separate **zero-inference** path.
 | Resume without replay | PASS: synthetic local side effect committed before lost handler acknowledgment; `continuePendingWork: false` prevented automatic model/tool replay; subsequent explicit turn did not duplicate it |
 | Cleanup | PASS: registered gate sessions deleted, owned processes exited, owned run directories removed; service login retained |
 
-The metadata reader defaults to sibling `../openclaw-jazz`; set
-`DENSEMBLE_GATE_AGENT_WORKSPACE` to an explicitly chosen workspace if different.
+The metadata reader needs `DENSEMBLE_GATE_AGENT_WORKSPACE` set to an explicitly
+chosen agent workspace; optionally set `DENSEMBLE_GATE_WORKER_ID` to a worker
+(subagent) id there to check that it is not offered as a persona.
 It validates references in place and returns only identifiers/model IDs/counts.
 **No real persona, skill body, secret, personal prompt, or document is copied
 into Densemble or sent in the inference probes.** All tool writes are synthetic
