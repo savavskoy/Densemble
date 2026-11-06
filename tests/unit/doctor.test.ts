@@ -120,8 +120,8 @@ describe("recording transcription diagnostics", () => {
     expect(report.checks.some((check) => check.component.includes("recordings"))).toBe(false);
     expect(report.checks).toContainEqual({ component: "coordinator", ready: true, code: "MODULE_COORDINATOR_NOT_CONFIGURED" });
   });
-  it("reports folder, model, VAD and the legacy job with names only in details", async () => {
-    const ready = await recordingChecks(withRecordings(`${root}/turbo.bin`), `${root}/missing.plist`);
+  it("reports folder, model and VAD with names only in details", async () => {
+    const ready = await recordingChecks(withRecordings(`${root}/turbo.bin`));
     expect(ready.checks).toEqual([
       { component: "recordings", ready: true, code: "RECORDINGS_ENABLED" },
       { component: "recordings-folder", ready: true, code: "RECORDINGS_FOLDER_READY" },
@@ -129,37 +129,33 @@ describe("recording transcription diagnostics", () => {
       { component: "recordings-retry-model", ready: true, code: "MEDIA_AUDIO_READY" },
       { component: "recordings-vad", ready: true, code: "MEDIA_AUDIO_READY" },
       { component: "recordings-speakers", ready: false, code: "SPEAKERS_MODEL_MISSING" },
-      { component: "recordings-legacy-job", ready: true, code: "RECORDINGS_LEGACY_JOB_ABSENT" },
     ]);
     expect(ready.details).toEqual({ recordingsFolder: `${root}/folder`, recordingsModel: "turbo.bin",
       recordingsRetryModel: "turbo.bin", recordingsVadModel: "vad.bin", recordingsSpeakers: "seg.onnx, emb.onnx" });
-    const { writeFileSync } = await import("node:fs");
-    writeFileSync(`${root}/legacy.plist`, "<plist/>");
-    const warned = await recordingChecks(withRecordings(`${root}/english.bin`), `${root}/legacy.plist`);
+    const warned = await recordingChecks(withRecordings(`${root}/english.bin`));
     expect(warned.checks).toContainEqual({ component: "recordings-model", ready: false, code: "MEDIA_AUDIO_MODEL_ENGLISH_ONLY" });
-    expect(warned.checks).toContainEqual({ component: "recordings-legacy-job", ready: false, code: "RECORDINGS_LEGACY_JOB_INSTALLED" });
-    const missing = await recordingChecks(withRecordings(`${root}/absent.bin`), `${root}/missing.plist`);
+    const missing = await recordingChecks(withRecordings(`${root}/absent.bin`));
     expect(missing.checks).toContainEqual({ component: "recordings-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
   });
   it("reports speaker models ready, or off when speakers are turned off", async () => {
     const { truncateSync, writeFileSync } = await import("node:fs");
     for (const name of ["seg.onnx", "emb.onnx"]) { writeFileSync(`${root}/${name}`, ""); truncateSync(`${root}/${name}`, 200_000); }
-    const ready = await recordingChecks(withRecordings(`${root}/turbo.bin`), `${root}/missing.plist`);
+    const ready = await recordingChecks(withRecordings(`${root}/turbo.bin`));
     expect(ready.checks).toContainEqual({ component: "recordings-speakers", ready: true, code: "SPEAKERS_READY" });
     const off = await recordingChecks(recordingSettings({ path: `${root}/folder`, modelPath: `${root}/turbo.bin`,
-      vadModelPath: `${root}/vad.bin`, speakers: { enabled: false } }, audio), `${root}/missing.plist`);
+      vadModelPath: `${root}/vad.bin`, speakers: { enabled: false } }, audio));
     expect(off.checks).toContainEqual({ component: "recordings-speakers", ready: true, code: "SPEAKERS_DISABLED" });
     expect(off.details.recordingsSpeakers).toBeUndefined();
   });
   it("checks a separately configured retry model on its own", async () => {
     const withRetry = (retryModel: string) => withRecordings(`${root}/turbo.bin`, retryModel);
-    const missing = await recordingChecks(withRetry(`${root}/large.bin`), `${root}/missing.plist`);
+    const missing = await recordingChecks(withRetry(`${root}/large.bin`));
     expect(missing.checks).toContainEqual({ component: "recordings-model", ready: true, code: "MEDIA_AUDIO_READY" });
     expect(missing.checks).toContainEqual({ component: "recordings-retry-model", ready: false, code: "MEDIA_AUDIO_MODEL_MISSING" });
     expect(missing.details.recordingsRetryModel).toBe("large.bin");
     const { writeFileSync } = await import("node:fs");
     writeFileSync(`${root}/large.bin`, header(51866));
-    const ready = await recordingChecks(withRetry(`${root}/large.bin`), `${root}/missing.plist`);
+    const ready = await recordingChecks(withRetry(`${root}/large.bin`));
     expect(ready.checks).toContainEqual({ component: "recordings-retry-model", ready: true, code: "MEDIA_AUDIO_READY" });
   });
 });

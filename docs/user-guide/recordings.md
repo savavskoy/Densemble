@@ -18,7 +18,6 @@ sent anywhere.
 - [All settings](#all-settings)
 - [Asking an agent](#asking-an-agent)
 - [Turning it off](#turning-it-off)
-- [Moving from the standalone transcriber](#moving-from-the-standalone-transcriber)
 
 ## What it does
 
@@ -351,7 +350,6 @@ Run it with the service stopped (`make stop` first).
 | `recordings-model` | `…MODEL_MISSING`: download the model. `…ENGLISH_ONLY`: you used a `.en` model; use the multilingual one. `…UNSUPPORTED`: not a whisper.cpp model file. |
 | `recordings-retry-model` | The same for `retry.modelPath` (or the main model when it is not set). New first attempts still work; only repeated attempts fail with `MODEL_UNAVAILABLE`. |
 | `recordings-vad` | The Silero file is missing or wrong; download it again. |
-| `recordings-legacy-job` | An older standalone transcriber is still installed on this Mac. Densemble and it take turns safely, but remove the old one; see [Moving from the standalone transcriber](#moving-from-the-standalone-transcriber). |
 
 ## All settings
 
@@ -417,23 +415,3 @@ do, and the coordinator agent (`coordinatorAgentId`) tells you once in its chat.
 Set `"enabled": false` in `modules.recordings` (the settings stay for later) or
 remove `modules.recordings` from `config.local.json`, then run `make restart`.
 Your recordings and transcripts stay where they are.
-
-## Moving from the standalone transcriber
-
-Only for Macs that used the older standalone transcriber
-(`com.openclaw-jazz.transcribe-recordings` launchd job). Do it once, in this
-order; at no point are files transcribed twice:
-
-1. Set up recordings in Densemble as [above](#set-up-once) and `make restart`.
-   While the old job is installed, `make doctor` reports `recordings-legacy-job`
-   not ready, and the two take turns through the old job's lock.
-2. Check `make transcribe-status`, then remove the old job:
-
-   ```sh
-   launchctl bootout gui/$(id -u)/com.openclaw-jazz.transcribe-recordings
-   mv ~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist \
-      ~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist.retired
-   ```
-
-3. `make restart`. The warning is gone. Existing transcripts, `review-log.tsv`
-   and review tools keep working: the file layout is the same.

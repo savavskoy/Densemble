@@ -58,8 +58,7 @@ error (`MODULE_SETTINGS_DUPLICATED`).
   labelled `Speaker`.
 
 `make doctor` (service stopped) shows `module:recordings` plus `recordings-folder`,
-`recordings-model`, `recordings-retry-model`, `recordings-vad`, `recordings-speakers` and
-`recordings-legacy-job`.
+`recordings-model`, `recordings-retry-model`, `recordings-vad` and `recordings-speakers`.
 
 ## Recognition
 
@@ -129,5 +128,5 @@ renames or deletes anything.
 - Code: `index.ts` (definition, start, `transcribeMedia`), `api.ts`, `settings.ts`,
   `worker.ts`, `lane.ts`, `filing.ts`, `transcribe.ts`, `timed.ts` (words, speakers,
   phrases, format), `speakers/` (diarization API and child worker), `silence.ts`,
-  `status.ts`, `notify.ts`, `legacy.ts`, `doctor.ts`, `contract.ts`. `media-work/` in the
+  `status.ts`, `notify.ts`, `doctor.ts`, `contract.ts`. `media-work/` in the
   data directory holds `transcribeMedia` work files.

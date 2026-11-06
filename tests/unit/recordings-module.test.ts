@@ -148,8 +148,7 @@ describe("recording worker health hooks", () => {
     };
     const health = { fail: vi.fn(), recovered: vi.fn() };
     const worker = createRecordingWorker({ settings, dataPath: join(runtime, "modules", "recordings"), diagnostics: diagnostics(),
-      runner: async () => { throw new Error("no process expected"); }, health,
-      legacy: { plist: join(tmp, "missing.plist"), lock: join(tmp, "lock") } });
+      runner: async () => { throw new Error("no process expected"); }, health });
     chmodSync(folder, 0o000);
     await expect(worker.pass()).rejects.toThrow();
     expect(health.fail).toHaveBeenCalledWith("RECORDINGS_FOLDER_UNREADABLE");

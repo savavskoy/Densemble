@@ -4,7 +4,6 @@ import { MediaError, runManagedProcess, SpeechGate, type ProcessControl, type Pr
 import { classify, dayFolder, isMediaName, parseDayFolder, parseReviewLog, PARTIAL_PATTERN, rootTargetDate,
   transcriptKey, type DayMedia } from "./contract.js";
 import { fileRecording, isFinished, repairInterruptedFiling, type FinishedCheckOptions } from "./filing.js";
-import { acquireLegacyLock, legacyJobInstalled } from "./legacy.js";
 import { createLane, type Lane } from "./lane.js";
 import { createNotifier, type RecordingNotifier } from "./notify.js";
 import type { RecordingSettings } from "./settings.js";
@@ -21,7 +20,6 @@ export interface RecordingWorkerOptions {
   runner?: ProcessRunner;
   now?: () => number;
   notifier?: RecordingNotifier;
-  legacy?: { plist?: string; lock?: string };
   /** Shared with `transcribeMedia`, so only one transcription runs at a time. */
   lane?: Lane;
   /** Module health: a pass that cannot read the watched folder fails it; the next good pass recovers it. */
@@ -64,7 +62,6 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
   let heartbeat: NodeJS.Timeout | undefined;
   let running: Promise<void> | undefined;
   let stopped = false;
-  let legacyWarned = false;
   let writing = Promise.resolve();
   const check: FinishedCheckOptions = { runner, ffprobePath: settings.ffprobePath, quietMs: settings.quietMinutes * 60_000, now, signal };
   const rel = (path: string) => path.slice(root.length + 1);
@@ -152,17 +149,6 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
     return true;
   }
 
-  /** While the legacy job is installed, filing and each transcription hold its lock so the two never overlap. */
-  async function withLegacyLock(action: () => Promise<void>): Promise<void> {
-    if (!await legacyJobInstalled(options.legacy?.plist)) return action();
-    const release = await acquireLegacyLock(options.legacy?.lock);
-    if (!release) {
-      diagnostics.record("RECORDINGS_LEGACY_LOCK_BUSY");
-      return;
-    }
-    try { await action(); } finally { await release(); }
-  }
-
   async function fileRoot(): Promise<void> {
     const waiting = status.waiting;
     const conflicts = status.conflicts;
@@ -246,9 +232,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
     }
     await lane(async () => {
       await gate.waitUntilIdle(signal);
-      await withLegacyLock(async () => {
-        if (await stillPending(job)) await run(job, failureKey, finished.durationSeconds!);
-      });
+      if (await stillPending(job)) await run(job, failureKey, finished.durationSeconds!);
     });
   }
 
@@ -339,7 +323,7 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
     for (let first = true; !signal.aborted; first = false) {
       status.waiting = [];
       status.conflicts = [];
-      await withLegacyLock(fileRoot);
+      await fileRoot();
       const { jobs, conflicts } = await findJobs();
       if (first) for (const conflict of conflicts) diagnostics.record("RECORDING_CONFLICT", { reason: conflict.reason });
       status.conflicts.push(...conflicts);
@@ -371,10 +355,6 @@ export function createRecordingWorker(options: RecordingWorkerOptions): Recordin
       // An unreadable folder is reported and retried every poll; it never stops the service.
       try { await cleanup(); }
       catch { diagnostics.record("RECORDINGS_FOLDER_UNREADABLE"); }
-      if (await legacyJobInstalled(options.legacy?.plist) && !legacyWarned) {
-        legacyWarned = true;
-        diagnostics.record("RECORDINGS_LEGACY_JOB_INSTALLED");
-      }
       heartbeat = setInterval(() => { void publishStatus(); }, settings.pollIntervalMs);
       heartbeat.unref();
       diagnostics.record("RECORDINGS_STARTED");

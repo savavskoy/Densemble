@@ -339,7 +339,7 @@ and in `make modules-status`); both at once is a config error
 to `runtimeDataPath/modules/recordings/` (renamed once at the first start).
 
 Implementation: `src/modules/recordings/` (worker, filing, transcription, status,
-notifications, legacy-lock interop), started by the module host in
+notifications), started by the module host in
 `src/service.ts` after media cleanup and stopped first on shutdown. Voice messages and recordings share one
 `SpeechGate` (`src/media/speech-gate.ts`): a voice message SIGSTOPs the
 recording's process group and SIGCONTs it afterwards (`src/media/process.ts`).

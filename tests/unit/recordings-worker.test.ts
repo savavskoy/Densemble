@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import { MediaError } from "../../src/media/errors.js";
 import type { ProcessControl, ProcessOptions, ProcessRunner } from "../../src/media/process.js";
 import { SpeechGate } from "../../src/media/speech-gate.js";
-import { acquireLegacyLock, legacyJobInstalled } from "../../src/modules/recordings/legacy.js";
 import type { DiagnosticSink } from "../../src/ports.js";
 import { createNotifier, type RecordingNotifier } from "../../src/modules/recordings/notify.js";
 import { RECORDING_DEFAULTS, type RecordingSettings } from "../../src/modules/recordings/settings.js";
@@ -119,13 +118,10 @@ function settings(overrides: Partial<RecordingSettings> = {}): RecordingSettings
   };
 }
 
-const legacyPlist = () => join(tmp, "legacy.plist");
-const legacyLock = () => join(tmp, "legacy.lock");
-
 function worker(extra: Partial<RecordingWorkerOptions> = {}) {
   return createRecordingWorker({
     settings: settings(), dataPath: join(runtime, "recordings"), diagnostics, runner: fake.runner, now: () => clock, notifier,
-    legacy: { plist: legacyPlist(), lock: legacyLock() }, ...extra,
+    ...extra,
   });
 }
 
@@ -475,7 +471,7 @@ describe("recording worker: filing and transcription", () => {
   it("notifies through osascript when no notifier is injected", async () => {
     media("2026/10/29/a.mp4");
     await createRecordingWorker({ settings: settings({ notifications: true }), dataPath: join(runtime, "recordings"), diagnostics,
-      runner: fake.runner, now: () => clock, legacy: { plist: legacyPlist(), lock: legacyLock() } }).pass();
+      runner: fake.runner, now: () => clock }).pass();
     const osascript = fake.calls.filter((call) => basename(call.executable) === "osascript");
     expect(osascript).toHaveLength(1);
     expect(osascript[0]!.args.slice(-2)).toEqual(["Transcription ready", "a.mp4"]);
@@ -536,7 +532,6 @@ describe("recording worker: lifecycle", () => {
     expect(existsSync(staleWork)).toBe(false);
     expect(fake.inputs).toEqual([join(day, OBS)]);
     expect(codes()).toContain("RECORDINGS_STARTED");
-    expect(codes()).not.toContain("RECORDINGS_LEGACY_JOB_INSTALLED");
   });
 });
 
@@ -596,78 +591,6 @@ describe("recording worker: voice first", () => {
   });
 });
 
-describe("recording worker: legacy launchd job", () => {
-  it("skips transcription and leaves a foreign lock alone", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    mkdirSync(legacyLock());
-    media("2026/10/29/a.mp4");
-    await worker().pass();
-    expect(executables()).not.toContain("whisper-cli");
-    expect(codes()).toContain("RECORDINGS_LEGACY_LOCK_BUSY");
-    expect(statSync(legacyLock()).isDirectory()).toBe(true);
-    expect(existsSync(join(root, "2026/10/29/transcript_2026-10-29_a.txt"))).toBe(false);
-  });
-
-  it("holds the shared lock while transcribing and removes it afterwards", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    media("2026/10/29/a.mp4");
-    let held: boolean | undefined;
-    fake.whisper = async () => { held = existsSync(legacyLock()); return "x\n"; };
-    await worker().pass();
-    expect(held).toBe(true);
-    expect(existsSync(legacyLock())).toBe(false);
-  });
-
-  it("releases the lock after a failed job too", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    media("2026/10/29/a.mp4");
-    fake.whisper = async () => { throw new MediaError("MEDIA_AUDIO_FAILED"); };
-    await worker().pass();
-    expect(existsSync(legacyLock())).toBe(false);
-  });
-
-  it("creates no lock when the legacy job is not installed", async () => {
-    media("2026/10/29/a.mp4");
-    let held: boolean | undefined;
-    fake.whisper = async () => { held = existsSync(legacyLock()); return "x\n"; };
-    await worker().pass();
-    expect(held).toBe(false);
-    expect(existsSync(legacyLock())).toBe(false);
-  });
-
-  it("start() reports an installed legacy job", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    const w = worker();
-    await w.start();
-    await w.stop();
-    expect(codes()).toContain("RECORDINGS_LEGACY_JOB_INSTALLED");
-  });
-});
-
-describe("legacy helpers", () => {
-  it("detects the plist", async () => {
-    expect(await legacyJobInstalled(join(tmp, "missing.plist"))).toBe(false);
-    writeFileSync(legacyPlist(), "<plist/>");
-    expect(await legacyJobInstalled(legacyPlist())).toBe(true);
-  });
-
-  it("acquires once, refuses while held, releases idempotently", async () => {
-    const release = await acquireLegacyLock(legacyLock());
-    expect(release).toBeDefined();
-    expect(statSync(legacyLock()).mode & 0o777).toBe(0o700);
-    expect(await acquireLegacyLock(legacyLock())).toBeUndefined();
-    await release!();
-    expect(existsSync(legacyLock())).toBe(false);
-    mkdirSync(legacyLock());
-    await release!();
-    expect(existsSync(legacyLock())).toBe(true);
-  });
-
-  it("propagates errors other than EEXIST", async () => {
-    await expect(acquireLegacyLock(join(tmp, "missing", "lock"))).rejects.toMatchObject({ code: "ENOENT" });
-  });
-});
-
 describe("createNotifier", () => {
   function setup(enabled = true, fail = false) {
     const calls: string[][] = [];
@@ -721,7 +644,7 @@ describe("createNotifier", () => {
     media("2026/10/28/meeting.m4a");
     media("2026/10/29/meeting.m4a");
     await createRecordingWorker({ settings: settings({ notifications: true }), dataPath: join(runtime, "recordings"), diagnostics,
-      runner: fake.runner, now: () => clock, legacy: { plist: legacyPlist(), lock: legacyLock() } }).pass();
+      runner: fake.runner, now: () => clock }).pass();
     expect(fake.calls.filter((call) => basename(call.executable) === "osascript")).toHaveLength(2);
   });
 });
@@ -763,16 +686,7 @@ describe("recording worker: resilience (review fixes)", () => {
     expect(readdirSync(join(tmp, "outside"))).toEqual([]);
     expect((await status()).conflicts).toContainEqual({ file: OBS, reason: "TARGET_UNSAFE" });
   });
-  it("never removes a legacy lock that replaced its own", async () => {
-    const release = (await acquireLegacyLock(legacyLock()))!;
-    rmSync(legacyLock(), { recursive: true });
-    mkdirSync(legacyLock());
-    await release();
-    expect(existsSync(legacyLock())).toBe(true);
-  });
-  it("keeps the status lists free of duplicates while the legacy lock is busy", async () => {
-    writeFileSync(legacyPlist(), "<plist/>");
-    mkdirSync(legacyLock());
+  it("keeps the status lists free of duplicates across passes", async () => {
     media("2026/10/29/a.mp4");
     media("2026/10/29/a.m4a", "data", new Date(OLD.getTime() + 1000));
     const instance = worker();

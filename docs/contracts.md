@@ -454,13 +454,7 @@ folder; its file contract is shared with the owner's review tooling and does not
   directory once at the first start); stale after 3 × poll
   interval → "service not running". macOS notifications "Transcription ready" /
   "Transcription failed" go once per outcome per file per run.
-- Legacy launchd job: while `~/Library/LaunchAgents/com.openclaw-jazz.transcribe-recordings.plist`
-  exists, Densemble warns (`RECORDINGS_LEGACY_JOB_INSTALLED`) and holds the old
-  script's lock dir `/tmp/transcribe-new-recordings.lock` around each recording;
-  a foreign lock means skip (`RECORDINGS_LEGACY_LOCK_BUSY`). The lock's mtime is
-  refreshed every 10 minutes (the old script treats 6 h as stale) and only the
-  same directory Densemble created is removed.
-- Diagnostics (codes only): `RECORDINGS_STARTED|DISABLED|START_FAILED|PASS_FAILED|STATUS_FAILED|FOLDER_UNREADABLE|LEGACY_LOCK_BUSY`,
+- Diagnostics (codes only): `RECORDINGS_STARTED|DISABLED|START_FAILED|PASS_FAILED|STATUS_FAILED|FOLDER_UNREADABLE`,
   `RECORDING_FILED|WAITING|CONFLICT|STARTED|PAUSED|RESUMED|DONE|FAILED|INTERRUPTED|NOTIFY_FAILED|ORPHAN_ENDED|SPEAKERS_UNAVAILABLE`,
   `RECORDING_MODEL_MISSING|ENGLISH_ONLY|UNSUPPORTED`; failure `reason` is one of
   `DECODE_FAILED ASR_FAILED TIMEOUT DISK_FULL TARGET_EXISTS MODEL_UNAVAILABLE OUTPUT_INVALID`.
